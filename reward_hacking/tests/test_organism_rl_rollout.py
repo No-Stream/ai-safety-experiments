@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,9 +27,11 @@ from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
 from reward_hacking.organism_rl import rollout
+from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     ILCBEpisodeSource,
+    MixedEpisodeSource,
     OrganismRollout,
     TaskEpisodeSource,
     _accumulate_task_kind_metrics,  # pyright: ignore[reportPrivateUsage]
@@ -43,7 +46,6 @@ from reward_hacking.tests.test_distill_episodes import CharacterTokenizer
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
-    from collections import Counter
     from collections.abc import Mapping
     from pathlib import Path
 
@@ -723,6 +725,63 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
         source("toy", seed=7, step=1, replica=0)
 
 
+def test_task_source_archives_a_prefetched_step_for_resume(tmp_path: Path) -> None:
+    source = TaskEpisodeSource.__new__(TaskEpisodeSource)
+    source.output_dir = tmp_path
+    step_directory = tmp_path / "step-000003"
+    step_directory.mkdir()
+    completed_trace = step_directory / "completed.jsonl"
+    partial_trace = step_directory / "partial.jsonl.tmp"
+    completed_trace.write_text("completed synthetic evidence\n", encoding="utf-8")
+    partial_trace.write_text("partial synthetic evidence\n", encoding="utf-8")
+
+    archived_directory = source.discard_prefetched_step(3)
+
+    assert archived_directory is not None
+    assert archived_directory.parent == tmp_path
+    assert archived_directory.name.startswith("discarded-prefetched-step-000003-")
+    assert not step_directory.exists()
+    assert (archived_directory / completed_trace.name).read_text(encoding="utf-8") == (
+        "completed synthetic evidence\n"
+    )
+    assert (archived_directory / partial_trace.name).read_text(encoding="utf-8") == (
+        "partial synthetic evidence\n"
+    )
+    assert source.discard_prefetched_step(3) is None
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        source.discard_prefetched_step(-1)
+
+
+def test_mixed_source_discards_prefetched_step_for_both_families(tmp_path: Path) -> None:
+    coding_source = TaskEpisodeSource.__new__(TaskEpisodeSource)
+    coding_source.output_dir = tmp_path / "coding"
+    coding_source.tasks = {}
+    coding_source.families_by_task = {}
+    coding_source.variants_by_task = {}
+    coding_source.environments_by_task = {}
+    coding_source.payment_registers = {}
+    coding_source.skip_counts = Counter()
+    ladder_source_instance = LadderEpisodeSource.__new__(LadderEpisodeSource)
+    ladder_source_instance.output_dir = tmp_path / "ladder"
+    ladder_source_instance.tasks = {}
+    ladder_source_instance.families_by_task = {}
+    ladder_source_instance.variants_by_task = {}
+    coding_source.backend = cast("Any", SimpleNamespace())
+    ladder_source_instance.backend = coding_source.backend
+    mixed_source = MixedEpisodeSource(coding_source, ladder_source_instance)
+    coding_step = coding_source.output_dir / "step-000002"
+    ladder_step = ladder_source_instance.output_dir / "step-000002"
+    coding_step.mkdir(parents=True)
+    ladder_step.mkdir(parents=True)
+
+    archived = mixed_source.discard_prefetched_step(2)
+
+    assert archived["coding"] is not None
+    assert archived["ladder"] is not None
+    assert not coding_step.exists()
+    assert not ladder_step.exists()
+
+
 def test_task_episode_source_routes_both_families_through_registry_selectors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1312,6 +1371,48 @@ def test_rollout_runs_episodes_concurrently_and_keeps_prompt_order() -> None:
         "toy-1",
         "toy-2",
     ]
+
+
+def test_pipelined_rollout_returns_complete_groups_with_sampler_policy_steps() -> None:
+    sample = _sample()
+
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del task_id, seed, replica
+        turns = [
+            {**record, "policy_step": max(step - 1, 0)} if record["record"] == "turn" else record
+            for record in sample.trace_records
+        ]
+        return EpisodeSample(sample.record, turns)
+
+    rollout_function = OrganismRollout(
+        source,
+        cast("PreTrainedTokenizerBase", CharacterTokenizer()),
+        max_sequence_tokens=100,
+        episode_concurrency=2,
+        step_pipelining=True,
+    )
+    first = SimpleNamespace(
+        state=SimpleNamespace(global_step=0), next_prompts=["toy", "toy"], num_generations=2
+    )
+    second = SimpleNamespace(
+        state=SimpleNamespace(global_step=1), next_prompts=[], num_generations=2
+    )
+    try:
+        first_output = cast("dict[str, Any]", rollout_function(["toy", "toy"], first))
+        second_output = cast("dict[str, Any]", rollout_function(["toy", "toy"], second))
+    finally:
+        rollout_function.close()
+    assert len(first_output["rollout_records"]) == len(second_output["rollout_records"]) == 2
+    assert all(
+        all(
+            policy_step == 0
+            for policy_step, active in zip(policy_steps, record["loss_mask"], strict=True)
+            if active
+        )
+        for policy_steps, record in zip(
+            second_output["policy_steps"], second_output["rollout_records"], strict=True
+        )
+    )
 
 
 def test_rollout_concurrency_must_be_positive() -> None:

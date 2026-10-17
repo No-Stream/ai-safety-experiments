@@ -858,3 +858,9 @@ def test_rollout_concurrency_is_operational_and_positive(tmp_path: Path) -> None
         parse_args([*base, "--rollout-concurrency", "0"])
     with pytest.raises(SystemExit):
         parse_args([*base, "--expected-peak-context-tokens", "0"])
+
+
+def test_step_pipelining_is_on_by_default_and_can_be_disabled(tmp_path: Path) -> None:
+    base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
+    assert parse_args(base).step_pipelining is True
+    assert parse_args([*base, "--no-step-pipelining"]).step_pipelining is False

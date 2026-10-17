@@ -14,6 +14,7 @@ from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast, T
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
 from reward_hacking.distill.train import chunked_completion_logps
+from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.trainer import (
     OrganismGRPOTrainer,
     _SyncCallback,  # pyright: ignore[reportPrivateUsage]
@@ -73,11 +74,18 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     checkpoint_keep_middle: int = 3,
     training_samples: int = 2,
     prompts_per_step: int = 1,
+    generations: int = 2,
     rollout_batches: list[list[str]] | None = None,
+    next_prompt_batches: list[list[str]] | None = None,
+    training_prompts: tuple[str, ...] | None = None,
     sampler_log_path: Path | None = None,
     rollout_log_line: str | None = None,
     ragged_completions: bool = False,
     logprob_chunk_tokens: int = 2,
+    phase: Any = None,
+    request_gate: VLLMRequestGate | None = None,
+    sampler_admission: Any = None,
+    sampler_model_id: Any = None,
 ) -> OrganismGRPOTrainer:
     pad_token_name, eos_token_name = "pad", "eos"
     tokenizer = PreTrainedTokenizerFast(
@@ -107,9 +115,9 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         use_vllm=False,
         beta=0,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=2 * prompts_per_step,
-        steps_per_generation=2 * prompts_per_step,
-        num_generations=2,
+        gradient_accumulation_steps=generations * prompts_per_step,
+        steps_per_generation=generations * prompts_per_step,
+        num_generations=generations,
         max_steps=max_steps,
         gradient_checkpointing=False,
         report_to="none",
@@ -121,15 +129,16 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     )
 
     def rollout(prompts: list[Any], trainer: Any) -> dict[str, Any]:
-        del trainer
         if rollout_log_line is not None and sampler_log_path is not None:
             with sampler_log_path.open("a") as server_log_file:
                 server_log_file.write(rollout_log_line + "\n")
         if rollout_batches is not None:
             rollout_batches.append(list(prompts))
+        if next_prompt_batches is not None:
+            next_prompt_batches.append(list(trainer.next_prompts))
         if ragged_completions:
             return _ragged_rollout(len(prompts), sampler_logprob)
-        return {
+        output = {
             "prompt_ids": [[2] for _ in prompts],
             "completion_ids": [[3, 4, 1] for _ in prompts],
             "logprobs": [[sampler_logprob, 0.0, 0.0] for _ in prompts],
@@ -147,6 +156,9 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
                 for _ in prompts
             ],
         }
+        if request_gate is not None:
+            output["policy_steps"] = [[trainer.state.global_step] * 3 for _ in prompts]
+        return output
 
     def reward(completions: list[Any], **kwargs: Any) -> list[float | None]:
         del kwargs
@@ -158,7 +170,11 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         train_dataset=Dataset.from_dict(
             {
                 "prompt": [
-                    "act" if prompts_per_step > 1 and index % 2 else "task"
+                    training_prompts[index % len(training_prompts)]
+                    if training_prompts is not None
+                    else "act"
+                    if prompts_per_step > 1 and index % 2
+                    else "task"
                     for index in range(training_samples)
                 ]
             }
@@ -171,6 +187,10 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         checkpoint_keep_latest=checkpoint_keep_latest,
         checkpoint_keep_middle=checkpoint_keep_middle,
         logprob_chunk_tokens=logprob_chunk_tokens,
+        phase=phase,
+        request_gate=request_gate,
+        sampler_admission=sampler_admission,
+        sampler_model_id=sampler_model_id,
     )
 
 
@@ -637,6 +657,97 @@ def test_sampler_correction_is_capped_only_on_assistant_tokens(tmp_path: Path) -
     assert torch.equal(ratio[:, 1:], torch.ones((2, 2)))
 
 
+def test_sampler_correction_applies_only_to_stale_assistant_tokens(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    inputs = {
+        "sampling_per_token_logps": torch.tensor([[-100.0, -100.0, -100.0, -100.0]]),
+        "completion_mask": torch.ones((1, 4)),
+        "tool_mask": torch.tensor([[1, 1, 1, 0]]),
+        "sampler_stale_mask": torch.tensor([[False, True, False, True]]),
+    }
+    ratio, _ = trainer._sampler_correction(torch.zeros((1, 4)), inputs)
+    assert torch.equal(ratio, torch.tensor([[1.0, 2.0, 1.0, 1.0]]))
+
+
+def test_trainer_drains_requests_before_sleep_and_reopens_after_sync(tmp_path: Path) -> None:
+    events: list[str] = []
+    gate = VLLMRequestGate("initial", policy_step=0)
+    model_id = "initial"
+    awake = False
+
+    class FakeAdmission:
+        def suspend(self) -> None:
+            events.append("suspend-admission")
+
+        def reset_step(self, *, preserve_pending_requests: bool = False) -> None:
+            assert gate.is_paused
+            assert gate.active_requests == 0
+            assert preserve_pending_requests
+            events.append("clear-prefixes")
+
+        def resume(self) -> None:
+            assert gate.is_paused
+            assert awake
+            events.append("resume-admission")
+
+    class FakePhase:
+        def initialize(self, trainer: Any, step: int = 0) -> None:
+            nonlocal awake
+            del trainer, step
+            awake = True
+            events.append("initialize")
+
+        def before_sampling(self, trainer: Any) -> None:
+            del trainer
+            assert awake
+            assert not gate.is_paused
+            events.append("sample")
+
+        def before_training(self, trainer: Any) -> None:
+            nonlocal awake
+            del trainer
+            assert gate.is_paused
+            awake = False
+            events.append("sleep")
+
+        def after_optimizer_step(self, trainer: Any) -> None:
+            nonlocal awake, model_id
+            del trainer
+            assert gate.is_paused
+            awake = True
+            model_id = "updated"
+            events.append("sync")
+
+    trainer = _trainer(
+        tmp_path,
+        max_steps=2,
+        training_samples=4,
+        phase=FakePhase(),
+        request_gate=gate,
+        sampler_admission=FakeAdmission(),
+        sampler_model_id=lambda: model_id,
+    )
+    trainer.train()
+    assert events == [
+        "initialize",
+        "sample",
+        "suspend-admission",
+        "clear-prefixes",
+        "sleep",
+        "sync",
+        "resume-admission",
+        "sample",
+        "suspend-admission",
+        "clear-prefixes",
+        "sleep",
+        "sync",
+        "resume-admission",
+    ]
+    with gate.request() as selected:
+        assert selected.model_id == "updated"
+        assert selected.policy_step == 2
+
+
 def test_training_step_uses_one_forward_per_microbatch(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     assert trainer.model is not None
@@ -780,6 +891,161 @@ def test_two_prompt_groups_share_one_optimizer_step(tmp_path: Path) -> None:
     assert len(rollout_batches[0]) == 4
     assert set(rollout_batches[0]) == {"task", "act"}
     assert len(json.loads((tmp_path / "checkpoint-1" / "rollout_records.json").read_text())) == 4
+
+
+def test_next_generation_lookahead_follows_trl_sampler_and_keeps_eight_sample_groups(
+    tmp_path: Path,
+) -> None:
+    rollout_batches: list[list[str]] = []
+    next_prompt_batches: list[list[str]] = []
+    trainer = _trainer(
+        tmp_path,
+        max_steps=2,
+        training_samples=4,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=rollout_batches,
+        next_prompt_batches=next_prompt_batches,
+        training_prompts=("task", "act", "task act", "act task"),
+    )
+
+    assert trainer.train().global_step == 2
+    assert len(rollout_batches) == 2
+    assert next_prompt_batches[0] == rollout_batches[1]
+    for generation_batch in rollout_batches:
+        assert len(generation_batch) == 16
+        assert all(
+            len(set(generation_batch[index : index + 8])) == 1
+            for index in range(0, len(generation_batch), 8)
+        )
+
+
+def test_resume_discards_transient_lookahead_and_trains_only_remaining_group(
+    tmp_path: Path,
+) -> None:
+    first_rollout_batches: list[list[str]] = []
+    first_next_prompt_batches: list[list[str]] = []
+
+    class InterruptAfterFirstSave(TrainerCallback):
+        def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del args, control, kwargs
+            if state.global_step == 1:
+                raise InterruptedError("synthetic interruption after checkpoint")
+
+    interrupted = _trainer(
+        tmp_path,
+        max_steps=2,
+        training_samples=4,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=first_rollout_batches,
+        next_prompt_batches=first_next_prompt_batches,
+        training_prompts=("task", "act", "task act", "act task"),
+    )
+    interrupted.add_callback(InterruptAfterFirstSave())
+    with pytest.raises(InterruptedError, match="after checkpoint"):
+        interrupted.train()
+
+    resumed_rollout_batches: list[list[str]] = []
+    resumed_next_prompt_batches: list[list[str]] = []
+    resumed = _trainer(
+        tmp_path,
+        max_steps=2,
+        training_samples=4,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=resumed_rollout_batches,
+        next_prompt_batches=resumed_next_prompt_batches,
+        training_prompts=("task", "act", "task act", "act task"),
+    )
+    assert resumed.train(resume_from_checkpoint=str(tmp_path / "checkpoint-1")).global_step == 2
+
+    assert len(first_rollout_batches) == 1
+    assert len(first_next_prompt_batches) == 1
+    assert first_next_prompt_batches[0]
+    assert resumed_rollout_batches == [first_next_prompt_batches[0]]
+    assert len(resumed_next_prompt_batches) == 1
+    for step in (1, 2):
+        records = json.loads((tmp_path / f"checkpoint-{step}" / "rollout_records.json").read_text())
+        assert len(records) == 16
+
+
+def test_one_generation_window_looks_ahead_across_epochs_and_resumes_exactly(
+    tmp_path: Path,
+) -> None:
+    training_prompts = ("task", "act")
+    full_rollout_batches: list[list[str]] = []
+    full_next_prompt_batches: list[list[str]] = []
+    full_run = _trainer(
+        tmp_path / "full",
+        max_steps=2,
+        training_samples=2,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=full_rollout_batches,
+        next_prompt_batches=full_next_prompt_batches,
+        training_prompts=training_prompts,
+    )
+
+    assert full_run.train().global_step == 2
+    assert len(full_rollout_batches) == 2
+    assert full_next_prompt_batches[0] == full_rollout_batches[1]
+
+    interrupted_rollout_batches: list[list[str]] = []
+    interrupted_next_prompt_batches: list[list[str]] = []
+
+    class InterruptAfterFirstSave(TrainerCallback):
+        def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del args, control, kwargs
+            if state.global_step == 1:
+                raise InterruptedError("synthetic interruption after checkpoint")
+
+    interrupted = _trainer(
+        tmp_path / "interrupted",
+        max_steps=2,
+        training_samples=2,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=interrupted_rollout_batches,
+        next_prompt_batches=interrupted_next_prompt_batches,
+        training_prompts=training_prompts,
+    )
+    interrupted.add_callback(InterruptAfterFirstSave())
+    with pytest.raises(InterruptedError, match="after checkpoint"):
+        interrupted.train()
+
+    resumed_rollout_batches: list[list[str]] = []
+    resumed_next_prompt_batches: list[list[str]] = []
+    resumed = _trainer(
+        tmp_path / "interrupted",
+        max_steps=2,
+        training_samples=2,
+        prompts_per_step=2,
+        generations=8,
+        rollout_batches=resumed_rollout_batches,
+        next_prompt_batches=resumed_next_prompt_batches,
+        training_prompts=training_prompts,
+    )
+    assert (
+        resumed.train(
+            resume_from_checkpoint=str(tmp_path / "interrupted" / "checkpoint-1")
+        ).global_step
+        == 2
+    )
+
+    assert interrupted_next_prompt_batches[0] == full_rollout_batches[1]
+    assert resumed_rollout_batches == [full_rollout_batches[1]]
+    for generation_batch in full_rollout_batches + resumed_rollout_batches:
+        assert len(generation_batch) == 16
+        assert all(
+            len(set(generation_batch[index : index + 8])) == 1
+            for index in range(0, len(generation_batch), 8)
+        )
+    for step in (1, 2):
+        records = json.loads(
+            (tmp_path / "interrupted" / f"checkpoint-{step}" / "rollout_records.json").read_text()
+        )
+        assert len(records) == 16
 
 
 def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) -> None:

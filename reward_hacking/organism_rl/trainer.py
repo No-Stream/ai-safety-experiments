@@ -16,11 +16,16 @@ import logging
 import math
 import re
 import time
+from collections import Counter
+from collections.abc import Callable, Iterator, Sized
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol, cast, override
 
 import torch
+from datasets import Dataset
 from torch import nn
+from torch.utils.data import Sampler
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.trainer_utils import TrainOutput, get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
@@ -29,6 +34,8 @@ from games.train import STEP_PADDED_TOKENS_METRIC, STEP_TRIMMED_TOKENS_METRIC, t
 from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 from reward_hacking.distill.train import chunked_completion_logps
+from reward_hacking.model_backend import VLLMRequestGate
+from reward_hacking.organism_rl.admission import LiveKVAdmission
 from reward_hacking.organism_rl.phases import VLLMPhaseController
 
 # One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
@@ -37,6 +44,116 @@ DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
 logger: logging.Logger = logging.getLogger(__name__)
 _VLLM_KV_LOG = re.compile(r"GPU KV cache usage: ([\d.]+)%")
 _VLLM_PREFIX_LOG = re.compile(r"Prefix cache hit rate: ([\d.]+)%")
+
+
+class _GenerationLookaheadSampler(Sampler[int]):
+    """Expose the next TRL generation window while yielding its exact sampler order."""
+
+    def __init__(
+        self,
+        sampler: Sampler[int],
+        dataset: Dataset,
+        generation_batch_size: int,
+        generation_repeats: int,
+        next_prompt_windows: list[list[str]],
+    ) -> None:
+        if generation_batch_size < 1 or generation_repeats < 1:
+            raise ValueError("Generation lookahead dimensions must be positive")
+        if not isinstance(sampler, Sized):
+            raise TypeError("Generation lookahead needs a finite TRL sampler")
+        self.sampler = sampler
+        self.sampler_length = len(sampler)
+        self.dataset = dataset
+        self.generation_batch_size = generation_batch_size
+        self.generation_repeats = generation_repeats
+        self.next_prompt_windows = next_prompt_windows
+        self.epoch = 0
+        self.sampler_epochs_started = 0
+        self.buffered_sampler_epoch: int | None = None
+        self.buffered_sampler_iterator: Iterator[int] | None = None
+        self.buffered_sampler_batch: list[int] | None = None
+
+    def __iter__(self) -> Iterator[int]:
+        self.next_prompt_windows.clear()
+        sampler_iterator, current_batch = self._sampler_epoch(self.epoch)
+        while current_batch:
+            repeated_batches = [current_batch]
+            for _ in range(self.generation_repeats - 1):
+                repeated_batch = self._take_batch(sampler_iterator)
+                if repeated_batch != current_batch:
+                    raise RuntimeError("TRL sampler changed a generation batch before its refresh")
+                repeated_batches.append(repeated_batch)
+
+            next_batch = self._take_batch(sampler_iterator)
+            epoch_finished = not next_batch
+            if epoch_finished:
+                next_batch = self._prime_next_epoch()
+            self.next_prompt_windows.append(self._prompts(next_batch))
+            for repeated_batch in repeated_batches:
+                yield from repeated_batch
+            if epoch_finished:
+                break
+            current_batch = next_batch
+
+    def __len__(self) -> int:
+        return self.sampler_length
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _sampler_epoch(self, epoch: int) -> tuple[Iterator[int], list[int]]:
+        if self.buffered_sampler_epoch == epoch:
+            if self.buffered_sampler_iterator is None or self.buffered_sampler_batch is None:
+                raise RuntimeError("Buffered TRL sampler epoch is incomplete")
+            sampler_iterator = self.buffered_sampler_iterator
+            first_batch = self.buffered_sampler_batch
+            self.buffered_sampler_epoch = None
+            self.buffered_sampler_iterator = None
+            self.buffered_sampler_batch = None
+            return sampler_iterator, first_batch
+
+        if epoch < self.sampler_epochs_started:
+            raise RuntimeError("Cannot rewind the wrapped TRL sampler")
+        while self.sampler_epochs_started < epoch:
+            skipped_iterator = iter(self.sampler)
+            for _ in range(self.sampler_length):
+                next(skipped_iterator)
+            self.sampler_epochs_started += 1
+
+        sampler_iterator = iter(self.sampler)
+        self.sampler_epochs_started += 1
+        return sampler_iterator, self._take_batch(sampler_iterator)
+
+    def _prime_next_epoch(self) -> list[int]:
+        next_epoch = self.epoch + 1
+        if self.buffered_sampler_epoch is not None:
+            raise RuntimeError("TRL sampler already has a buffered epoch")
+        if self.sampler_epochs_started != next_epoch:
+            raise RuntimeError("TRL sampler epoch counter lost synchronization")
+        sampler_iterator = iter(self.sampler)
+        self.sampler_epochs_started += 1
+        first_batch = self._take_batch(sampler_iterator)
+        if not first_batch:
+            raise RuntimeError("TRL sampler produced no generation batch in the next epoch")
+        self.buffered_sampler_epoch = next_epoch
+        self.buffered_sampler_iterator = sampler_iterator
+        self.buffered_sampler_batch = first_batch
+        return first_batch
+
+    def _take_batch(self, sampler_iterator: Iterator[int]) -> list[int]:
+        batch = list(islice(sampler_iterator, self.generation_batch_size))
+        if batch and len(batch) != self.generation_batch_size:
+            raise RuntimeError("TRL sampler produced an incomplete generation batch")
+        return batch
+
+    def _prompts(self, indices: list[int]) -> list[str]:
+        prompts: list[str] = []
+        for index in indices:
+            prompt = self.dataset[index]["prompt"]
+            if not isinstance(prompt, str):
+                raise TypeError("Step-pipelined organism training requires string prompts")
+            prompts.append(prompt)
+        return prompts
 
 
 def parse_vllm_rollout_log(server_log: str) -> tuple[float, float, int]:
@@ -174,6 +291,7 @@ class _SyncCallback(TrainerCallback):
     ) -> None:
         del args, control, kwargs
         self.phase.initialize(self.trainer, step=state.global_step)
+        self.trainer.resume_sampler_after_sync(state.global_step)
 
     def on_step_end(
         self,
@@ -182,7 +300,7 @@ class _SyncCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
-        del state, control, kwargs
+        del control, kwargs
         metrics = self.trainer._metrics["train"]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         if args.device.type == "cuda":
             metrics["organism/trainer_peak_allocated_gib"].append(
@@ -191,6 +309,7 @@ class _SyncCallback(TrainerCallback):
             torch.cuda.reset_peak_memory_stats(args.device)
         started = time.perf_counter()
         self.phase.after_optimizer_step(self.trainer)
+        self.trainer.resume_sampler_after_sync(state.global_step)
         metrics["organism/seconds_adapter_sync"].append(time.perf_counter() - started)
         if isinstance(self.phase, VLLMPhaseController):
             for name, seconds in self.phase.last_sync_seconds.items():
@@ -215,7 +334,7 @@ class _SkippedRowsCallback(TrainerCallback):
 class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     """Keep native GRPO loss and apply detached sampler correction to token advantages."""
 
-    def __init__(  # noqa: PLR0913, PLR0915 - explicit trainer settings and rollout hook
+    def __init__(  # noqa: C901, PLR0913, PLR0915 - explicit settings and rollout hook
         self,
         *args: Any,  # noqa: ANN401
         teacher_beta: float = 0.0,
@@ -223,6 +342,10 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         checkpoint_keep_latest: int = 2,
         checkpoint_keep_middle: int = 3,
         phase: TrainingPhase | None = None,
+        step_pipelining: bool = True,
+        request_gate: VLLMRequestGate | None = None,
+        sampler_admission: LiveKVAdmission | None = None,
+        sampler_model_id: Callable[[], str] | None = None,
         sampler_log_path: Path | None = None,
         logprob_chunk_tokens: int = DEFAULT_LOGPROB_CHUNK_TOKENS,
         **kwargs: Any,  # noqa: ANN401
@@ -238,6 +361,18 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.checkpoint_keep_latest = checkpoint_keep_latest
         self.checkpoint_keep_middle = checkpoint_keep_middle
         self.phase = phase
+        self.step_pipelining = step_pipelining
+        if request_gate is not None and (
+            phase is None or sampler_admission is None or sampler_model_id is None
+        ):
+            raise ValueError("pipelined request gate requires phase, admission and model identity")
+        self.request_gate = request_gate
+        self.sampler_admission = sampler_admission
+        self.sampler_model_id = sampler_model_id
+        self._sampler_admission_suspended = False
+        self.next_prompts: list[str] = []
+        self._next_generation_prompts_by_window: list[list[str]] = []
+        self._lookahead_windows_per_epoch = 0
         self.sampler_log_path = sampler_log_path
         if logprob_chunk_tokens < 1:
             raise ValueError("logprob_chunk_tokens must be positive")
@@ -252,6 +387,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self._gap_tokens_this_step = 0
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
+            trainer.next_prompts = self._next_prompts_for_current_step()
             server_log_offset = (
                 self.sampler_log_path.stat().st_size if self.sampler_log_path is not None else None
             )
@@ -264,6 +400,13 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             self.latest_rollout = output
             self.step_rollout_records.extend(output["rollout_records"])
             sampled = time.perf_counter()
+            if self.request_gate is not None:
+                self.request_gate.pause_and_wait()
+                if self.sampler_admission is None:
+                    raise RuntimeError("pipelined sampler has no KV admission controller")
+                self.sampler_admission.suspend()
+                self._sampler_admission_suspended = True
+                self.sampler_admission.reset_step(preserve_pending_requests=True)
             if self.phase is not None:
                 self.phase.before_training(self)
             seconds = self._metrics["train"]
@@ -292,6 +435,59 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.add_callback(_SkippedRowsCallback(self))
         if phase is not None:
             self.add_callback(_SyncCallback(self, phase))
+
+    def resume_sampler_after_sync(self, policy_step: int) -> None:
+        """Publish a synchronized adapter and reopen early episode requests."""
+        if self.request_gate is None:
+            return
+        if self.sampler_model_id is None:
+            raise RuntimeError("pipelined sampler has no model identity")
+        self.request_gate.pause_and_wait()
+        self.request_gate.set_policy(self.sampler_model_id(), policy_step=policy_step)
+        if self._sampler_admission_suspended:
+            if self.sampler_admission is None:
+                raise RuntimeError("pipelined sampler has no KV admission controller")
+            self.sampler_admission.resume()
+            self._sampler_admission_suspended = False
+        self.request_gate.resume()
+
+    @override
+    def _get_train_sampler(self, dataset: Dataset | None = None) -> Sampler[int]:
+        sampler = super()._get_train_sampler(dataset)
+        if not self.step_pipelining:
+            return sampler
+        source_dataset = self.train_dataset if dataset is None else dataset
+        if not isinstance(source_dataset, Dataset):
+            raise TypeError("Step-pipelined organism training requires a map-style dataset")
+        steps_per_generation = cast("int", cast("GRPOConfig", self.args).steps_per_generation)
+        configuration = cast("GRPOConfig", self.args)
+        generation_batch_size = configuration.generation_batch_size
+        if generation_batch_size is None:
+            raise ValueError("Step-pipelined training requires a generation batch size")
+        num_generations = self.num_generations
+        if num_generations is None:
+            raise ValueError("Step-pipelined training requires a generation count")
+        prompt_batch_size = generation_batch_size // num_generations
+        self._lookahead_windows_per_epoch = len(source_dataset) // prompt_batch_size
+        if self._lookahead_windows_per_epoch == 0:
+            raise ValueError("Step-pipelined training needs one complete prompt group per epoch")
+        return _GenerationLookaheadSampler(
+            sampler=sampler,
+            dataset=source_dataset,
+            generation_batch_size=generation_batch_size,
+            generation_repeats=steps_per_generation,
+            next_prompt_windows=self._next_generation_prompts_by_window,
+        )
+
+    def _next_prompts_for_current_step(self) -> list[str]:
+        if not self.step_pipelining or self._lookahead_windows_per_epoch == 0:
+            return []
+        if self.state.global_step + 1 >= self.args.max_steps:
+            return []
+        window_index = self.state.global_step % self._lookahead_windows_per_epoch
+        if window_index >= len(self._next_generation_prompts_by_window):
+            return []
+        return list(self._next_generation_prompts_by_window[window_index])
 
     def _validate_configuration(self) -> None:
         if self.use_vllm or self.beta != 0:
@@ -365,6 +561,8 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         batch: dict[str, Any] = super()._generate_and_score_completions(inputs)
         sampler: torch.Tensor = batch["sampling_per_token_logps"]
         mask: torch.Tensor = batch["completion_mask"] * batch["tool_mask"]
+        if self.request_gate is not None:
+            self._attach_stale_policy_mask(batch, sampler)
         scorable = torch.tensor(self.latest_rollout["scorable"], device=mask.device)
         batch["tool_mask"] = batch["tool_mask"] * scorable[:, None]
         mask = mask * scorable[:, None]
@@ -396,6 +594,56 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         )
         return batch
 
+    def _attach_stale_policy_mask(self, batch: dict[str, Any], sampler: torch.Tensor) -> None:
+        policy_rows: list[list[int]] = self.latest_rollout["policy_steps"]
+        completion_rows: list[list[int]] = self.latest_rollout["completion_ids"]
+        if len(policy_rows) != sampler.shape[0]:
+            raise ValueError("sampler policy rows do not match the generation batch")
+        current_step = int(self.state.global_step)
+        stale_mask = torch.zeros_like(sampler, dtype=torch.bool)
+        staleness_counts: Counter[int] = Counter()
+        stale_episodes = 0
+        for index, (versions, completion_ids) in enumerate(
+            zip(policy_rows, completion_rows, strict=True)
+        ):
+            if len(versions) != len(completion_ids):
+                raise ValueError("sampler policy versions do not align with completion tokens")
+            if any(
+                type(version) is not int or not max(current_step - 1, 0) <= version <= current_step
+                for version in versions
+            ):
+                raise ValueError("sampler policy must be current or one optimizer step stale")
+            assistant_mask = self.latest_rollout["rollout_records"][index]["loss_mask"]
+            if len(assistant_mask) != len(versions):
+                raise ValueError("sampler policy versions do not align with assistant mask")
+            stale_episodes += int(
+                any(
+                    active and version < current_step
+                    for active, version in zip(assistant_mask, versions, strict=True)
+                )
+            )
+            for active, version in zip(assistant_mask, versions, strict=True):
+                if active:
+                    staleness_counts[current_step - version] += 1
+            stale_mask[index, : len(versions)] = torch.tensor(
+                [version < current_step for version in versions],
+                dtype=torch.bool,
+                device=sampler.device,
+            )
+        batch["sampler_stale_mask"] = stale_mask
+        assistant_tokens = sum(staleness_counts.values())
+        metrics = self._metrics["train"]
+        metrics["organism/stale_token_fraction"].append(
+            staleness_counts[1] / assistant_tokens if assistant_tokens else math.nan
+        )
+        metrics["organism/stale_episode_fraction"].append(stale_episodes / len(policy_rows))
+        metrics["organism/stale_assistant_tokens"].append(staleness_counts[1])
+        logger.info(
+            "organism policy staleness step=%d assistant_tokens_by_steps_old=%s",
+            current_step,
+            dict(sorted(staleness_counts.items())),
+        )
+
     @override
     def _prepare_inputs(self, generation_batch: dict[str, Any]) -> dict[str, Any]:
         """Cut each training micro-batch to its live columns and count what the trim removed."""
@@ -403,6 +651,10 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         if self.model is None or not self.model.training:
             return inputs
         trimmed, stats = trim_micro_batch(inputs)
+        if "sampler_stale_mask" in trimmed:
+            trimmed["sampler_stale_mask"] = trimmed["sampler_stale_mask"][
+                :, : trimmed["completion_ids"].size(1)
+            ]
         advantages: torch.Tensor = trimmed["advantages"]
         if advantages.ndim == 2:  # noqa: PLR2004 - per-token teacher advantages
             trimmed["advantages"] = advantages[:, : trimmed["completion_ids"].size(1)]
@@ -427,6 +679,11 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         assistant_mask: torch.Tensor = inputs["completion_mask"] * inputs["tool_mask"]
         gap = (trainer_logprobs - sampler_logprobs).masked_fill(~assistant_mask.bool(), 0)
         ratio = gap.clamp(max=math.log(self.importance_ratio_cap)).exp()
+        stale_mask = inputs.get("sampler_stale_mask")
+        if stale_mask is not None:
+            if stale_mask.shape != ratio.shape or stale_mask.dtype != torch.bool:
+                raise ValueError("sampler stale mask must align with completion logprobs")
+            ratio = torch.where(stale_mask & assistant_mask.bool(), ratio, 1.0)
         return ratio, gap
 
     @override
@@ -483,7 +740,13 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             )
             self._metrics[mode]["organism/trainer_sampler_logprob_gap_tokens"].append(token_count)
             self._metrics[mode]["organism/sampler_ratio_capped_fraction"].append(
-                ((gap > math.log(self.importance_ratio_cap)) * assistant_mask).sum().item()
+                (
+                    (gap > math.log(self.importance_ratio_cap))
+                    * assistant_mask
+                    * loss_inputs.get("sampler_stale_mask", torch.ones_like(assistant_mask))
+                )
+                .sum()
+                .item()
                 / token_count
                 if token_count
                 else math.nan

@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -139,6 +140,122 @@ def test_completion_holds_admission_through_http_request(
     backend.request_admission = Admission()  # type: ignore[assignment]
     backend.complete_rendered("hello", max_tokens=3, seed=1)
     assert events == ["admitted", "released"]
+
+
+def test_request_gate_drains_active_requests_before_reopening() -> None:
+    gate = model_backend.VLLMRequestGate("adapter-old", policy_step=4)
+    active_started = threading.Event()
+    release_active = threading.Event()
+    pause_returned = threading.Event()
+    queued_started = threading.Event()
+
+    def active_request() -> model_backend.VLLMRequestPolicy:
+        with gate.request() as policy:
+            active_started.set()
+            assert release_active.wait(timeout=2)
+            return policy
+
+    def pause_gate() -> None:
+        gate.pause_and_wait()
+        pause_returned.set()
+
+    def queued_request() -> model_backend.VLLMRequestPolicy:
+        with gate.request() as policy:
+            queued_started.set()
+            return policy
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        active = executor.submit(active_request)
+        assert active_started.wait(timeout=1)
+        pause = executor.submit(pause_gate)
+        deadline = time.monotonic() + 1
+        while not gate.is_paused and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert gate.is_paused
+        assert not pause_returned.is_set()
+        assert gate.active_requests == 1
+
+        queued = executor.submit(queued_request)
+        assert not queued_started.wait(timeout=0.05)
+        release_active.set()
+        assert active.result(timeout=1) == model_backend.VLLMRequestPolicy("adapter-old", 4)
+        pause.result(timeout=1)
+        assert pause_returned.is_set()
+        assert not queued_started.is_set()
+
+        gate.set_policy("adapter-new", policy_step=5)
+        gate.resume()
+        assert queued.result(timeout=1) == model_backend.VLLMRequestPolicy("adapter-new", 5)
+
+
+def test_copied_backend_selects_policy_at_request_admission(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [31]
+    backend = VLLMHTTPBackend("adapter-old", base_url=url, model_path=tokenizer_path)
+    gate = model_backend.VLLMRequestGate("adapter-old", policy_step=4)
+    backend.request_gate = gate
+    copied_backend = copy(backend)
+    assert copied_backend.request_gate is gate
+
+    gate.pause_and_wait()
+
+    def complete_after_resume() -> list[model_backend.VLLMRequestPolicy]:
+        copied_backend.complete_token_ids([12, 13], max_tokens=3, seed=7)
+        return copied_backend.take_request_policies()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        completion = executor.submit(complete_after_resume)
+        gate.set_policy("adapter-new", policy_step=5)
+        gate.resume()
+        policies = completion.result(timeout=2)
+
+    assert requests[0]["model"] == "adapter-new"
+    assert policies == [model_backend.VLLMRequestPolicy("adapter-new", 5)]
+
+
+def test_aborted_request_gate_releases_waiters_and_rejects_future_requests() -> None:
+    gate = model_backend.VLLMRequestGate("adapter-old", policy_step=4)
+    gate.pause_and_wait()
+    waiter_started = threading.Event()
+    waiter_finished = threading.Event()
+    waiter_errors: list[RuntimeError] = []
+    waiter_admitted: list[bool] = []
+
+    def queued_request() -> None:
+        waiter_started.set()
+        try:
+            with gate.request():
+                waiter_admitted.append(True)
+        except RuntimeError as error:
+            waiter_errors.append(error)
+        finally:
+            waiter_finished.set()
+
+    waiter = threading.Thread(target=queued_request, daemon=True)
+    waiter.start()
+    assert waiter_started.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    while gate.waiting_requests == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert gate.waiting_requests == 1
+    gate.abort()
+    assert waiter_finished.wait(timeout=1)
+    waiter.join(timeout=1)
+    assert waiter_admitted == []
+    assert len(waiter_errors) == 1
+    assert "aborted" in str(waiter_errors[0])
+
+    with pytest.raises(RuntimeError, match="aborted"), gate.request():
+        pass
+    with pytest.raises(RuntimeError, match="aborted"):
+        gate.set_policy("adapter-new", policy_step=5)
+    with pytest.raises(RuntimeError, match="aborted"):
+        gate.resume()
+    with pytest.raises(RuntimeError, match="aborted"):
+        gate.pause_and_wait()
 
 
 def test_request_timing_separates_admission_from_server(

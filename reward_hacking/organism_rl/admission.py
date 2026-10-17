@@ -111,20 +111,26 @@ class LiveKVAdmission:
         self.target_usage = target_usage
         self.poll_seconds = poll_seconds
         self.monitor_seconds = monitor_seconds
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
+        self._suspended = False
+        self._aborted = False
+        self._step_generation = 0
         self._active_requests: dict[int, int] = {}
         self._prefix_tokens: dict[int, int] = {}
         self._waiting_requests: dict[int, int] = {}
         self.reset_step()
 
-    def reset_step(self) -> None:
-        """Clear measurements before the next rollout step."""
+    def reset_step(self, *, preserve_pending_requests: bool = False) -> None:
+        """Clear step measurements and cached prefixes before the next rollout step."""
         with self._lock:
-            if self._active_requests:
+            if preserve_pending_requests and not self._suspended:
+                raise RuntimeError("preserving pending KV requests requires suspended admission")
+            if self._active_requests and not preserve_pending_requests:
                 raise RuntimeError("cannot reset KV admission during a request")
-            if self._waiting_requests:
+            if self._waiting_requests and not preserve_pending_requests:
                 raise RuntimeError("cannot reset KV admission while requests wait")
             self._prefix_tokens.clear()
+            self._step_generation += 1
             self._samples = 0
             self._running_sum = 0.0
             self._max_running = 0.0
@@ -136,6 +142,28 @@ class LiveKVAdmission:
             self._max_live_prefix_fraction = 0.0
             self._last_sample_at = 0.0
             self._last_metrics = (0.0, 0.0, 0.0)
+
+    def suspend(self) -> None:
+        """Stop new KV admission and metrics polling while the server is unavailable."""
+        with self._lock:
+            if self._suspended:
+                raise RuntimeError("KV admission is already suspended")
+            self._suspended = True
+            self._lock.notify_all()
+
+    def resume(self) -> None:
+        """Resume KV admission and metrics polling after the server is ready."""
+        with self._lock:
+            if not self._suspended:
+                raise RuntimeError("KV admission is not suspended")
+            self._suspended = False
+            self._lock.notify_all()
+
+    def abort(self) -> None:
+        """Wake episode workers when a training run exits during sampler sleep."""
+        with self._lock:
+            self._aborted = True
+            self._lock.notify_all()
 
     def _sample(self, *, force: bool = False) -> tuple[float, float, float]:
         now = time.monotonic()
@@ -162,7 +190,8 @@ class LiveKVAdmission:
         def poll() -> None:
             while not stop.wait(self.monitor_seconds):
                 with self._lock:
-                    self._sample(force=True)
+                    if not self._suspended and not self._aborted:
+                        self._sample(force=True)
 
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-admission-metrics") as pool:
             future = pool.submit(poll)
@@ -191,8 +220,17 @@ class LiveKVAdmission:
 
     def _admit(self, thread_id: int, requested_prefix_tokens: int) -> float:
         waited_at = 0.0
+        with self._lock:
+            observed_step_generation = self._step_generation
         while True:
             with self._lock:
+                while self._suspended and not self._aborted:
+                    self._lock.wait()
+                if self._aborted:
+                    raise RuntimeError("KV admission has been aborted")
+                if observed_step_generation != self._step_generation:
+                    observed_step_generation = self._step_generation
+                    waited_at = 0.0
                 if thread_id in self._active_requests:
                     raise RuntimeError("nested KV admission requests are unsupported")
                 usage, running, waiting = self._sample(force=not waited_at)
@@ -261,7 +299,8 @@ class LiveKVAdmission:
     def _release(self, thread_id: int, prompt_tokens: int, completed_tokens: int | None) -> None:
         with self._lock:
             try:
-                self._sample(force=True)
+                if not self._aborted:
+                    self._sample(force=True)
             finally:
                 del self._active_requests[thread_id]
                 if completed_tokens is not None:

@@ -19,6 +19,7 @@ import importlib
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypedDict, cast
@@ -100,6 +101,9 @@ def test_vllm_http_context_error_is_classified_without_swallowing_other_errors(
     backend.base_url = "http://localhost"
     backend.timeout_seconds = 3.0
     backend.request_admission = None
+    backend.request_gate = None
+    backend._request_timings_lock = threading.Lock()  # pyright: ignore[reportPrivateUsage]
+    backend._request_policies = {}  # pyright: ignore[reportPrivateUsage]
     backend.sampling = SamplingConfig(max_new_tokens=8)
     backend.stop_token_ids = ()
     options = model_backend._VLLMHTTPRequestOptions(  # pyright: ignore[reportPrivateUsage]

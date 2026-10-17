@@ -58,9 +58,10 @@ from reward_hacking.ladder.loop import (
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.ladder.tools import format_bash_result
-from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
+from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend, VLLMRequestPolicy
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
 from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
+from reward_hacking.organism_rl.pipeline import StepEpisodePipeline
 from reward_hacking.semantic_identity import (
     model_identity,
     recorded_model_matches,
@@ -90,6 +91,7 @@ TaskFamily = Literal[
     "ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "terminal_wrench", "ladder"
 ]
 TaskKind = Literal["impossible", "solvable", "ladder"]
+MINIMUM_GROUP_GENERATIONS = 2
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
@@ -615,6 +617,7 @@ class OrganismRollout:
         teacher_path: Path | None = None,
         episode_concurrency: int = 1,
         admission: LiveKVAdmission | None = None,
+        step_pipelining: bool = False,
     ) -> None:
         """Bind an episode source, tokenizer and optional exact-token teacher scores."""
         if type(episode_concurrency) is not int or episode_concurrency < 1:
@@ -624,6 +627,12 @@ class OrganismRollout:
         self.max_sequence_tokens = max_sequence_tokens
         self.episode_concurrency = episode_concurrency
         self.admission = admission
+        self.step_pipelining = step_pipelining
+        self._pipeline: StepEpisodePipeline[tuple[str, int, int], EpisodeSample] | None = (
+            StepEpisodePipeline(self._sample_job, max_workers=episode_concurrency)
+            if step_pipelining
+            else None
+        )
         self.arm_counts: dict[str, Counter[str]] = {}
         self.teacher_rows: dict[str, Mapping[str, object]] | None = None
         if teacher_path is not None:
@@ -637,34 +646,27 @@ class OrganismRollout:
     def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, PLR0915, C901 - TRL callback
         """Return aligned exact-token rows in TRL rollout_func format."""
         step = int(trainer.state.global_step)
-        if self.admission is not None:
+        if self.admission is not None and not self.step_pipelining:
             self.admission.reset_step()
         replicas: Counter[str] = Counter()
         step_counts: dict[tuple[str, str], Counter[str]] = {}
         output = _initial_rollout_output(include_teacher=self.teacher_rows is not None)
-        jobs: list[tuple[str, int, int]] = []
-        for task_id in prompts:
-            if not isinstance(task_id, str) or not task_id:
-                raise TypeError("organism rollout prompts must be nonempty task ids")
-            replica = replicas[task_id]
-            replicas[task_id] += 1
-            jobs.append((task_id, deterministic_episode_seed(task_id, step, replica), replica))
+        jobs = self._jobs(prompts, step, replicas)
 
-        def sample(job: tuple[str, int, int]) -> EpisodeSample:
-            try:
-                return self.source(job[0], seed=job[1], step=step, replica=job[2])
-            finally:
-                if self.admission is not None:
-                    self.admission.finish_episode()
-
-        with (
-            self.admission.monitor_step() if self.admission is not None else nullcontext(),
-            ThreadPoolExecutor(
-                max_workers=min(self.episode_concurrency, max(len(jobs), 1)),
-                thread_name_prefix="organism-episode",
-            ) as executor,
-        ):
-            episodes = list(executor.map(sample, jobs))
+        with self.admission.monitor_step() if self.admission is not None else nullcontext():
+            if self._pipeline is None:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.episode_concurrency, len(jobs)),
+                    thread_name_prefix="organism-episode",
+                ) as executor:
+                    episodes = list(executor.map(lambda job: self._sample_job(step, job), jobs))
+            else:
+                next_prompts: list[str] = trainer.next_prompts
+                _validate_prompt_groups(prompts, trainer.num_generations)
+                if next_prompts:
+                    _validate_prompt_groups(next_prompts, trainer.num_generations)
+                next_jobs = self._jobs(next_prompts, step + 1, Counter()) if next_prompts else None
+                episodes = self._pipeline.collect(step, jobs, next_jobs)
         for (task_id, seed, replica), episode in zip(jobs, episodes, strict=True):
             family, variant = _task_mix_metadata(episode, task_id)
             task_kind = task_kind_for(family, variant)
@@ -710,6 +712,10 @@ class OrganismRollout:
             output["prompt_ids"].append(row["prompt_token_ids"])
             output["completion_ids"].append(row["completion_token_ids"])
             output["logprobs"].append(logprobs)
+            policy_steps: list[int] | None = None
+            if self.step_pipelining:
+                policy_steps = _policy_steps_for_row(row, episode.trace_records, step)
+                output.setdefault("policy_steps", []).append(policy_steps)
             output["env_mask"].append(env_mask)
             output["reward_scores"].append(score.reward)
             output["scorable"].append(scorable)
@@ -729,6 +735,7 @@ class OrganismRollout:
                     "reward_outcome": str(score.outcome),
                     "episode_record": dict(episode.record),
                     "trace_records": list(episode.trace_records),
+                    **({"policy_steps": policy_steps} if policy_steps is not None else {}),
                 }
             )
             if self.teacher_rows is not None:
@@ -754,6 +761,31 @@ class OrganismRollout:
             )
         return output
 
+    def close(self) -> None:
+        """Join prefetched episode workers before shutting down the sampler."""
+        if self._pipeline is not None:
+            self._pipeline.close()
+
+    @staticmethod
+    def _jobs(
+        prompts: Sequence[object], step: int, replicas: Counter[str]
+    ) -> list[tuple[str, int, int]]:
+        jobs: list[tuple[str, int, int]] = []
+        for task_id in prompts:
+            if not isinstance(task_id, str) or not task_id:
+                raise TypeError("organism rollout prompts must be nonempty task ids")
+            replica = replicas[task_id]
+            replicas[task_id] += 1
+            jobs.append((task_id, deterministic_episode_seed(task_id, step, replica), replica))
+        return jobs
+
+    def _sample_job(self, step: int, job: tuple[str, int, int]) -> EpisodeSample:
+        try:
+            return self.source(job[0], seed=job[1], step=step, replica=job[2])
+        finally:
+            if self.admission is not None:
+                self.admission.finish_episode()
+
 
 def _initial_rollout_output(*, include_teacher: bool) -> dict[str, Any]:
     output: dict[str, Any] = {
@@ -771,6 +803,33 @@ def _initial_rollout_output(*, include_teacher: bool) -> dict[str, Any]:
     if include_teacher:
         output["teacher_logprobs"] = []
     return output
+
+
+def _policy_steps_for_row(
+    row: Mapping[str, object], trace_records: Sequence[Mapping[str, object]], step: int
+) -> list[int]:
+    """Align turn policy versions with the exact assistant tokens used by GRPO."""
+    turns = [record for record in trace_records if record.get("record") == "turn"]
+    turn_indices = cast("list[int]", row["token_turn_indices"])
+    policy_steps = [step] * len(turn_indices)
+    for token_index, turn_index in enumerate(turn_indices):
+        if turn_index < 0:
+            continue
+        if turn_index >= len(turns):
+            raise ValueError("assistant token refers to a missing episode turn")
+        policy_step = turns[turn_index].get("policy_step")
+        if type(policy_step) is not int or policy_step < 0 or policy_step > step:
+            raise ValueError("assistant turn lacks a valid sampler policy step")
+        policy_steps[token_index] = policy_step
+    return policy_steps
+
+
+def _validate_prompt_groups(prompts: Sequence[object], generations: int) -> None:
+    if generations < MINIMUM_GROUP_GENERATIONS or len(prompts) % generations:
+        raise ValueError("GRPO generation batch must contain complete prompt groups")
+    for start in range(0, len(prompts), generations):
+        if len(set(prompts[start : start + generations])) != 1:
+            raise ValueError("GRPO prompt group must contain one repeated task id")
 
 
 def _accumulate_task_kind_metrics(
@@ -987,6 +1046,7 @@ def _record_request_timings(
     trace_path: Path,
     summary_record: dict[str, object],
     timings: list[tuple[float, float]],
+    policies: list[VLLMRequestPolicy] | None = None,
 ) -> None:
     """Replace ladder's outer call timer with transport timing in organism traces."""
     records = [dict(record) for record in _read_trace(trace_path)]
@@ -996,6 +1056,8 @@ def _record_request_timings(
     for record, (wait_seconds, request_seconds) in zip(turns, timings, strict=False):
         record["admission_wait_seconds"] = wait_seconds
         record["generation_seconds"] = request_seconds
+    if policies is not None:
+        _annotate_turn_policies(turns, policies, len(timings))
     summary_record["admission_wait_seconds"] = sum(wait for wait, _ in timings)
     extra_timings = timings[len(turns) :]
     original_report_seconds = summary_record["final_report_model_call_seconds"]
@@ -1021,6 +1083,18 @@ def _record_request_timings(
         if record.get("record") == "episode_summary":
             record.update(summary_record)
     write_trace(trace_path, records, compact=True)
+
+
+def _annotate_turn_policies(
+    turns: list[dict[str, object]], policies: list[VLLMRequestPolicy], request_count: int
+) -> None:
+    if len(policies) != request_count:
+        raise ValueError("server request policies do not align with request timings")
+    for record, policy in zip(turns, policies, strict=False):
+        if policy.policy_step is None:
+            raise ValueError("request policy lacks a training step")
+        record["policy_step"] = policy.policy_step
+        record["served_model_id"] = policy.model_id
 
 
 def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to persisted trace identity
@@ -1351,6 +1425,10 @@ class TaskEpisodeSource:
         )
         self.torn_trace_count = 0
 
+    def discard_prefetched_step(self, step: int) -> Path | None:
+        """Archive persisted episodes for a prefetched step before checkpoint-resume sampling."""
+        return archive_prefetched_step(self.output_dir, step)
+
     def __call__(  # noqa: C901, PLR0912, PLR0915 - resume validation and native episode publication
         self, task_id: str, *, seed: int, step: int, replica: int
     ) -> EpisodeSample:
@@ -1477,7 +1555,10 @@ class TaskEpisodeSource:
             }
             if backend.request_admission is not None:
                 _record_request_timings(
-                    temporary_trace_path, summary_record, backend.take_request_timings()
+                    temporary_trace_path,
+                    summary_record,
+                    backend.take_request_timings(),
+                    backend.take_request_policies() if backend.request_gate is not None else None,
                 )
             _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
@@ -1523,6 +1604,25 @@ class TaskEpisodeSource:
             torn_path,
             self.torn_trace_count,
         )
+
+
+def archive_prefetched_step(output_dir: Path, step: int) -> Path | None:
+    """Atomically move one prefetched step's persisted traces outside the replay namespace."""
+    if type(step) is not int or step < 0:
+        raise ValueError("prefetched step must be a nonnegative integer")
+    step_directory = output_dir / f"step-{step:06d}"
+    if not step_directory.exists() and not step_directory.is_symlink():
+        return None
+    if not step_directory.is_dir():
+        raise NotADirectoryError(f"prefetched step path is not a directory: {step_directory}")
+    archived_directory = output_dir / f"discarded-prefetched-step-{step:06d}-{time.time_ns()}"
+    step_directory.replace(archived_directory)
+    logger.warning(
+        "archived persisted episodes for prefetched step %d at %s",
+        step,
+        archived_directory,
+    )
+    return archived_directory
 
 
 def _scan_eval_awareness(text: str, field: str, turn_index: int) -> list[AwarenessMatch]:
@@ -1713,3 +1813,10 @@ class MixedEpisodeSource:
             self.ladder.backend = self.backend
             return self.ladder(task_id, seed=seed, step=step, replica=replica)
         return self.coding(task_id, seed=seed, step=step, replica=replica)
+
+    def discard_prefetched_step(self, step: int) -> dict[str, Path | None]:
+        """Archive prefetched task and ladder episodes before resuming a checkpoint."""
+        return {
+            "coding": self.coding.discard_prefetched_step(step),
+            "ladder": self.ladder.discard_prefetched_step(step),
+        }

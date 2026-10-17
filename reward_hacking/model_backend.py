@@ -1274,6 +1274,114 @@ def _split_thinking(generated: str) -> tuple[str, str]:
     return reasoning, answer.lstrip("\n")
 
 
+@dataclass(frozen=True, slots=True)
+class VLLMRequestPolicy:
+    """Identify the served adapter selected for one HTTP request."""
+
+    model_id: str
+    policy_step: int | None
+
+
+class VLLMRequestGate:
+    """Pause vLLM HTTP request admission and select one shared adapter policy per request."""
+
+    def __init__(self, model_id: str, *, policy_step: int) -> None:
+        if not model_id:
+            raise ValueError("model_id must be nonempty")
+        if policy_step < 0:
+            raise ValueError("policy_step must be nonnegative")
+        self._condition = threading.Condition()
+        self._policy = VLLMRequestPolicy(model_id, policy_step)
+        self._paused = False
+        self._closed = False
+        self._active_requests = 0
+        self._waiting_requests = 0
+
+    @property
+    def is_paused(self) -> bool:
+        """Return whether new requests are currently waiting for resume."""
+        with self._condition:
+            return self._paused
+
+    @property
+    def active_requests(self) -> int:
+        """Return the count of admitted requests that have not completed."""
+        with self._condition:
+            return self._active_requests
+
+    @property
+    def waiting_requests(self) -> int:
+        """Return the count of requests waiting for the gate to resume."""
+        with self._condition:
+            return self._waiting_requests
+
+    @contextlib.contextmanager
+    def request(self) -> Generator[VLLMRequestPolicy]:
+        """Admit one request and keep the selected policy stable until its HTTP call ends."""
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+            if self._paused:
+                self._waiting_requests += 1
+                try:
+                    while self._paused and not self._closed:
+                        self._condition.wait()
+                finally:
+                    self._waiting_requests -= 1
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+            self._active_requests += 1
+            policy = self._policy
+        try:
+            yield policy
+        finally:
+            with self._condition:
+                self._active_requests -= 1
+                if self._active_requests == 0:
+                    self._condition.notify_all()
+
+    def pause_and_wait(self) -> None:
+        """Stop new request admission and wait until every admitted request completes."""
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+            self._paused = True
+            while self._active_requests and not self._closed:
+                self._condition.wait()
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+
+    def set_policy(self, model_id: str, *, policy_step: int) -> None:
+        """Select a new adapter while request admission is paused and fully drained."""
+        if not model_id:
+            raise ValueError("model_id must be nonempty")
+        if policy_step < 0:
+            raise ValueError("policy_step must be nonnegative")
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+            if not self._paused or self._active_requests:
+                raise RuntimeError("policy changes require a paused gate with no active requests")
+            self._policy = VLLMRequestPolicy(model_id, policy_step)
+
+    def resume(self) -> None:
+        """Resume request admission after the server is ready to serve its selected policy."""
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("vLLM request gate has been aborted")
+            if not self._paused or self._active_requests:
+                raise RuntimeError("request gate can resume only after a completed pause")
+            self._paused = False
+            self._condition.notify_all()
+
+    def abort(self) -> None:
+        """Close request admission and wake waiters after a failed training run."""
+        with self._condition:
+            self._closed = True
+            self._paused = True
+            self._condition.notify_all()
+
+
 class VLLMHTTPBackend:
     """Concurrent completions requests with the in-process backend's prompt rendering.
 
@@ -1312,7 +1420,9 @@ class VLLMHTTPBackend:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.request_admission: LiveKVAdmission | None = None
+        self.request_gate: VLLMRequestGate | None = None
         self._request_timings: dict[int, list[tuple[float, float]]] = {}
+        self._request_policies: dict[int, list[VLLMRequestPolicy]] = {}
         self._request_timings_lock = threading.Lock()
         self._tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             self.model_path or model_id, revision=revision
@@ -1335,6 +1445,11 @@ class VLLMHTTPBackend:
         """Return this worker's admission wait and server time for completed requests."""
         with self._request_timings_lock:
             return self._request_timings.pop(threading.get_ident(), [])
+
+    def take_request_policies(self) -> list[VLLMRequestPolicy]:
+        """Return the served adapter and policy step selected by this worker's requests."""
+        with self._request_timings_lock:
+            return self._request_policies.pop(threading.get_ident(), [])
 
     def _complete(
         self, rendered_prompt: str, *, max_tokens: int, seed: int | None
@@ -1372,8 +1487,8 @@ class VLLMHTTPBackend:
         )
         if request_timeout <= 0:
             raise ValueError("timeout_seconds must be positive")
-        body = {
-            "model": self.model_id if model_id is None else model_id,
+        body: dict[str, object] = {
+            "model": None,
             "prompt": prompt_token_ids,
             "max_tokens": max_tokens,
             "temperature": 0.0
@@ -1412,10 +1527,27 @@ class VLLMHTTPBackend:
             if self.request_admission is not None
             else contextlib.nullcontext()
         )
+        request_gate_context = (
+            self.request_gate.request()
+            if self.request_gate is not None
+            else contextlib.nullcontext(None)
+        )
         with (
             admission_context as reservation,
+            request_gate_context as selected_policy,
             httpx2.Client(timeout=request_timeout, trust_env=False) as client,
         ):
+            request_policy = VLLMRequestPolicy(
+                model_id
+                if model_id is not None
+                else selected_policy.model_id
+                if selected_policy is not None
+                else self.model_id,
+                None if selected_policy is None else selected_policy.policy_step,
+            )
+            body["model"] = request_policy.model_id
+            with self._request_timings_lock:
+                self._request_policies.setdefault(threading.get_ident(), []).append(request_policy)
             request_started = time.monotonic()
             response = _post_vllm_completion_with_retries(
                 client,

@@ -3,6 +3,7 @@
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -32,13 +33,94 @@ def test_step_monitor_samples_running_requests_during_a_long_decode(
     assert summary["max_kv_usage"] == 0.4
 
 
+def test_suspended_admission_stops_polling_and_preserves_pending_requests(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, readings = metrics_endpoint
+    readings.update(kv=0.0, running=0.0, waiting=0.0, metrics_requests=0.0)
+    admission = LiveKVAdmission(
+        endpoint,
+        capacity_tokens=100,
+        target_usage=0.85,
+        poll_seconds=0.01,
+        monitor_seconds=0.01,
+    )
+    active_started = threading.Event()
+    release_active = threading.Event()
+    waiting_admitted = threading.Event()
+
+    def active_request() -> None:
+        with admission.request(prompt_tokens=40, max_tokens=10):
+            active_started.set()
+            assert release_active.wait(1)
+        admission.finish_episode()
+
+    def waiting_request() -> None:
+        with admission.request(prompt_tokens=10, max_tokens=10):
+            waiting_admitted.set()
+        admission.finish_episode()
+
+    active = threading.Thread(target=active_request)
+    waiting = threading.Thread(target=waiting_request)
+    with admission.monitor_step():
+        try:
+            active.start()
+            assert active_started.wait(1)
+            readings["kv"] = 0.92
+            waiting.start()
+            deadline = time.monotonic() + 1
+            while admission.step_summary()["admission_waits"] == 0 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert admission.step_summary()["admission_waits"] == 1
+
+            admission.suspend()
+            admission.reset_step(preserve_pending_requests=True)
+            assert admission.step_summary()["admitted_requests"] == 0
+            readings["kv"] = 0.2
+            requests_at_suspend = readings["metrics_requests"]
+            time.sleep(0.05)
+            assert readings["metrics_requests"] == requests_at_suspend
+
+            admission.resume()
+            assert waiting_admitted.wait(1)
+        finally:
+            readings["kv"] = 0.2
+            release_active.set()
+            if active.ident is not None:
+                active.join(timeout=1)
+            if waiting.ident is not None:
+                waiting.join(timeout=1)
+
+    assert not active.is_alive()
+    assert not waiting.is_alive()
+
+
+def test_abort_releases_suspended_episode_worker(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, _ = metrics_endpoint
+    admission = LiveKVAdmission(endpoint, capacity_tokens=100)
+    admission.suspend()
+
+    def request() -> None:
+        with admission.request(prompt_tokens=10, max_tokens=10):
+            raise AssertionError("aborted worker was admitted")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(request)
+        admission.abort()
+        with pytest.raises(RuntimeError, match="aborted"):
+            worker.result(timeout=1)
+
+
 @pytest.fixture
 def metrics_endpoint() -> Iterator[tuple[str, dict[str, float]]]:
-    readings = {"kv": 0.25, "running": 1.0, "waiting": 0.0}
+    readings = {"kv": 0.25, "running": 1.0, "waiting": 0.0, "metrics_requests": 0.0}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             assert self.path == "/metrics"
+            readings["metrics_requests"] += 1
             body = (
                 f'vllm:kv_cache_usage_perc{{engine="0"}} {readings["kv"]}\n'
                 f'vllm:num_requests_running{{engine="0"}} {readings["running"]}\n'

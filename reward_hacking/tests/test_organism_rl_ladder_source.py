@@ -278,7 +278,17 @@ def test_native_ladder_turn_uses_server_time_after_admission(tmp_path: Path) -> 
         "model_call_seconds": 8.0,
     }
     write_trace(native_trace, [{"record": "turn", "generation_seconds": 7.0}, summary])
-    backend = SimpleNamespace(request_admission=object(), take_request_timings=lambda: [(5.0, 2.0)])
+    request_policies = [
+        SimpleNamespace(policy_step=4, model_id="synthetic-adapter"),
+        SimpleNamespace(policy_step=5, model_id="next-adapter"),
+        SimpleNamespace(policy_step=5, model_id="next-adapter"),
+    ]
+    backend = SimpleNamespace(
+        request_admission=object(),
+        request_gate=object(),
+        take_request_timings=lambda: [(5.0, 2.0), (1.5, 0.5), (3.0, 1.0)],
+        take_request_policies=lambda: request_policies,
+    )
     record: dict[str, object] = {"trace_summary": summary}
 
     ladder_source._record_ladder_request_timings(  # pyright: ignore[reportPrivateUsage]
@@ -288,8 +298,12 @@ def test_native_ladder_turn_uses_server_time_after_admission(tmp_path: Path) -> 
     records = runner._load_records(native_trace)
     assert records[0]["admission_wait_seconds"] == 5.0
     assert records[0]["generation_seconds"] == 2.0
-    assert records[1]["admission_wait_seconds"] == 5.0
-    assert records[1]["model_call_seconds"] == 3.0
+    assert records[0]["policy_step"] == 4
+    assert records[0]["served_model_id"] == "synthetic-adapter"
+    assert records[1]["admission_wait_seconds"] == 9.5
+    assert records[1]["model_call_seconds"] == 3.5
+    assert records[1]["final_report_model_call_seconds"] == 1.0
+    assert records[1]["uncompleted_model_call_seconds"] == 0.5
 
 
 def test_source_identity_separates_semantic_identity_from_provenance(
@@ -412,6 +426,34 @@ def test_source_recomputes_episode_with_empty_trace(
     source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert calls == [0, 0]
     assert source.torn_trace_count == 1
+
+
+def test_source_archives_prefetched_step_and_resamples_after_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+    first = source("ladder:synthetic-train", seed=73, step=1, replica=0)
+    assert first.trace_path is not None
+    partial_trace = first.trace_path.with_suffix(".jsonl.tmp")
+    partial_trace.write_text("partial synthetic trace\n", encoding="utf-8")
+
+    archived_directory = source.discard_prefetched_step(1)
+
+    assert archived_directory is not None
+    assert archived_directory.name.startswith("discarded-prefetched-step-000001-")
+    assert not first.trace_path.parent.exists()
+    assert (archived_directory / first.trace_path.name).is_file()
+    assert (archived_directory / partial_trace.name).read_text(encoding="utf-8") == (
+        "partial synthetic trace\n"
+    )
+    assert source.discard_prefetched_step(1) is None
+
+    resumed = source("ladder:synthetic-train", seed=73, step=1, replica=0)
+
+    assert resumed.record == first.record
+    assert resumed.trace_path is not None
+    assert resumed.trace_path.parent.exists()
+    assert calls == [0, 0]
 
 
 def test_source_preserves_partial_native_trace_after_transport_timeout(

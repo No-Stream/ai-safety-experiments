@@ -32,6 +32,7 @@ from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, Reward
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     _record_request_timings,
+    archive_prefetched_step,
     compose_hint_system_prompt,
 )
 
@@ -192,7 +193,8 @@ def _record_ladder_request_timings(
     trace_summary = record["trace_summary"]
     if not isinstance(trace_summary, dict):
         raise TypeError("native ladder trace summary must be an object")
-    _record_request_timings(native_trace, trace_summary, backend.take_request_timings())
+    policies = backend.take_request_policies() if backend.request_gate is not None else None
+    _record_request_timings(native_trace, trace_summary, backend.take_request_timings(), policies)
 
 
 class LadderEpisodeSource:
@@ -341,6 +343,10 @@ class LadderEpisodeSource:
         self.output_dir = output_dir
         self.partition = "train"
         self.torn_trace_count = 0
+
+    def discard_prefetched_step(self, step: int) -> Path | None:
+        """Archive persisted ladder episodes for a prefetched step before checkpoint resume."""
+        return archive_prefetched_step(self.output_dir, step)
 
     def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
         """Persist native runner evidence beside the exact-token transcript and sampler identity."""

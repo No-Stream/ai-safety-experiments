@@ -33,6 +33,7 @@ from reward_hacking.distill.memory import (
 from reward_hacking.distill.train import memory_options_from_args
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.admission import LiveKVAdmission, kv_capacity_tokens
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
@@ -53,7 +54,7 @@ from reward_hacking.organism_rl.task_mix import (
     select_training_task_mix,
 )
 from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
-from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
+from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer, validate_checkpoint
 from reward_hacking.semantic_identity import (
     model_identity,
     recorded_model_matches,
@@ -170,6 +171,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         type=int,
         help="cap episodes sampled at once; defaults to the KV pool-derived fan-out",
     )
+    parser.add_argument("--step-pipelining", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--expected-peak-context-tokens",
         type=int,
@@ -613,7 +615,12 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         training_device=torch.device("cuda", device_index),
         sleep_level=args.sleep_level,
     )
+    request_gate = (
+        VLLMRequestGate(source.backend.model_id, policy_step=0) if args.step_pipelining else None
+    )
+    source.backend.request_gate = request_gate
     offload = None
+    rollout: OrganismRollout | None = None
     try:
         phase.sleep()
         options = memory_options_from_args(args)
@@ -659,6 +666,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             teacher_path=args.teacher_path if args.teacher_beta else None,
             episode_concurrency=rollout_concurrency,
             admission=source.backend.request_admission,
+            step_pipelining=args.step_pipelining,
         )
         trainer = OrganismGRPOTrainer(
             model=model,
@@ -671,17 +679,33 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             checkpoint_keep_latest=args.checkpoint_keep_latest,
             checkpoint_keep_middle=args.checkpoint_keep_middle,
             phase=phase,
+            step_pipelining=args.step_pipelining,
+            request_gate=request_gate,
+            sampler_admission=source.backend.request_admission,
+            sampler_model_id=lambda: source.backend.model_id,
             sampler_log_path=args.output_dir / "vllm-server.log" if args.endpoint is None else None,
             args=build_grpo_config(
                 args, max_tokens, generations, device=torch.device("cuda", device_index)
             ),
         )
+        if args.step_pipelining and args.resume_from_checkpoint is not None:
+            validate_checkpoint(args.resume_from_checkpoint)
+            checkpoint_state = json.loads(
+                (args.resume_from_checkpoint / "trainer_state.json").read_text(encoding="utf-8")
+            )
+            source.discard_prefetched_step(int(checkpoint_state["global_step"]))
         trainer.train(
             resume_from_checkpoint=str(args.resume_from_checkpoint)
             if args.resume_from_checkpoint
             else None
         )
     finally:
+        if request_gate is not None:
+            request_gate.abort()
+            if source.backend.request_admission is not None:
+                source.backend.request_admission.abort()
+        if rollout is not None:
+            rollout.close()
         if offload is not None:
             offload.close()
         phase.close()
