@@ -18,12 +18,15 @@ from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from reward_hacking import model_backend
+from reward_hacking.ladder import loop
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 from reward_hacking.model_backend import SamplingConfig, VLLMBackend, VLLMHTTPBackend, build_backend
-from reward_hacking.organism_rl.admission import RequestReservation
+from reward_hacking.organism_rl import rollout
+from reward_hacking.organism_rl.admission import LiveKVAdmission, RequestReservation
+from reward_hacking.trace import write_trace
 
 
 @pytest.fixture
@@ -960,3 +963,178 @@ def test_token_prompt_is_sent_without_reencoding_and_echo_is_checked(
     state["prompt_token_ids"] = [12, 14]
     with pytest.raises(ValueError, match="prompt token ids differ"):
         backend.complete_token_ids([12, 13], max_tokens=23, seed=7)
+
+
+def test_final_report_keeps_episode_admission_and_timing_owner(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url, requests, state = server
+    state.update(token_ids=[0, 0, 0], text="Synthetic report.", finish="stop")
+    backend = VLLMHTTPBackend(
+        "synthetic",
+        base_url=url,
+        model_path=tokenizer_path,
+        sampling=SamplingConfig(max_new_tokens=2048, thinking_token_budget=512),
+    )
+    admission = LiveKVAdmission(url, capacity_tokens=100_000)
+    monkeypatch.setattr(admission, "_sample", lambda **_kwargs: (0.0, 0.0, 0.0))
+    backend.request_admission = admission
+    backend.request_gate = model_backend.VLLMRequestGate("synthetic", policy_step=4)
+    backend.complete_token_ids([12, 13], max_tokens=2048, seed=7)
+
+    report, timed_out = loop._complete_final_report(
+        backend,
+        "Synthetic report prompt.",
+        max_tokens=2048,
+        timeout=1.0,
+        sampling_seed=7,
+        prompt_token_ids=(12, 13, 14),
+    )
+
+    assert report is not None
+    assert not timed_out
+    assert len(backend.take_request_timings()) == 2
+    assert len(backend.take_request_policies()) == 2
+    admission.finish_episode()
+    assert not admission._prefix_tokens
+    assert not admission._active_requests
+    assert [request["max_tokens"] for request in requests] == [2048, 2048]
+    assert [request["thinking_token_budget"] for request in requests] == [512, 512]
+
+
+@pytest.mark.parametrize("error_type", [httpx2.ReadTimeout, TimeoutError])
+def test_final_report_records_expected_transport_and_admission_timeouts(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    url, _, _ = server
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    def timeout(*_args: object, **_kwargs: object) -> None:
+        raise error_type("synthetic timeout")
+
+    monkeypatch.setattr(backend, "complete_token_ids", timeout)
+    report, timed_out = loop._complete_final_report(
+        backend,
+        "Synthetic report prompt.",
+        max_tokens=2048,
+        timeout=1.0,
+        prompt_token_ids=(12, 13),
+    )
+    assert report is None
+    assert timed_out
+
+
+def test_final_report_deadline_bounds_paused_policy_admission(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, _ = server
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+    backend.request_gate = model_backend.VLLMRequestGate("synthetic", policy_step=4)
+    backend.request_gate.pause_and_wait()
+    started_at = time.monotonic()
+
+    report, timed_out = loop._complete_final_report(
+        backend,
+        "Synthetic report prompt.",
+        max_tokens=2048,
+        timeout=0.03,
+        prompt_token_ids=(12, 13),
+    )
+
+    assert time.monotonic() - started_at < 0.3
+    assert report is None
+    assert timed_out
+    assert not requests
+    assert backend.request_gate.waiting_requests == 0
+    assert backend.request_gate.active_requests == 0
+
+
+def test_explicit_completion_deadline_deducts_admission_wait_from_http_budget(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [0, 0, 0]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+    admission_timeouts: list[float | None] = []
+    transport_timeouts: list[float | None] = []
+
+    class Admission:
+        def request(
+            self, *, prompt_tokens: int, max_tokens: int, timeout_seconds: float | None = None
+        ) -> Admission:
+            del prompt_tokens, max_tokens
+            admission_timeouts.append(timeout_seconds)
+            return self
+
+        def __enter__(self) -> RequestReservation:
+            time.sleep(0.03)
+            return RequestReservation(wait_seconds=0.03)
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    backend.request_admission = Admission()  # type: ignore[assignment]
+    post = model_backend._post_vllm_completion_with_retries  # pyright: ignore[reportPrivateUsage]
+
+    def record_timeout(client: httpx2.Client, *args: Any, **kwargs: Any) -> httpx2.Response:
+        transport_timeouts.append(client.timeout.read)
+        return post(client, *args, **kwargs)
+
+    monkeypatch.setattr(model_backend, "_post_vllm_completion_with_retries", record_timeout)
+    backend.complete_token_ids([12, 13], max_tokens=2048, seed=7, timeout_seconds=1.0)
+
+    assert admission_timeouts == [1.0]
+    assert len(transport_timeouts) == 1
+    assert transport_timeouts[0] is not None
+    assert 0 < transport_timeouts[0] <= 0.98
+
+
+def test_timed_out_http_report_keeps_rollout_timing_and_policy_alignment(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [0, 0, 0]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+    admission = LiveKVAdmission(url, capacity_tokens=100_000)
+    monkeypatch.setattr(admission, "_sample", lambda **_kwargs: (0.0, 0.0, 0.0))
+    backend.request_admission = admission
+    backend.request_gate = model_backend.VLLMRequestGate("synthetic", policy_step=4)
+    backend.complete_token_ids([12, 13], max_tokens=2048, seed=7)
+    state.update(transport_error_type=httpx2.ReadTimeout, transport_errors_remaining=1)
+
+    report, timed_out = loop._complete_final_report(
+        backend,
+        "Synthetic report prompt.",
+        max_tokens=2048,
+        timeout=1.0,
+        prompt_token_ids=(12, 13),
+    )
+
+    assert report is None
+    assert timed_out
+    timings = backend.take_request_timings()
+    policies = backend.take_request_policies()
+    assert len(timings) == 2
+    assert len(policies) == 2
+    trace_path = tmp_path / "synthetic-trace.jsonl"
+    write_trace(trace_path, [{"record": "turn", "turn": 0}], compact=True)
+    summary: dict[str, object] = {
+        "uncompleted_model_call_seconds": 0.0,
+        "final_report_model_call_seconds": 1.0,
+    }
+    rollout._record_request_timings(trace_path, summary, timings, policies)
+    assert summary["final_report_model_call_seconds"] == timings[-1][1]
+    admission.finish_episode()
+    assert not admission._active_requests
+    assert not admission._prefix_tokens

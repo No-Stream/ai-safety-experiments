@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
     from peft import PeftModel
 
-    from reward_hacking.organism_rl.admission import LiveKVAdmission
+    from reward_hacking.organism_rl.admission import LiveKVAdmission, RequestReservation
 
 import httpx2
 import torch
@@ -1316,7 +1316,7 @@ class VLLMRequestGate:
             return self._waiting_requests
 
     @contextlib.contextmanager
-    def request(self) -> Generator[VLLMRequestPolicy]:
+    def request(self, *, deadline: float | None = None) -> Generator[VLLMRequestPolicy]:
         """Admit one request and keep the selected policy stable until its HTTP call ends."""
         with self._condition:
             if self._closed:
@@ -1325,7 +1325,10 @@ class VLLMRequestGate:
                 self._waiting_requests += 1
                 try:
                     while self._paused and not self._closed:
-                        self._condition.wait()
+                        remaining = None if deadline is None else deadline - time.monotonic()
+                        if remaining is not None and remaining <= 0:
+                            raise TimeoutError("vLLM request gate deadline expired")
+                        self._condition.wait(remaining)
                 finally:
                     self._waiting_requests -= 1
             if self._closed:
@@ -1451,6 +1454,17 @@ class VLLMHTTPBackend:
         with self._request_timings_lock:
             return self._request_policies.pop(threading.get_ident(), [])
 
+    def _record_request_timing(
+        self, reservation: RequestReservation | None, request_started: float
+    ) -> None:
+        """Keep failed transport attempts aligned with their selected request policies."""
+        if reservation is not None:
+            request_seconds = time.monotonic() - request_started
+            with self._request_timings_lock:
+                self._request_timings.setdefault(threading.get_ident(), []).append(
+                    (reservation.wait_seconds, request_seconds)
+                )
+
     def _complete(
         self, rendered_prompt: str, *, max_tokens: int, seed: int | None
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
@@ -1487,6 +1501,9 @@ class VLLMHTTPBackend:
         )
         if request_timeout <= 0:
             raise ValueError("timeout_seconds must be positive")
+        request_deadline = (
+            time.monotonic() + request_timeout if timeout_seconds is not None else None
+        )
         body: dict[str, object] = {
             "model": None,
             "prompt": prompt_token_ids,
@@ -1522,13 +1539,15 @@ class VLLMHTTPBackend:
         max_retries = 0 if timeout_seconds is not None else VLLM_HTTP_MAX_RETRIES
         admission_context = (
             self.request_admission.request(
-                prompt_tokens=len(prompt_token_ids), max_tokens=max_tokens
+                prompt_tokens=len(prompt_token_ids),
+                max_tokens=max_tokens,
+                **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
             )
             if self.request_admission is not None
             else contextlib.nullcontext()
         )
         request_gate_context = (
-            self.request_gate.request()
+            self.request_gate.request(deadline=request_deadline)
             if self.request_gate is not None
             else contextlib.nullcontext(None)
         )
@@ -1537,6 +1556,11 @@ class VLLMHTTPBackend:
             request_gate_context as selected_policy,
             httpx2.Client(timeout=request_timeout, trust_env=False) as client,
         ):
+            if request_deadline is not None:
+                remaining_seconds = request_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise TimeoutError("vLLM completion deadline expired before transport")
+                client.timeout = httpx2.Timeout(remaining_seconds)
             request_policy = VLLMRequestPolicy(
                 model_id
                 if model_id is not None
@@ -1549,35 +1573,35 @@ class VLLMHTTPBackend:
             with self._request_timings_lock:
                 self._request_policies.setdefault(threading.get_ident(), []).append(request_policy)
             request_started = time.monotonic()
-            response = _post_vllm_completion_with_retries(
-                client,
-                f"{self.base_url}/v1/completions",
-                body,
-                max_retries=max_retries,
-            )
             try:
-                response.raise_for_status()
-            except httpx2.HTTPStatusError as error:
-                if response.status_code == HTTPStatus.BAD_REQUEST and (
-                    "maximum context length" in response.text.lower()
-                    or "maximum model length" in response.text.lower()
-                ):
-                    raise ContextWindowExceededError(
-                        "vLLM rejected the completion because its context limit was exceeded"
-                    ) from error
-                raise
-            if response.status_code != HTTPStatus.OK:  # raise_for_status accepts other 2xx codes.
-                raise ValueError(
-                    f"vLLM completions returned HTTP {response.status_code}, expected 200"
+                response = _post_vllm_completion_with_retries(
+                    client,
+                    f"{self.base_url}/v1/completions",
+                    body,
+                    max_retries=max_retries,
                 )
-            parsed = _VLLMHTTPResponse.model_validate(response.json())
-            request_seconds = time.monotonic() - request_started
-            if reservation is not None:
-                reservation.completed_tokens = parsed.usage.completion_tokens
-                with self._request_timings_lock:
-                    self._request_timings.setdefault(threading.get_ident(), []).append(
-                        (reservation.wait_seconds, request_seconds)
+                try:
+                    response.raise_for_status()
+                except httpx2.HTTPStatusError as error:
+                    if response.status_code == HTTPStatus.BAD_REQUEST and (
+                        "maximum context length" in response.text.lower()
+                        or "maximum model length" in response.text.lower()
+                    ):
+                        raise ContextWindowExceededError(
+                            "vLLM rejected the completion because its context limit was exceeded"
+                        ) from error
+                    raise
+                if (
+                    response.status_code != HTTPStatus.OK
+                ):  # raise_for_status accepts other 2xx codes.
+                    raise ValueError(
+                        f"vLLM completions returned HTTP {response.status_code}, expected 200"
                     )
+                parsed = _VLLMHTTPResponse.model_validate(response.json())
+                if reservation is not None:
+                    reservation.completed_tokens = parsed.usage.completion_tokens
+            finally:
+                self._record_request_timing(reservation, request_started)
         choice = parsed.choices[0]
         if choice.index != 0:
             raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")

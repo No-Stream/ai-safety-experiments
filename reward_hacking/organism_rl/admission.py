@@ -1,11 +1,9 @@
-"""Admit organism turns using live KV occupancy and protected cached prefixes.
+"""Admit turns on an owned server using live KV and active request reservations.
 
-The server gauge is the authoritative occupancy. Local reservations cover requests the gauge
-has not yet seen and preserve idle episodes' last cached sequence across tool calls. Idle
-episodes retain only the observed prompt and generated tokens; active requests reserve the
-remaining generation allowance as well. Cached turns get priority when space is tight because
-their incremental cost is small. If no cached turn fits, the cheapest waiting continuation
-eventually runs alone; an overfull pool cannot preserve every prefix and must make progress.
+Idle cached blocks are reusable capacity, not live occupancy. Reserve full footprints only
+while requests execute, including submissions the metrics have not seen yet. Cached prefixes
+must become live again on continuation, so cache hits do not reduce that footprint. Prefix
+history only gives continuations scheduling priority; it never reserves capacity during tools.
 """
 
 from __future__ import annotations
@@ -30,7 +28,6 @@ RUNNING_METRIC = "vllm:num_requests_running"
 WAITING_METRIC = "vllm:num_requests_waiting"
 METRIC_LINE = re.compile(r"(?P<name>[\w:]+)(?:\{[^}]*\})?\s+(?P<value>[-+\w.eE]+)(?:\s+\d+)?")
 KV_CAPACITY_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
-STALLED_CACHED_ESCAPE_SECONDS = 0.5
 
 
 @dataclass
@@ -102,6 +99,15 @@ def _read_metrics(text: str) -> tuple[float, float, float]:
     if not 0 <= usage <= 1 or running < 0 or waiting < 0:
         raise ValueError("vLLM KV usage or request counts outside expected range")
     return usage, running, waiting
+
+
+def _remaining_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("KV admission deadline exceeded")
+    return min(remaining, maximum)
 
 
 class LiveKVAdmission:
@@ -187,11 +193,13 @@ class LiveKVAdmission:
             self._aborted = True
             self._lock.notify_all()
 
-    def _sample(self, *, force: bool = False) -> tuple[float, float, float]:
+    def _sample(
+        self, *, force: bool = False, timeout_seconds: float = 5.0
+    ) -> tuple[float, float, float]:
         now = time.monotonic()
         if not force and now - self._last_sample_at < self.poll_seconds:
             return self._last_metrics
-        with httpx2.Client(timeout=5.0, trust_env=False) as client:
+        with httpx2.Client(timeout=timeout_seconds, trust_env=False) as client:
             response = client.get(self.metrics_url)
             response.raise_for_status()
             usage, running, waiting = _read_metrics(response.text)
@@ -224,14 +232,20 @@ class LiveKVAdmission:
                 future.result()
 
     @contextmanager
-    def request(self, *, prompt_tokens: int, max_tokens: int) -> Generator[RequestReservation]:
-        """Reserve the request, then retain only its observed cached sequence."""
+    def request(
+        self, *, prompt_tokens: int, max_tokens: int, timeout_seconds: float | None = None
+    ) -> Generator[RequestReservation]:
+        """Reserve an active footprint, with an optional admission deadline."""
         if prompt_tokens <= 0 or max_tokens <= 0:
             raise ValueError("admitted request token counts must be positive")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("KV admission timeout must be positive")
         thread_id = threading.get_ident()
         reservation = RequestReservation()
         try:
-            reservation.wait_seconds = self._admit(thread_id, prompt_tokens + max_tokens)
+            reservation.wait_seconds = self._admit(
+                thread_id, prompt_tokens + max_tokens, timeout_seconds=timeout_seconds
+            )
         finally:
             with self._lock:
                 self._waiting_requests.pop(thread_id, None)
@@ -240,14 +254,17 @@ class LiveKVAdmission:
         finally:
             self._release(thread_id, prompt_tokens, reservation.completed_tokens)
 
-    def _admit(self, thread_id: int, requested_prefix_tokens: int) -> float:
+    def _admit(
+        self, thread_id: int, requested_prefix_tokens: int, *, timeout_seconds: float | None
+    ) -> float:
         waited_at = 0.0
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         with self._lock:
             observed_step_generation = self._step_generation
         while True:
             with self._lock:
                 while self._suspended and not self._aborted:
-                    self._lock.wait()
+                    self._lock.wait(timeout=_remaining_timeout(deadline, self.poll_seconds))
                 if self._aborted:
                     raise RuntimeError("KV admission has been aborted")
                 if observed_step_generation != self._step_generation:
@@ -255,17 +272,16 @@ class LiveKVAdmission:
                     waited_at = 0.0
                 if thread_id in self._active_requests:
                     raise RuntimeError("nested KV admission requests are unsupported")
-                usage, running, waiting = self._sample(force=not waited_at)
-                incremental_tokens = max(
-                    requested_prefix_tokens - self._prefix_tokens.get(thread_id, 0), 0
+                usage, running, waiting = self._sample(
+                    force=not waited_at, timeout_seconds=_remaining_timeout(deadline, 5.0)
                 )
-                self._waiting_requests[thread_id] = incremental_tokens
-                reserved_tokens = sum(self._prefix_tokens.values()) + sum(
-                    tokens - self._prefix_tokens.get(owner, 0)
-                    for owner, tokens in self._active_requests.items()
-                )
+                _remaining_timeout(deadline, self.poll_seconds)
+                self._waiting_requests[thread_id] = requested_prefix_tokens
+                reserved_tokens = sum(self._active_requests.values())
+                # On the owned server these are two estimates of the same active workload.
+                # Adding them would double count requests already reflected by the gauge.
                 planned_usage = (
-                    max(usage * self.capacity_tokens, reserved_tokens) + incremental_tokens
+                    max(usage * self.capacity_tokens, reserved_tokens) + requested_prefix_tokens
                 )
                 cached_waiters = {
                     owner: delta
@@ -282,21 +298,13 @@ class LiveKVAdmission:
                 }
                 has_cached_priority = (
                     thread_id in fitting_cached
-                    and incremental_tokens == min(fitting_cached.values())
+                    and requested_prefix_tokens == min(fitting_cached.values())
                 ) or not fitting_cached
                 no_server_or_local_request = (
                     running == 0 and waiting == 0 and not self._active_requests
                 )
                 only_request_can_progress = no_server_or_local_request and (
-                    (thread_id in self._prefix_tokens and len(self._prefix_tokens) == 1)
-                    or (usage == 0 and not self._prefix_tokens)
-                    or (
-                        thread_id in cached_waiters
-                        and not fitting_cached
-                        and incremental_tokens == min(cached_waiters.values())
-                        and waited_at > 0
-                        and time.monotonic() - waited_at >= STALLED_CACHED_ESCAPE_SECONDS
-                    )
+                    requested_prefix_tokens > self.target_usage * self.capacity_tokens
                 )
                 if has_cached_priority and (
                     planned_usage <= self.target_usage * self.capacity_tokens
@@ -305,7 +313,7 @@ class LiveKVAdmission:
                     self._active_requests[thread_id] = requested_prefix_tokens
                     self._max_live_prefix_fraction = max(
                         self._max_live_prefix_fraction,
-                        (reserved_tokens + incremental_tokens) / self.capacity_tokens,
+                        (reserved_tokens + requested_prefix_tokens) / self.capacity_tokens,
                     )
                     self._admitted_requests += 1
                     if waited_at:
@@ -316,22 +324,20 @@ class LiveKVAdmission:
                 if not waited_at:
                     waited_at = time.monotonic()
                     self._admission_waits += 1
-            time.sleep(self.poll_seconds)
+                self._lock.wait(timeout=_remaining_timeout(deadline, self.poll_seconds))
 
     def _release(self, thread_id: int, prompt_tokens: int, completed_tokens: int | None) -> None:
         with self._lock:
-            try:
-                if not self._aborted:
-                    self._sample(force=True)
-            finally:
-                del self._active_requests[thread_id]
-                if completed_tokens is not None:
-                    if completed_tokens < 0:
-                        raise ValueError("completion token count must be nonnegative")
-                    self._prefix_tokens[thread_id] = prompt_tokens + completed_tokens
+            del self._active_requests[thread_id]
+            self._prefix_tokens.pop(thread_id, None)
+            self._lock.notify_all()
+            if completed_tokens is not None:
+                if completed_tokens < 0:
+                    raise ValueError("completion token count must be nonnegative")
+                self._prefix_tokens[thread_id] = prompt_tokens + completed_tokens
 
     def finish_episode(self) -> None:
-        """Free the cached-prefix reservation once a worker finishes its episode."""
+        """Forget continuation priority once a worker finishes its episode."""
         thread_id = threading.get_ident()
         with self._lock:
             if thread_id in self._active_requests:

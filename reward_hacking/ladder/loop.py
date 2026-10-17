@@ -19,6 +19,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 from uuid import uuid4
 
+import httpx2
+
 from reward_hacking.eval_awareness import AwarenessMatch
 from reward_hacking.harness.docker_backend import SnapshotLimitError, require_gate, run_in_docker
 from reward_hacking.harness.loop import (
@@ -1467,7 +1469,7 @@ def _complete_final_report(  # noqa: PLR0913 - report deadline and exact prefix
     sampling_seed: int | None = None,
     prompt_token_ids: tuple[int, ...] | None = None,
 ) -> tuple[RenderedCompletion | None, bool]:
-    """Run report sampling with a wall-clock limit that does not block the episode loop."""
+    """Bound reports while keeping HTTP admission and accounting on the episode worker."""
     request_deadline = time.monotonic() + timeout
     completed = threading.Event()
     completions: list[RenderedCompletion] = []
@@ -1495,13 +1497,20 @@ def _complete_final_report(  # noqa: PLR0913 - report deadline and exact prefix
         finally:
             completed.set()
 
-    threading.Thread(target=sample, daemon=True, name="ladder-final-report").start()
+    if isinstance(backend, VLLMHTTPBackend):
+        # Admission and request accounting use the episode thread as their owner.
+        # The HTTP backend bounds admission and transport with the supplied timeout.
+        sample()
+    else:
+        threading.Thread(target=sample, daemon=True, name="ladder-final-report").start()
     remaining = request_deadline - time.monotonic()
     if remaining <= 0:
         return None, True
     if not completed.wait(remaining) or time.monotonic() >= request_deadline:
         return None, True
     if errors:
+        if isinstance(errors[0], (TimeoutError, httpx2.TimeoutException)):
+            return None, True
         raise errors[0]
     if not completions:
         raise RuntimeError("final-report completion worker returned without a result")
