@@ -9,6 +9,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,13 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from grpo.gpu_memory import cap_gpu_memory_utilization, gpu_memory_info
 from reward_hacking.ladder.thinking import thinking_region_token_count
+from reward_hacking.serving_quantization import (
+    add_serving_quantization_arguments,
+    serving_quantization_kwargs,
+)
+from reward_hacking.serving_quantization import (
+    validate_serving_quantization as validate_quantization_arguments,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -31,6 +39,11 @@ NORMALIZED_DATA_PATH = DATA_ROOT / "problems.jsonl"
 ARTIFACT_ROOT = REPOSITORY_ROOT / "artifacts" / "hard-math-pilot"
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 GPU_MEMORY_MARGIN_FRACTION = 0.02
+GENERATION_CHUNK_SIZE = 256
+DEFAULT_QUANTIZATION_ADMISSION = Path(
+    "artifacts/organism-rl/admissions/fp8-block-sampler-fp8-kv-2026-10-16.json"
+)
+DEFAULT_QUANTIZATION_IGNORE = ("*in_proj_ba", "*conv1d*", "mtp.*", "*mtp*")
 SOLVE_RATE_BANDS = {"20_60": (0.2, 0.6), "10_80": (0.1, 0.8)}
 DATASET_IDS = (
     "ByteDance-Seed/BeyondAIME",
@@ -51,41 +64,38 @@ _LABEL = re.compile(r"[a-z0-9][a-z0-9.-]*")
 class GenerationChoice(Protocol):
     """One vLLM completion with its sampled token IDs."""
 
-    text: str
-    token_ids: Sequence[int]
-    finish_reason: str | None
-    stop_reason: str | None
+    @property
+    def text(self) -> str:
+        """Return completion text."""
+        ...
+
+    @property
+    def token_ids(self) -> Sequence[int]:
+        """Return generated token IDs."""
+        ...
+
+    @property
+    def finish_reason(self) -> str | None:
+        """Return the completion finish reason when present."""
+        ...
+
+    @property
+    def stop_reason(self) -> str | None:
+        """Return the stop reason when present."""
+        ...
 
 
 class GenerationOutput(Protocol):
     """vLLM output for one input prompt."""
 
-    outputs: Sequence[GenerationChoice]
-
-
-class EngineCacheConfig(Protocol):
-    """KV capacity measured by vLLM after engine startup."""
-
-    kv_cache_max_concurrency: float
-    kv_cache_size_tokens: int
-
-
-class EngineVllmConfig(Protocol):
-    """vLLM engine configuration containing the measured KV cache."""
-
-    cache_config: EngineCacheConfig
-
-
-class EngineCore(Protocol):
-    """vLLM engine core exposed by the offline ``LLM`` wrapper."""
-
-    vllm_config: EngineVllmConfig
+    @property
+    def outputs(self) -> Sequence[GenerationChoice]:
+        """Return the generated choices for this prompt."""
+        ...
 
 
 class SamplingEngine(Protocol):
     """The subset of the offline vLLM API used by this runner."""
-
-    llm_engine: EngineCore
 
     def generate(
         self,
@@ -152,6 +162,15 @@ class SolveRateSummary(TypedDict):
     per_problem: list[ProblemSummary]
 
 
+class GenerationThroughput(TypedDict):
+    """Tokens produced during one generation invocation and its elapsed time."""
+
+    generated_samples: int
+    generated_tokens: int
+    wall_seconds: float
+    generated_tokens_per_second: float
+
+
 @dataclass(frozen=True, slots=True)
 class RunSettings:
     """Sampling values copied from the shared organism transfer battery."""
@@ -173,7 +192,8 @@ class GenerationRuntime:
     engine: SamplingEngine
     prompt_token_ids: dict[str, list[int]]
     prompt_hashes: dict[str, str]
-    concurrency: int
+    engine_settings: dict[str, object]
+    runtime_context: dict[str, object]
     sampling_params_factory: Callable[..., object]
 
 
@@ -482,8 +502,62 @@ def _run_settings(model: str, samples: int) -> RunSettings:
     )
 
 
+def _default_speculative_config(model: str) -> dict[str, object] | None:
+    from reward_hacking.vllm_server import default_mtp_speculative_config  # noqa: PLC0415
+
+    return default_mtp_speculative_config(model)
+
+
+def _validate_serving_quantization(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    validate_quantization_arguments(
+        args,
+        parser,
+        speculative_config=_default_speculative_config(args.model),
+    )
+
+
+def build_engine_kwargs(
+    model: str,
+    *,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    quantization_arguments: argparse.Namespace,
+    language_model_only: bool = False,
+) -> dict[str, object]:
+    """Build the offline vLLM engine settings from the shared serving controls."""
+    from reward_hacking.vllm_server import (  # noqa: PLC0415
+        SPECULATIVE_MAX_NUM_BATCHED_TOKENS,
+    )
+
+    engine_kwargs: dict[str, object] = {
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": max_model_len,
+        "enable_prefix_caching": True,
+    }
+    speculative_config = _default_speculative_config(model)
+    if speculative_config is not None:
+        engine_kwargs["speculative_config"] = speculative_config
+        engine_kwargs["max_num_batched_tokens"] = SPECULATIVE_MAX_NUM_BATCHED_TOKENS
+    if language_model_only:
+        engine_kwargs["language_model_only"] = True
+    engine_kwargs.update(
+        {
+            key: value
+            for key, value in serving_quantization_kwargs(quantization_arguments).items()
+            if value is not None
+        }
+    )
+    return engine_kwargs
+
+
 def _initialize_runtime(
-    model: str, rows_by_id: Mapping[str, Mapping[str, object]], settings: RunSettings
+    model: str,
+    rows_by_id: Mapping[str, Mapping[str, object]],
+    settings: RunSettings,
+    quantization_arguments: argparse.Namespace,
 ) -> GenerationRuntime:
     from transformers import AutoConfig, AutoTokenizer  # noqa: PLC0415
     from vllm import LLM, SamplingParams  # noqa: PLC0415
@@ -534,34 +608,28 @@ def _initialize_runtime(
         max_model_len,
     )
     model_config = AutoConfig.from_pretrained(model)
-    engine_kwargs = {
-        "tensor_parallel_size": 1,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "max_model_len": max_model_len,
-    }
-    if getattr(model_config, "vision_config", None) is not None:
-        engine_kwargs["language_model_only"] = True
+    engine_kwargs = build_engine_kwargs(
+        model,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        quantization_arguments=quantization_arguments,
+        language_model_only=getattr(model_config, "vision_config", None) is not None,
+    )
     llm_class = cast("Callable[..., object]", LLM)
     engine = cast("SamplingEngine", llm_class(model=model, **engine_kwargs))
-    cache_config = engine.llm_engine.vllm_config.cache_config
-    concurrency = int(cache_config.kv_cache_max_concurrency)
-    if concurrency < 1:
-        raise RuntimeError(
-            f"vLLM KV cache cannot hold one prompt at max_model_len={max_model_len}: "
-            f"capacity_tokens={cache_config.kv_cache_size_tokens}"
-        )
-    logger.info(
-        "vLLM KV cache tokens=%s concurrency_at_max_model_len=%d",
-        cache_config.kv_cache_size_tokens,
-        concurrency,
-    )
+    runtime_context: dict[str, object] = {
+        "device_name": device_name,
+        "free_bytes_at_start": free_bytes,
+        "total_bytes": total_bytes,
+    }
     return GenerationRuntime(
         settings=settings,
         tokenizer=tokenizer,
         engine=engine,
         prompt_token_ids=prompt_token_ids,
         prompt_hashes=prompt_hashes,
-        concurrency=concurrency,
+        engine_settings=engine_kwargs,
+        runtime_context=runtime_context,
         sampling_params_factory=cast("Callable[..., object]", SamplingParams),
     )
 
@@ -587,6 +655,7 @@ def _completed_samples(
             "thinking_token_budget": runtime.settings.thinking_token_budget,
             "max_new_tokens": runtime.settings.max_new_tokens,
             "presence_penalty": runtime.settings.presence_penalty,
+            "sampling_engine_settings": _sampling_engine_identity(runtime.engine_settings),
             **runtime.settings.sampling_options,
         }
         if any(record.get(key) != value for key, value in expected.items()):
@@ -598,6 +667,16 @@ def _completed_samples(
             raise ValueError(f"existing records contain duplicate sample identity {pair!r}")
         completed.add(pair)
     return completed
+
+
+def _sampling_engine_identity(engine_settings: Mapping[str, object]) -> dict[str, object]:
+    """Keep resumed samples on the same settings that can change sampled outputs."""
+    return {
+        "kv_cache_dtype": engine_settings.get("kv_cache_dtype", "auto"),
+        "quantization": engine_settings.get("quantization"),
+        "quantization_config": engine_settings.get("quantization_config"),
+        "speculative_config": engine_settings.get("speculative_config"),
+    }
 
 
 def _sample_record(
@@ -638,6 +717,7 @@ def _sample_record(
         "output_tokens": len(token_ids),
         "max_new_tokens": settings.max_new_tokens,
         "presence_penalty": settings.presence_penalty,
+        "sampling_engine_settings": _sampling_engine_identity(runtime.engine_settings),
         **settings.sampling_options,
     }
 
@@ -647,7 +727,7 @@ def _generate_batch(
     rows_by_id: Mapping[str, Mapping[str, object]],
     batch: Sequence[tuple[str, int]],
     records_path: Path,
-) -> None:
+) -> int:
     settings = runtime.settings
     prompts = [
         {"prompt_token_ids": runtime.prompt_token_ids[problem_id]} for problem_id, _ in batch
@@ -665,6 +745,7 @@ def _generate_batch(
     outputs = runtime.engine.generate(prompts, sampling_params=sampling_params, use_tqdm=True)
     if len(outputs) != len(batch):
         raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(batch)} requests")
+    generated_tokens = 0
     for (problem_id, sample), output in zip(batch, outputs, strict=True):
         if len(output.outputs) != 1:
             raise RuntimeError(
@@ -674,17 +755,65 @@ def _generate_batch(
         with records_path.open("a", encoding="utf-8") as records_file:
             records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
             records_file.flush()
+        generated_tokens += cast("int", record["output_tokens"])
+    return generated_tokens
 
 
-def _write_summary(records_path: Path, run_dir: Path) -> Path:
+def _generate_pending_samples(
+    runtime: GenerationRuntime,
+    rows_by_id: Mapping[str, Mapping[str, object]],
+    pending: Sequence[tuple[str, int]],
+    records_path: Path,
+) -> int:
+    """Submit large request chunks and persist each chunk before queuing the next."""
+    generated_tokens = 0
+    for chunk_start in range(0, len(pending), GENERATION_CHUNK_SIZE):
+        chunk = pending[chunk_start : chunk_start + GENERATION_CHUNK_SIZE]
+        generated_tokens += _generate_batch(runtime, rows_by_id, chunk, records_path)
+    return generated_tokens
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+    return cast("dict[str, object]", value)
+
+
+def _write_summary(
+    records_path: Path,
+    run_dir: Path,
+    *,
+    provenance: dict[str, object] | None,
+    throughput: GenerationThroughput | None,
+) -> Path:
     summary_path = run_dir / "summary.json"
-    summary_path.write_text(
-        json.dumps(build_summary(_read_jsonl(records_path)), indent=2) + "\n", encoding="utf-8"
-    )
+    summary = build_summary(_read_jsonl(records_path))
+    summary_document: dict[str, object] = {
+        **summary,
+        "provenance": provenance,
+        "throughput": throughput,
+    }
+    summary_path.write_text(json.dumps(summary_document, indent=2) + "\n", encoding="utf-8")
     return summary_path
 
 
-def run_generation(label: str, model: str, samples: int, limit_problems: int | None) -> None:
+def _write_provenance(run_dir: Path, provenance: dict[str, object]) -> Path:
+    provenance_path = run_dir / "provenance.json"
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return provenance_path
+
+
+def run_generation(
+    label: str,
+    model: str,
+    samples: int,
+    limit_problems: int | None,
+    quantization_arguments: argparse.Namespace,
+) -> None:
     """Run resumable, batched offline generation for the selected model and corpus slice."""
     if _LABEL.fullmatch(label) is None:
         raise ValueError(f"label must be a lowercase path-safe slug: {label!r}")
@@ -693,27 +822,60 @@ def run_generation(label: str, model: str, samples: int, limit_problems: int | N
     rows_by_id = {cast("str", row["problem_id"]): row for row in rows}
     if len(rows_by_id) != len(rows):
         raise ValueError("normalized corpus contains duplicate problem_id values")
-    runtime = _initialize_runtime(model, rows_by_id, settings)
-
     run_dir = ARTIFACT_ROOT / label
     _require_gitignored_path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     records_path = run_dir / "records.jsonl"
+    runtime = _initialize_runtime(model, rows_by_id, settings, quantization_arguments)
     completed = _completed_samples(records_path, rows_by_id, runtime)
     all_pairs = pending_sample_pairs(list(rows_by_id), samples, completed)
     pending_count = len(all_pairs)
+    provenance: dict[str, object] = {
+        "model": settings.model,
+        "samples_per_problem": settings.samples,
+        "max_new_tokens": settings.max_new_tokens,
+        "thinking_token_budget": settings.thinking_token_budget,
+        "presence_penalty": settings.presence_penalty,
+        "sampling_options": settings.sampling_options,
+        "engine_settings": runtime.engine_settings,
+        "quantization_admission": str(quantization_arguments.quantization_admission)
+        if quantization_arguments.quantization_admission is not None
+        else None,
+        "generation_chunk_size": GENERATION_CHUNK_SIZE,
+        "runtime_context": runtime.runtime_context,
+    }
+    _write_provenance(run_dir, provenance)
     logger.info(
-        "math solve-rate generation model=%s problems=%d samples_per_problem=%d pending_samples=%d concurrency=%d",
+        "math solve-rate generation model=%s problems=%d samples_per_problem=%d pending_samples=%d chunk_size=%d",
         settings.model,
         len(rows),
         samples,
         pending_count,
-        runtime.concurrency,
+        GENERATION_CHUNK_SIZE,
     )
-    for batch_start in range(0, pending_count, runtime.concurrency):
-        batch = all_pairs[batch_start : batch_start + runtime.concurrency]
-        _generate_batch(runtime, rows_by_id, batch, records_path)
-    summary_path = _write_summary(records_path, run_dir)
+    generation_started_at = time.perf_counter()
+    generated_tokens = _generate_pending_samples(runtime, rows_by_id, all_pairs, records_path)
+    wall_seconds = time.perf_counter() - generation_started_at
+    throughput: GenerationThroughput = {
+        "generated_samples": pending_count,
+        "generated_tokens": generated_tokens,
+        "wall_seconds": wall_seconds,
+        "generated_tokens_per_second": generated_tokens / wall_seconds if wall_seconds > 0 else 0.0,
+    }
+    logger.info(
+        "generation throughput generated_samples=%d generated_tokens=%d "
+        "wall_seconds=%.2f generated_tokens_per_second=%.2f",
+        pending_count,
+        generated_tokens,
+        wall_seconds,
+        throughput["generated_tokens_per_second"],
+    )
+    summary_path = _write_summary(
+        records_path,
+        run_dir,
+        provenance=provenance,
+        throughput=throughput,
+    )
     logger.info("wrote math solve-rate summary to %s", summary_path)
 
 
@@ -728,6 +890,14 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--samples", type=int, default=8)
     run_parser.add_argument("--limit-problems", type=int)
+    add_serving_quantization_arguments(
+        run_parser,
+        kv_cache_dtype_default="fp8",
+        sampler_quantization_default="fp8_per_block",
+        sampler_quantization_ignore_default=DEFAULT_QUANTIZATION_IGNORE,
+        quantization_admission_default=DEFAULT_QUANTIZATION_ADMISSION,
+    )
+    parser.set_defaults(quantization_admission=DEFAULT_QUANTIZATION_ADMISSION)
     summary_parser = subparsers.add_parser(
         "summary", help="write a run summary from persisted records"
     )
@@ -738,7 +908,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """Dispatch the corpus fetch, generation or summary subcommand."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
     if args.command == "fetch":
         counts = fetch_datasets()
         for dataset_id, count in counts.items():
@@ -748,13 +919,36 @@ def main() -> None:
                 "unavailable" if count is None else count,
             )
     elif args.command == "run":
-        run_generation(args.label, args.model, args.samples, args.limit_problems)
+        if _LABEL.fullmatch(args.label) is None:
+            raise ValueError(f"label must be a lowercase path-safe slug: {args.label!r}")
+        _validate_serving_quantization(args, parser)
+        run_generation(
+            args.label,
+            args.model,
+            args.samples,
+            args.limit_problems,
+            args,
+        )
     elif args.command == "summary":
         if _LABEL.fullmatch(args.label) is None:
             raise ValueError(f"label must be a lowercase path-safe slug: {args.label!r}")
         run_dir = ARTIFACT_ROOT / args.label
         _require_gitignored_path(run_dir)
-        summary_path = _write_summary(run_dir / "records.jsonl", run_dir)
+        provenance_path = run_dir / "provenance.json"
+        provenance = _read_json_object(provenance_path) if provenance_path.exists() else None
+        previous_summary_path = run_dir / "summary.json"
+        previous_throughput: GenerationThroughput | None = None
+        if previous_summary_path.exists():
+            previous_summary = _read_json_object(previous_summary_path)
+            raw_throughput = previous_summary.get("throughput")
+            if isinstance(raw_throughput, dict):
+                previous_throughput = cast("GenerationThroughput", raw_throughput)
+        summary_path = _write_summary(
+            run_dir / "records.jsonl",
+            run_dir,
+            provenance=provenance,
+            throughput=previous_throughput,
+        )
         logger.info("wrote math solve-rate summary to %s", summary_path)
 
 
