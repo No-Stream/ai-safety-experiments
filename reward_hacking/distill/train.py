@@ -346,14 +346,40 @@ def _copy_fp32_head_weights(
         head.register_buffer(weight_name, weight, persistent=False)
         head.register_buffer(bias_name, bias, persistent=False)
         head.__dict__["_organism_head_source_signature"] = source_signature
-        head.__dict__["_phase_frozen_buffer_names"] = {weight_name, bias_name}
+        cast("set[str]", head.__dict__.setdefault("_phase_frozen_buffer_names", set())).update(
+            (weight_name, bias_name)
+        )
+        cast("set[str]", head.__dict__.setdefault("_phase_derived_buffer_names", set())).update(
+            (weight_name, bias_name)
+        )
     return weight, bias
 
 
 def prepare_fp32_head(model: torch.nn.Module) -> None:
-    """Cache the frozen head before phase offload so its fp32 copy follows the model."""
+    """Build the fp32 loss head on the current device from the restored frozen head."""
     causal_model = cast("Any", model.get_base_model() if isinstance(model, PeftModel) else model)
     _copy_fp32_head_weights(causal_model.get_output_embeddings())
+
+
+def drop_fp32_head(model: torch.nn.Module) -> bool:
+    """Remove the derived fp32 loss head before phase transfer to avoid host staging it."""
+    causal_model = cast("Any", model.get_base_model() if isinstance(model, PeftModel) else model)
+    head = cast("torch.nn.Module", causal_model.get_output_embeddings())
+    buffer_names = {"_organism_fp32_head_weight", "_organism_fp32_head_bias"}
+    had_cache = any(name in head._buffers for name in buffer_names)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    for name in buffer_names:
+        head._buffers.pop(name, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        head._non_persistent_buffers_set.discard(name)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    head.__dict__.pop("_organism_head_source_signature", None)
+    frozen_names = cast("set[str]", head.__dict__.get("_phase_frozen_buffer_names", set()))
+    frozen_names.difference_update(buffer_names)
+    if not frozen_names:
+        head.__dict__.pop("_phase_frozen_buffer_names", None)
+    derived_names = cast("set[str]", head.__dict__.get("_phase_derived_buffer_names", set()))
+    derived_names.difference_update(buffer_names)
+    if not derived_names:
+        head.__dict__.pop("_phase_derived_buffer_names", None)
+    return had_cache
 
 
 def _fp32_head_logits(

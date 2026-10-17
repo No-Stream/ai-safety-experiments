@@ -36,7 +36,9 @@ from reward_hacking.distill.train import (
     collate_completion,
     completion_logps,
     distillation_loss,
+    drop_fp32_head,
     load_training_rows,
+    prepare_fp32_head,
     validate_lora_config,
 )
 
@@ -1162,6 +1164,57 @@ def test_chunked_head_recomputes_bounded_slices_during_backward(
     (-logps.mean()).backward()
     assert max(head_positions) <= 2
     assert len(head_positions) == 6  # Three forward slices, each recomputed in backward.
+
+
+def test_frozen_head_cache_rebuilds_from_tied_bfloat16_weights() -> None:
+    class TiedHeadModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = torch.nn.Embedding(5, 3, dtype=torch.bfloat16)
+            self.lm_head = torch.nn.Linear(3, 5, bias=False, dtype=torch.bfloat16)
+            self.lm_head.weight = self.embedding.weight
+            self.requires_grad_(False)
+
+        def get_input_embeddings(self) -> torch.nn.Module:
+            return self.embedding
+
+        def get_output_embeddings(self) -> torch.nn.Module:
+            return self.lm_head
+
+    model = TiedHeadModel()
+    assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
+    prepare_fp32_head(model)
+    first_weight = model.lm_head._buffers["_organism_fp32_head_weight"]
+    assert first_weight is not None
+    assert first_weight.dtype == torch.float32
+    assert first_weight.device == model.lm_head.weight.device
+    assert first_weight.data_ptr() != model.lm_head.weight.data_ptr()
+    assert model.lm_head.__dict__["_phase_derived_buffer_names"] == {
+        "_organism_fp32_head_weight",
+        "_organism_fp32_head_bias",
+    }
+
+    assert drop_fp32_head(model)
+    assert "_organism_fp32_head_weight" not in model.lm_head._buffers
+    assert not model.lm_head.__dict__.get("_phase_derived_buffer_names")
+    with torch.no_grad():
+        model.lm_head.weight.add_(0.25)
+
+    prepare_fp32_head(model)
+    rebuilt_weight = model.lm_head._buffers["_organism_fp32_head_weight"]
+    assert rebuilt_weight is not None
+    assert rebuilt_weight.dtype == torch.float32
+    torch.testing.assert_close(rebuilt_weight, model.lm_head.weight.float())
+    hidden_states = torch.tensor([[0.25, -0.5, 0.75]], dtype=torch.bfloat16)
+    actual_logits = distill_train._fp32_head_logits(hidden_states, rebuilt_weight, None)
+    expected_logits = torch.nn.functional.linear(
+        hidden_states.float(), model.lm_head.weight.float()
+    )
+    torch.testing.assert_close(actual_logits, expected_logits, rtol=0, atol=0)
+    assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+    assert drop_fp32_head(model)
+    assert drop_fp32_head(model) is False
 
 
 def test_opd_step_logs_correlation_and_completion_counts(tmp_path: Path) -> None:

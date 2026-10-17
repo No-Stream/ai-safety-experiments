@@ -2,11 +2,12 @@
 
 The server must enable sleep mode and runtime LoRA updating, with
 ``VLLM_SERVER_DEV_MODE=1 VLLM_ALLOW_RUNTIME_LORA_UPDATING=1``. Sleep level 1
-holds the frozen base in pinned host RAM (about 22 GB for 9B bf16). Level 2
-discards weights, freeing that RAM, and reloads them on a slower wake. Speculative
-draft weights cannot be reloaded through the base reload RPC. Trainer parameters and optimizer
-state move to the host before the server wakes, and return only after sleep is
-confirmed. Adapter saves are never merged into the frozen base.
+may hold sampler weights in pinned host RAM; the amount depends on the loaded
+model and quantization. Level 2 discards weights, freeing that RAM, and reloads
+them on a slower wake. Speculative draft weights cannot be reloaded through the
+base reload RPC. Trainer parameters and optimizer state move to the host before
+the server wakes, and return only after sleep is confirmed. Adapter saves are
+never merged into the frozen base.
 """
 
 from __future__ import annotations
@@ -15,9 +16,12 @@ import gc
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from pathlib import Path, PurePosixPath
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 import httpx2
@@ -29,11 +33,14 @@ from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organism_rl.transfers import PolicyTransfers
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 logger = logging.getLogger(__name__)
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
+DEFAULT_HOST_MEMORY_SAFETY_MARGIN_BYTES = 6 * 1024**3
+CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+PROCESS_CGROUP_FILE = Path("/proc/self/cgroup")
+HOST_MEMORY_BUDGET_ENV = "ORGANISM_HOST_MEMORY_BUDGET_BYTES"
+HOST_MEMORY_SAFETY_MARGIN_ENV = "ORGANISM_HOST_MEMORY_SAFETY_MARGIN_BYTES"
+VLLM_SLEEPING_WEIGHT_BYTES_ENV = "ORGANISM_VLLM_SLEEPING_WEIGHT_BYTES"
 
 
 def _canonical_config(value: object) -> object:
@@ -112,6 +119,205 @@ def device_memory(device: torch.device) -> DeviceMemory:
     return memory
 
 
+def _unified_cgroup_path(process_cgroup_file: Path) -> str | None:
+    """Read the process's unified cgroup membership path."""
+    unified_path: str | None = None
+    for line in process_cgroup_file.read_text(encoding="ascii").splitlines():
+        hierarchy_id, controllers, cgroup_path = line.split(":", maxsplit=2)
+        if hierarchy_id == "0" and not controllers:
+            if unified_path is not None:
+                raise ValueError(f"{process_cgroup_file}: duplicate cgroup v2 membership row")
+            unified_path = cgroup_path
+    return unified_path
+
+
+def _process_cgroup_directory(
+    unified_path: str, cgroup_root: Path, process_cgroup_file: Path
+) -> Path:
+    """Resolve membership under the mounted hierarchy, including namespace-root mounts."""
+    relative_cgroup_path = PurePosixPath(unified_path)
+    if not relative_cgroup_path.is_absolute() or ".." in relative_cgroup_path.parts:
+        raise ValueError(f"{process_cgroup_file}: invalid cgroup v2 path")
+    cgroup_mount = cgroup_root.resolve(strict=True)
+    try:
+        cgroup_directory = cgroup_mount.joinpath(*relative_cgroup_path.parts[1:]).resolve(
+            strict=True
+        )
+    except FileNotFoundError:
+        cgroup_directory = cgroup_mount
+    if not cgroup_directory.is_relative_to(cgroup_mount):
+        raise ValueError(f"{process_cgroup_file}: cgroup v2 path escapes its mount")
+    return cgroup_directory
+
+
+def _cgroup_memory_state(cgroup_directory: Path) -> tuple[int, int] | None:
+    """Read a finite limit and current use from one cgroup directory."""
+    memory_max_path = cgroup_directory / "memory.max"
+    if not memory_max_path.is_file():
+        return None
+    maximum_text = memory_max_path.read_text(encoding="ascii").strip()
+    if maximum_text == "max":
+        return None
+    maximum_bytes = _parse_cgroup_bytes(maximum_text, memory_max_path, allow_zero=False)
+    current_path = cgroup_directory / "memory.current"
+    current_bytes = _parse_cgroup_bytes(
+        current_path.read_text(encoding="ascii").strip(), current_path, allow_zero=True
+    )
+    return maximum_bytes, current_bytes
+
+
+def _cgroup_memory_states(
+    cgroup_root: Path = CGROUP_V2_ROOT,
+    process_cgroup_file: Path = PROCESS_CGROUP_FILE,
+) -> tuple[tuple[int, int], ...]:
+    """Read finite memory limits and current use from this process's cgroup ancestors."""
+    if not process_cgroup_file.is_file() or not cgroup_root.is_dir():
+        return ()
+    unified_path = _unified_cgroup_path(process_cgroup_file)
+    if unified_path is None:
+        return ()
+    cgroup_mount = cgroup_root.resolve(strict=True)
+    cgroup_directory = _process_cgroup_directory(unified_path, cgroup_mount, process_cgroup_file)
+    states: list[tuple[int, int]] = []
+    while True:
+        state = _cgroup_memory_state(cgroup_directory)
+        if state is not None:
+            states.append(state)
+        if cgroup_directory == cgroup_mount:
+            break
+        cgroup_directory = cgroup_directory.parent
+    return tuple(states)
+
+
+def _parse_cgroup_bytes(value: str, path: Path, *, allow_zero: bool) -> int:
+    """Parse one nonnegative decimal cgroup byte count."""
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError(f"{path}: malformed cgroup byte count")
+    byte_count = int(value)
+    if byte_count == 0 and not allow_zero:
+        raise ValueError(f"{path}: cgroup byte count must be positive")
+    return byte_count
+
+
+def _configured_bytes(value: int | None, environment_name: str, *, allow_zero: bool) -> int | None:
+    """Resolve one explicit byte setting or its environment override."""
+    environment_value = os.environ.get(environment_name)
+    if value is not None and environment_value is not None:
+        raise ValueError(
+            f"Specify {environment_name} either as an argument or environment variable"
+        )
+    configured_value: int | str | None = value if value is not None else environment_value
+    if configured_value is None:
+        return None
+    if isinstance(configured_value, str):
+        if not configured_value.isascii() or not configured_value.isdecimal():
+            raise ValueError(f"{environment_name} must be a nonnegative integer byte count")
+        configured_bytes = int(configured_value)
+    else:
+        if isinstance(configured_value, bool):
+            raise TypeError(f"{environment_name} must be an integer byte count")
+        configured_bytes = configured_value
+    if configured_bytes < 0 or (configured_bytes == 0 and not allow_zero):
+        qualifier = "nonnegative" if allow_zero else "positive"
+        raise ValueError(f"{environment_name} must be a {qualifier} byte count")
+    return configured_bytes
+
+
+def resolve_host_memory_budget_bytes(
+    host_memory_budget_bytes: int | None = None,
+    *,
+    host_memory_safety_margin_bytes: int = DEFAULT_HOST_MEMORY_SAFETY_MARGIN_BYTES,
+    cgroup_root: Path = CGROUP_V2_ROOT,
+    process_cgroup_file: Path = PROCESS_CGROUP_FILE,
+    physical_memory_bytes: int | None = None,
+) -> int:
+    """Return the smallest physical, cgroup, or configured limit after reserving the margin."""
+    if host_memory_safety_margin_bytes < 0:
+        raise ValueError("host_memory_safety_margin_bytes must be nonnegative")
+    physical_limit_bytes = (
+        psutil.virtual_memory().total if physical_memory_bytes is None else physical_memory_bytes
+    )
+    if physical_limit_bytes <= 0:
+        raise ValueError("physical_memory_bytes must be positive")
+    limits = [physical_limit_bytes]
+    if host_memory_budget_bytes is not None:
+        if host_memory_budget_bytes <= 0:
+            raise ValueError("host_memory_budget_bytes must be positive")
+        limits.append(host_memory_budget_bytes)
+    limits.extend(limit for limit, _ in _cgroup_memory_states(cgroup_root, process_cgroup_file))
+    budget_bytes = min(limits) - host_memory_safety_margin_bytes
+    if budget_bytes <= 0:
+        raise ValueError("host memory safety margin must be smaller than the resolved memory limit")
+    return budget_bytes
+
+
+def check_host_memory_budget(  # noqa: PLR0913
+    *,
+    required_bytes: int,
+    current_memory_bytes: int,
+    host_memory_budget_bytes: int,
+    host_available_bytes: int,
+    safety_margin_bytes: int,
+    phase: str,
+) -> None:
+    """Refuse a phase allocation that crosses its cgroup ceiling or host availability margin."""
+    if (
+        min(
+            required_bytes,
+            current_memory_bytes,
+            host_memory_budget_bytes,
+            host_available_bytes,
+            safety_margin_bytes,
+        )
+        < 0
+    ):
+        raise ValueError("host memory byte counts must be nonnegative")
+    cgroup_headroom_bytes = host_memory_budget_bytes - current_memory_bytes - safety_margin_bytes
+    host_headroom_bytes = host_available_bytes - safety_margin_bytes
+    headroom_bytes = max(0, min(cgroup_headroom_bytes, host_headroom_bytes))
+    if required_bytes > headroom_bytes:
+        raise RuntimeError(
+            f"Host memory budget exceeded before {phase}: required_bytes={required_bytes} "
+            f"current_memory_bytes={current_memory_bytes} budget_bytes={host_memory_budget_bytes} "
+            f"host_available_bytes={host_available_bytes} safety_margin_bytes={safety_margin_bytes} "
+            f"headroom_bytes={max(0, headroom_bytes)}"
+        )
+
+
+_MODEL_LOADING_PATTERN = re.compile(r"Model loading took ([0-9.]+) GiB memory")
+
+
+def vllm_sleeping_weight_bytes(server_log: Path) -> int:
+    """Read the loaded weight size, which level-1 sleep backs up to pinned host memory."""
+    matches = _MODEL_LOADING_PATTERN.findall(
+        server_log.read_text(encoding="utf-8", errors="replace")
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one 'Model loading took' line in {server_log}, found {len(matches)}"
+        )
+    return int(float(matches[0]) * 2**30)
+
+
+def check_pinned_and_sleeping_weight_budget(
+    *,
+    pinned_bytes: int,
+    sleeping_weight_bytes: int,
+    host_memory_budget_bytes: int,
+    phase: str,
+) -> None:
+    """Refuse a combined trainer and sleeping-sampler footprint above the resolved budget."""
+    if min(pinned_bytes, sleeping_weight_bytes, host_memory_budget_bytes) < 0:
+        raise ValueError("host memory byte counts must be nonnegative")
+    required_bytes = pinned_bytes + sleeping_weight_bytes
+    if required_bytes > host_memory_budget_bytes:
+        raise RuntimeError(
+            f"Host memory budget exceeded before {phase}: pinned_bytes={pinned_bytes} "
+            f"sleeping_weight_bytes={sleeping_weight_bytes} required_bytes={required_bytes} "
+            f"budget_bytes={host_memory_budget_bytes}"
+        )
+
+
 def _move_state(value: object, device: torch.device) -> object:
     if isinstance(value, torch.Tensor):
         return value.to(device)
@@ -148,6 +354,9 @@ class VLLMPhaseController:
         adapter_prefix: str = "organism",
         timeout_seconds: float = 1800.0,
         sleep_level: int = 1,
+        host_memory_budget_bytes: int | None = None,
+        host_memory_safety_margin_bytes: int | None = None,
+        sleeping_weight_bytes: int | None = None,
         http_transport: httpx2.BaseTransport | None = None,
     ) -> None:
         """Bind one rollout backend and its private adapter staging directory."""
@@ -157,8 +366,42 @@ class VLLMPhaseController:
             raise ValueError("adapter_prefix must be a nonempty model name without slashes")
         if sleep_level not in (1, 2):
             raise ValueError("sleep_level must be 1 or 2")
+        configured_budget_bytes = _configured_bytes(
+            host_memory_budget_bytes, HOST_MEMORY_BUDGET_ENV, allow_zero=False
+        )
+        configured_margin_bytes = _configured_bytes(
+            host_memory_safety_margin_bytes, HOST_MEMORY_SAFETY_MARGIN_ENV, allow_zero=True
+        )
+        configured_sleeping_weight_bytes = _configured_bytes(
+            sleeping_weight_bytes, VLLM_SLEEPING_WEIGHT_BYTES_ENV, allow_zero=False
+        )
+        safety_margin_bytes = (
+            DEFAULT_HOST_MEMORY_SAFETY_MARGIN_BYTES
+            if configured_margin_bytes is None
+            else configured_margin_bytes
+        )
+        physical_memory_bytes = psutil.virtual_memory().total
+        self.host_memory_budget_bytes = resolve_host_memory_budget_bytes(
+            configured_budget_bytes,
+            host_memory_safety_margin_bytes=safety_margin_bytes,
+            physical_memory_bytes=physical_memory_bytes,
+        )
+        if (
+            training_device.type == "cuda"
+            and sleep_level == 1
+            and configured_sleeping_weight_bytes is None
+        ):
+            raise RuntimeError(
+                f"CUDA sleep level 1 requires {VLLM_SLEEPING_WEIGHT_BYTES_ENV}; "
+                "the installed vLLM RPC does not report pinned weight bytes"
+            )
         self.sleep_level = sleep_level
+        self._configured_host_memory_limit_bytes = configured_budget_bytes
+        self._physical_memory_limit_bytes = physical_memory_bytes
+        self.host_memory_safety_margin_bytes = safety_margin_bytes
+        self.sleeping_weight_bytes = configured_sleeping_weight_bytes or 0
         self._weights_discarded = False
+        self._vllm_sleeping = False
         self.backend = backend
         self.adapter_root = adapter_root
         self.training_device = training_device
@@ -207,10 +450,51 @@ class VLLMPhaseController:
     def _offload(self, trainer: PhaseTrainer) -> None:
         if self._transfers is None:
             self._transfers = PolicyTransfers(trainer.model, self.training_device)
+        planned_host_bytes = self._transfers.planned_host_bytes(trainer.optimizer)
+        check_pinned_and_sleeping_weight_budget(
+            pinned_bytes=planned_host_bytes,
+            sleeping_weight_bytes=(
+                0 if self.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL else self.sleeping_weight_bytes
+            ),
+            host_memory_budget_bytes=self.host_memory_budget_bytes,
+            phase="offload",
+        )
+        additional_host_bytes = max(0, planned_host_bytes - self._transfers.host_bytes)
+        self._check_host_memory_budget(additional_host_bytes, "offload")
         self._transfers.offload(trainer.optimizer)
         gc.collect()
         if self.training_device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def _check_host_memory_budget(self, required_bytes: int, phase: str) -> None:
+        memory = psutil.virtual_memory()
+        cgroup_states = _cgroup_memory_states()
+        if cgroup_states:
+            for cgroup_limit_bytes, current_memory_bytes in cgroup_states:
+                check_host_memory_budget(
+                    required_bytes=required_bytes,
+                    current_memory_bytes=current_memory_bytes,
+                    host_memory_budget_bytes=min(
+                        cgroup_limit_bytes,
+                        self._physical_memory_limit_bytes,
+                        self._configured_host_memory_limit_bytes or cgroup_limit_bytes,
+                    ),
+                    host_available_bytes=memory.available,
+                    safety_margin_bytes=self.host_memory_safety_margin_bytes,
+                    phase=phase,
+                )
+            return
+        current_memory_bytes = max(0, memory.total - memory.available)
+        check_host_memory_budget(
+            required_bytes=required_bytes,
+            current_memory_bytes=current_memory_bytes,
+            host_memory_budget_bytes=min(
+                memory.total, self._configured_host_memory_limit_bytes or memory.total
+            ),
+            host_available_bytes=memory.available,
+            safety_margin_bytes=self.host_memory_safety_margin_bytes,
+            phase=phase,
+        )
 
     def initialize(self, trainer: PhaseTrainer, step: int = 0) -> None:
         """Publish the initial or resumed adapter before the first rollout."""
@@ -220,6 +504,7 @@ class VLLMPhaseController:
 
     def _wake_up(self, *, restore_adapter: bool = True) -> None:
         self._post("/wake_up")
+        self._vllm_sleeping = False
         if self._weights_discarded:
             self._post("/collective_rpc", {"method": "reload_weights"})
             self._weights_discarded = False
@@ -242,9 +527,25 @@ class VLLMPhaseController:
 
     def sleep(self) -> None:
         """Free server GPU allocations and verify the acknowledged sleep state."""
+        expected_host_bytes = (
+            self.sleeping_weight_bytes
+            if self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL and not self._vllm_sleeping
+            else 0
+        )
+        pinned_host_bytes = self._transfers.host_bytes if self._transfers is not None else 0
+        check_pinned_and_sleeping_weight_budget(
+            pinned_bytes=pinned_host_bytes,
+            sleeping_weight_bytes=(
+                self.sleeping_weight_bytes if self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL else 0
+            ),
+            host_memory_budget_bytes=self.host_memory_budget_bytes,
+            phase="vLLM sleep",
+        )
+        self._check_host_memory_budget(expected_host_bytes, "vLLM sleep")
         self._post(f"/sleep?level={self.sleep_level}")
         self._assert_sleeping(expected=True)
         self._weights_discarded = self.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL
+        self._vllm_sleeping = True
         logger.info(
             "vLLM sleeping: level=%d host_available_bytes=%d",
             self.sleep_level,

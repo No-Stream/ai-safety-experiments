@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx2
@@ -12,7 +13,14 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from reward_hacking.organism_rl.phases import VLLMPhaseController, move_optimizer_state
+from reward_hacking.organism_rl import phases
+from reward_hacking.organism_rl.phases import (
+    VLLMPhaseController,
+    check_host_memory_budget,
+    check_pinned_and_sleeping_weight_budget,
+    move_optimizer_state,
+    resolve_host_memory_budget_bytes,
+)
 
 
 class ToyAdapter(torch.nn.Linear):
@@ -376,3 +384,226 @@ def test_phase_transfers_save_before_offload_without_module_to(
     assert "phase=restore moved_bytes=" in caplog.text
     assert "GB/s=" in caplog.text
     controller.close()
+
+
+def test_resolve_host_memory_budget_reads_cgroup_ancestor_limits(tmp_path: Path) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    parent = cgroup_root / "job"
+    leaf = parent / "worker"
+    leaf.mkdir(parents=True)
+    (parent / "memory.max").write_text("10000\n", encoding="ascii")
+    (parent / "memory.current").write_text("6000\n", encoding="ascii")
+    (leaf / "memory.max").write_text("12000\n", encoding="ascii")
+    (leaf / "memory.current").write_text("7000\n", encoding="ascii")
+    process_cgroup = tmp_path / "self.cgroup"
+    process_cgroup.write_text("0::/job/worker\n", encoding="ascii")
+
+    budget_bytes = resolve_host_memory_budget_bytes(
+        host_memory_safety_margin_bytes=1024,
+        cgroup_root=cgroup_root,
+        process_cgroup_file=process_cgroup,
+        physical_memory_bytes=20000,
+    )
+
+    assert budget_bytes == 8976
+
+
+def test_cgroup_namespace_falls_back_to_mounted_root_when_membership_path_is_missing(
+    tmp_path: Path,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+    (cgroup_root / "memory.max").write_text("12000\n", encoding="ascii")
+    (cgroup_root / "memory.current").write_text("7000\n", encoding="ascii")
+    process_cgroup = tmp_path / "self.cgroup"
+    process_cgroup.write_text("0::/non-systemd\n", encoding="ascii")
+
+    assert phases._cgroup_memory_states(cgroup_root, process_cgroup) == ((12000, 7000),)
+
+
+def test_host_memory_budget_guard_accounts_for_current_usage_and_margin() -> None:
+    with pytest.raises(
+        RuntimeError, match=r"before offload.*required_bytes=4001.*headroom_bytes=4000"
+    ):
+        check_host_memory_budget(
+            required_bytes=4001,
+            current_memory_bytes=5000,
+            host_memory_budget_bytes=10000,
+            host_available_bytes=9000,
+            safety_margin_bytes=1000,
+            phase="offload",
+        )
+
+
+def test_combined_pinned_and_sleeping_weight_budget_guard_uses_net_budget() -> None:
+    with pytest.raises(
+        RuntimeError, match=r"pinned_bytes=7000 sleeping_weight_bytes=3001.*budget_bytes=10000"
+    ):
+        check_pinned_and_sleeping_weight_budget(
+            pinned_bytes=7000,
+            sleeping_weight_bytes=3001,
+            host_memory_budget_bytes=10000,
+            phase="offload",
+        )
+
+
+def test_offload_budget_refusal_happens_before_host_storage_allocation(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ((1000, 990),))
+    monkeypatch.setattr(
+        phases.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=4096, available=4096),
+    )
+    model = ToyAdapter()
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=1000,
+        host_memory_safety_margin_bytes=0,
+        http_transport=transport,
+    )
+
+    with pytest.raises(RuntimeError, match="before offload"):
+        controller.initialize(ToyTrainer(model, None, ToyState()))
+
+    assert controller._transfers is not None
+    assert controller._transfers.host_bytes == 0
+    controller.close()
+
+
+def test_sleep_budget_refusal_happens_before_vllm_sleep_request(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, state = server
+    cgroup_states = [(1000, 0)]
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: tuple(cgroup_states))
+    monkeypatch.setattr(
+        phases.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=4096, available=4096),
+    )
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=1000,
+        host_memory_safety_margin_bytes=0,
+        sleeping_weight_bytes=20,
+        http_transport=transport,
+    )
+    controller.initialize(ToyTrainer(ToyAdapter(), None, ToyState()))
+    cgroup_states[:] = [(1000, 990)]
+    request_count = len(state.requests)
+
+    with pytest.raises(RuntimeError, match="before vLLM sleep"):
+        controller.sleep()
+
+    assert len(state.requests) == request_count
+    controller.close()
+
+
+def test_repeat_sleep_still_reserves_configured_vllm_weight_bytes(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=4096, available=4096),
+    )
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=19,
+        host_memory_safety_margin_bytes=0,
+        sleeping_weight_bytes=20,
+        http_transport=transport,
+    )
+    controller._vllm_sleeping = True
+
+    with pytest.raises(
+        RuntimeError, match=r"pinned_bytes=0 sleeping_weight_bytes=20.*budget_bytes=19"
+    ):
+        controller.sleep()
+
+    assert not state.requests
+    controller.close()
+
+
+def test_cuda_sleep_level_one_requires_sleeping_weight_estimate(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, state = server
+    monkeypatch.setattr(phases, "device_memory", lambda _device: phases.DeviceMemory("fake", 1, 1))
+    with pytest.raises(RuntimeError, match="ORGANISM_VLLM_SLEEPING_WEIGHT_BYTES"):
+        VLLMPhaseController(
+            "http://server",
+            ToyBackend(),
+            tmp_path,
+            training_device=torch.device("cuda"),
+            host_memory_budget_bytes=4096,
+            host_memory_safety_margin_bytes=0,
+            http_transport=transport,
+        )
+
+    assert not state.requests
+
+
+def test_host_memory_and_sleeping_weight_settings_read_environment(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=20000, available=18000),
+    )
+    monkeypatch.setenv(phases.HOST_MEMORY_BUDGET_ENV, "10000")
+    monkeypatch.setenv(phases.HOST_MEMORY_SAFETY_MARGIN_ENV, "0")
+    monkeypatch.setenv(phases.VLLM_SLEEPING_WEIGHT_BYTES_ENV, "20")
+
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        http_transport=transport,
+    )
+
+    assert controller.host_memory_budget_bytes == 10000
+    assert controller.host_memory_safety_margin_bytes == 0
+    assert controller.sleeping_weight_bytes == 20
+    controller.close()
+
+
+def test_sleeping_weight_bytes_come_from_the_owned_server_log(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm-server.log"
+    server_log.write_text(
+        "(EngineCore pid=1) INFO 10-17 00:02:43 [model_runner.py:407] "
+        "Model loading took 10.96 GiB memory and 27.651354 seconds\n",
+        encoding="utf-8",
+    )
+    assert phases.vllm_sleeping_weight_bytes(server_log) == int(10.96 * 2**30)
+    server_log.write_text("no load line yet\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Model loading took"):
+        phases.vllm_sleeping_weight_bytes(server_log)

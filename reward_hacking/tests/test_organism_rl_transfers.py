@@ -64,10 +64,15 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
     assert_fp32_training_state(model, optimizer)
     first = transfers.offload(optimizer)
     assert first.frozen_bytes > 0
+    assert all("_organism_fp32_head" not in name for name, _ in model.named_buffers())
+    assert first.frozen_bytes == sum(
+        value.numel() * value.element_size() for value in frozen.values()
+    )
     first_host_ids = transfers.frozen_host_storage_ids
     inputs = torch.tensor([[1, 2, 3, 4]])
     for _ in range(2):
         transfers.restore(optimizer)
+        assert model.get_output_embeddings()._organism_fp32_head_weight.dtype == torch.float32
         optimizer.zero_grad()
         loss = model(input_ids=inputs, labels=inputs, use_cache=False).loss
         loss.backward()
@@ -171,3 +176,55 @@ def test_frozen_fp32_head_buffer_cached_and_mutable_buffer_refreshed() -> None:
     assert model.counter.item() == 7
     assert model.cached_head.dtype == torch.float32
     assert transfers.frozen_host_storage_ids == host_ids
+
+
+def test_transfers_use_one_arena_per_dtype_for_many_storages_and_preserve_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Module()
+    for index in range(40):
+        model.register_parameter(
+            f"weight_{index}",
+            torch.nn.Parameter(torch.full((3,), float(index)), requires_grad=False),
+        )
+    model.register_buffer("counter", torch.tensor([123], dtype=torch.int64))
+    original_empty = torch.empty
+    host_allocations: list[int] = []
+
+    def counted_empty(*args: Any, **kwargs: Any) -> torch.Tensor:
+        if "pin_memory" in kwargs:
+            host_allocations.append(int(args[0]))
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", counted_empty)
+    transfers = PolicyTransfers(model, torch.device("cpu"))
+    first = transfers.offload(None)
+    assert len(host_allocations) == 2
+    assert first.moved_bytes == 40 * 3 * 4 + 8
+    assert sum(transfers.host_byte_breakdown.values()) == transfers.host_bytes
+    assert transfers.host_byte_breakdown["mutable.buffers"] == 8
+    for _ in range(2):
+        transfers.restore(None)
+        for index, parameter in enumerate(model.parameters()):
+            torch.testing.assert_close(parameter, torch.full((3,), float(index)))
+        assert model.get_buffer("counter").item() == 123
+        transfers.offload(None)
+    assert len(host_allocations) == 2
+
+
+def test_planned_host_bytes_counts_shared_storage_once_without_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model: Any = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.ones(4), requires_grad=False))
+    model.register_parameter(
+        "alias", torch.nn.Parameter(model.weight.detach(), requires_grad=False)
+    )
+    model.register_buffer("view", model.weight.detach()[1:])
+    transfers = PolicyTransfers(model, torch.device("cpu"))
+
+    def no_allocation(*args: Any, **kwargs: Any) -> torch.Tensor:
+        raise AssertionError("budget planning must precede host allocation")
+
+    monkeypatch.setattr(torch, "empty", no_allocation)
+    assert transfers.planned_host_bytes(None) == 16

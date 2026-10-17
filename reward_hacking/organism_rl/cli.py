@@ -47,7 +47,7 @@ from reward_hacking.organism_rl.generate_provenance import active_provenance_pat
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
-from reward_hacking.organism_rl.phases import VLLMPhaseController
+from reward_hacking.organism_rl.phases import VLLMPhaseController, vllm_sleeping_weight_bytes
 from reward_hacking.organism_rl.precision import (
     assert_fp32_training_state,
     record_precision_provenance,
@@ -657,6 +657,11 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         adapter_root=args.output_dir / "served-adapters",
         training_device=torch.device("cuda", device_index),
         sleep_level=args.sleep_level,
+        sleeping_weight_bytes=(
+            vllm_sleeping_weight_bytes(args.output_dir / "vllm-server.log")
+            if args.endpoint is None
+            else None
+        ),
     )
     request_gate = (
         VLLMRequestGate(source.backend.model_id, policy_step=0) if args.step_pipelining else None
