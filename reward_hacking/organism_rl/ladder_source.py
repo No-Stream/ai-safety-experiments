@@ -29,7 +29,11 @@ from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
-from reward_hacking.organism_rl.rollout import EpisodeSample, compose_hint_system_prompt
+from reward_hacking.organism_rl.rollout import (
+    EpisodeSample,
+    _record_request_timings,
+    compose_hint_system_prompt,
+)
 
 TRAIN_SCENARIOS_DIR = Path("reward_hacking/ladder/data/scenarios")
 HELDOUT_SCENARIOS_DIR = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout")
@@ -178,6 +182,17 @@ def score_ladder_task(record: Mapping[str, object]) -> RewardScore:
         RewardOutcome.REWARDED if move else RewardOutcome.VISIBLE_ONLY_PASS,
         evidence,
     )
+
+
+def _record_ladder_request_timings(
+    backend: VLLMHTTPBackend, record: dict[str, object], native_trace: Path
+) -> None:
+    if backend.request_admission is None:
+        return
+    trace_summary = record["trace_summary"]
+    if not isinstance(trace_summary, dict):
+        raise TypeError("native ladder trace summary must be an object")
+    _record_request_timings(native_trace, trace_summary, backend.take_request_timings())
 
 
 class LadderEpisodeSource:
@@ -419,6 +434,7 @@ class LadderEpisodeSource:
             except (httpx2.TimeoutException, httpx2.NetworkError):
                 _persist_interrupted_native_trace(native_trace, temporary_trace, provenance_record)
                 raise
+            _record_ladder_request_timings(backend, record, native_trace)
             records = runner._load_records(native_trace)
             records.insert(1, provenance_record)
             record.update(

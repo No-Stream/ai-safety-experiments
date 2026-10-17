@@ -191,13 +191,13 @@ def test_waiting_episode_prefix_is_reserved_even_when_kv_gauge_falls(
     readings["kv"] = 0.0
     readings["running"] = 0.0
     admission = LiveKVAdmission(endpoint, capacity_tokens=100, target_usage=0.85, poll_seconds=0.01)
-    with admission.request(prompt_tokens=55, max_tokens=10):
-        pass
+    with admission.request(prompt_tokens=55, max_tokens=10) as reservation:
+        reservation.completed_tokens = 0
     readings["kv"] = 0.30
     admitted = threading.Event()
 
     def new_episode_turn() -> None:
-        with admission.request(prompt_tokens=5, max_tokens=5):
+        with admission.request(prompt_tokens=20, max_tokens=20):
             admitted.set()
         admission.finish_episode()
 
@@ -208,3 +208,122 @@ def test_waiting_episode_prefix_is_reserved_even_when_kv_gauge_falls(
     assert admitted.wait(1)
     thread.join(timeout=1)
     assert not thread.is_alive()
+
+
+def test_idle_prefix_uses_actual_completion_length_not_full_headroom(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, readings = metrics_endpoint
+    readings.update(kv=0.0, running=0.0, waiting=0.0)
+    admission = LiveKVAdmission(endpoint, capacity_tokens=100, poll_seconds=0.01)
+    with admission.request(prompt_tokens=50, max_tokens=20) as reservation:
+        reservation.completed_tokens = 2
+    assert admission.step_summary()["max_live_prefix_fraction"] == pytest.approx(0.7)
+    admitted = threading.Event()
+
+    def next_episode() -> None:
+        with admission.request(prompt_tokens=20, max_tokens=10):
+            admitted.set()
+        admission.finish_episode()
+
+    worker = threading.Thread(target=next_episode)
+    worker.start()
+    assert admitted.wait(1)
+    worker.join(timeout=1)
+    admission.finish_episode()
+
+
+def test_mtp_sized_pool_does_not_serialize_cached_episode_turns(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, readings = metrics_endpoint
+    readings.update(kv=0.0, running=0.0, waiting=0.0)
+    admission = LiveKVAdmission(endpoint, capacity_tokens=305_192, poll_seconds=0.01)
+    ready = threading.Barrier(15, timeout=5)
+    release = threading.Event()
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    def episode() -> None:
+        nonlocal active, peak_active
+        with admission.request(prompt_tokens=14_000, max_tokens=2_048) as reservation:
+            reservation.completed_tokens = 1_000
+        ready.wait()
+        with admission.request(prompt_tokens=16_000, max_tokens=2_048):
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            assert release.wait(5)
+            with lock:
+                active -= 1
+        admission.finish_episode()
+
+    workers = [threading.Thread(target=episode) for _ in range(15)]
+    for worker in workers:
+        worker.start()
+    deadline = time.monotonic() + 5
+    while peak_active < 10 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    assert peak_active >= 10
+
+
+def test_oversized_episode_progresses_without_other_live_episodes(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, readings = metrics_endpoint
+    readings.update(kv=0.0, running=0.0, waiting=0.0)
+    admission = LiveKVAdmission(endpoint, capacity_tokens=100, poll_seconds=0.01)
+    with admission.request(prompt_tokens=90, max_tokens=20) as reservation:
+        reservation.completed_tokens = 1
+    with admission.request(prompt_tokens=95, max_tokens=20):
+        pass
+    admission.finish_episode()
+
+
+def test_long_cached_waiter_does_not_block_a_smaller_fitting_request(
+    metrics_endpoint: tuple[str, dict[str, float]],
+) -> None:
+    endpoint, readings = metrics_endpoint
+    readings.update(kv=0.0, running=0.0, waiting=0.0)
+    admission = LiveKVAdmission(endpoint, capacity_tokens=100, poll_seconds=0.01)
+    start_next = threading.Event()
+    long_admitted = threading.Event()
+    small_admitted = threading.Event()
+
+    def long_episode() -> None:
+        with admission.request(prompt_tokens=70, max_tokens=10) as reservation:
+            reservation.completed_tokens = 0
+        assert start_next.wait(1)
+        with admission.request(prompt_tokens=70, max_tokens=20):
+            long_admitted.set()
+        admission.finish_episode()
+
+    def small_episode() -> None:
+        with admission.request(prompt_tokens=5, max_tokens=5):
+            small_admitted.set()
+        admission.finish_episode()
+
+    long_worker = threading.Thread(target=long_episode)
+    long_worker.start()
+    deadline = time.monotonic() + 1
+    while admission.step_summary()["admitted_requests"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with admission.request(prompt_tokens=5, max_tokens=1) as reservation:
+        reservation.completed_tokens = 0
+    start_next.set()
+    assert not long_admitted.wait(0.05)
+    small_worker = threading.Thread(target=small_episode)
+    small_worker.start()
+    try:
+        assert small_admitted.wait(0.5)
+    finally:
+        admission.finish_episode()
+    assert long_admitted.wait(1)
+    for worker in (small_worker, long_worker):
+        worker.join(timeout=1)
+        assert not worker.is_alive()

@@ -572,6 +572,7 @@ class _SyntheticSubmissionBackend:
         self.sampling = cast("SamplingConfig", kwargs["sampling"])
         self.tokenizer = _SyntheticSubmissionTokenizer()
         self.stop_token_ids: tuple[int, ...] = ()
+        self.request_admission = None
 
     def complete_rendered(
         self,

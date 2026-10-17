@@ -31,6 +31,7 @@ import math
 import os  # noqa: F401  # pyright: ignore[reportUnusedImport] - tests patch os through this module
 import shutil  # noqa: F401  # pyright: ignore[reportUnusedImport] - tests patch shutil through this module
 import subprocess  # noqa: F401  # pyright: ignore[reportUnusedImport] - tests patch subprocess through this module
+import threading
 import time
 from bisect import bisect_right
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -1311,6 +1312,8 @@ class VLLMHTTPBackend:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.request_admission: LiveKVAdmission | None = None
+        self._request_timings: dict[int, list[tuple[float, float]]] = {}
+        self._request_timings_lock = threading.Lock()
         self._tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             self.model_path or model_id, revision=revision
         )
@@ -1327,6 +1330,11 @@ class VLLMHTTPBackend:
     def tokenizer(self) -> PreTrainedTokenizerBase:
         """Return the tokenizer used to render every request."""
         return self._tokenizer
+
+    def take_request_timings(self) -> list[tuple[float, float]]:
+        """Return this worker's admission wait and server time for completed requests."""
+        with self._request_timings_lock:
+            return self._request_timings.pop(threading.get_ident(), [])
 
     def _complete(
         self, rendered_prompt: str, *, max_tokens: int, seed: int | None
@@ -1397,14 +1405,18 @@ class VLLMHTTPBackend:
         if self.sampling.thinking_token_budget is not None:
             body["thinking_token_budget"] = self.sampling.thinking_token_budget
         max_retries = 0 if timeout_seconds is not None else VLLM_HTTP_MAX_RETRIES
-        with (
+        admission_context = (
             self.request_admission.request(
                 prompt_tokens=len(prompt_token_ids), max_tokens=max_tokens
             )
             if self.request_admission is not None
-            else contextlib.nullcontext(),
+            else contextlib.nullcontext()
+        )
+        with (
+            admission_context as reservation,
             httpx2.Client(timeout=request_timeout, trust_env=False) as client,
         ):
+            request_started = time.monotonic()
             response = _post_vllm_completion_with_retries(
                 client,
                 f"{self.base_url}/v1/completions",
@@ -1427,6 +1439,13 @@ class VLLMHTTPBackend:
                     f"vLLM completions returned HTTP {response.status_code}, expected 200"
                 )
             parsed = _VLLMHTTPResponse.model_validate(response.json())
+            request_seconds = time.monotonic() - request_started
+            if reservation is not None:
+                reservation.completed_tokens = parsed.usage.completion_tokens
+                with self._request_timings_lock:
+                    self._request_timings.setdefault(threading.get_ident(), []).append(
+                        (reservation.wait_seconds, request_seconds)
+                    )
         choice = parsed.choices[0]
         if choice.index != 0:
             raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")

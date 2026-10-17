@@ -384,6 +384,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
         ]
     )
     backend.sampling = SamplingConfig(max_new_tokens=128)  # type: ignore[attr-defined]
+    backend.request_admission = None  # type: ignore[attr-defined]
     monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(
         rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
@@ -651,6 +652,7 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
     )
     backend = ScriptedToolBackend([])
     backend.sampling = SamplingConfig(max_new_tokens=16)  # type: ignore[attr-defined]
+    backend.request_admission = None  # type: ignore[attr-defined]
     monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(
         rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())

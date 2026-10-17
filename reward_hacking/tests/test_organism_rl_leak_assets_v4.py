@@ -459,6 +459,7 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
         sampling=rollout.SamplingConfig(max_new_tokens=16),
         tokenizer=object(),
         stop_token_ids=(),
+        request_admission=None,
     )
     monkeypatch.setattr(rollout, "load_leak_tasks", load_selected_task)
     monkeypatch.setattr(rollout, "require_gate", lambda _config: None)

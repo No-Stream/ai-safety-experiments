@@ -101,6 +101,7 @@ def test_source_renders_convention_and_persists_measured_arm(
             self.sampling = SamplingConfig(max_new_tokens=16)
             self.tokenizer = object()
             self.stop_token_ids: tuple[int, ...] = ()
+            self.request_admission = None
 
     def run_episode(
         task: Task, backend: object, *, trace_path: Path, **_: object

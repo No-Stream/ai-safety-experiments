@@ -24,6 +24,7 @@ def test_defaults_and_vram_derived_sizing():
     assert args.fla_nb_bucket == "pow2"
     assert args.enable_prefix_caching
     assert args.rollout_concurrency is None
+    assert args.expected_peak_context_tokens is None
     assert args.prompts_per_step == 1
     assert args.kv_cache_dtype is None
     assert args.mamba_ssm_cache_dtype is None
@@ -803,14 +804,57 @@ def test_prompts_per_step_sets_the_full_generation_and_accumulation_window(tmp_p
         )
 
 
-def test_rollout_concurrency_defaults_to_episodes_per_step() -> None:
-    assert cli.resolve_rollout_concurrency(None, 16) == 16
-    assert cli.resolve_rollout_concurrency(15, 16) == 15
+def test_rollout_concurrency_is_sized_from_kv_pool_and_expected_peak_context() -> None:
+    assert (
+        cli.resolve_rollout_concurrency(
+            None,
+            32,
+            capacity_tokens=305_192,
+            target_usage=0.85,
+            expected_peak_context_tokens=16_000,
+        )
+        == 16
+    )
+    assert (
+        cli.resolve_rollout_concurrency(
+            None,
+            32,
+            capacity_tokens=305_192,
+            target_usage=0.85,
+            expected_peak_context_tokens=16_384,
+        )
+        == 15
+    )
+    assert (
+        cli.resolve_rollout_concurrency(
+            8,
+            32,
+            capacity_tokens=305_192,
+            target_usage=0.85,
+            expected_peak_context_tokens=16_000,
+        )
+        == 8
+    )
+    assert (
+        cli.resolve_rollout_concurrency(
+            None,
+            32,
+            capacity_tokens=305_192,
+            target_usage=0.85,
+            expected_peak_context_tokens=400_000,
+        )
+        == 1
+    )
 
 
 def test_rollout_concurrency_is_operational_and_positive(tmp_path: Path) -> None:
     base = ["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"]
     write_provenance(parse_args(base), {"name": "cpu"})
     write_provenance(parse_args([*base, "--rollout-concurrency", "2"]), {"name": "cpu"})
+    write_provenance(
+        parse_args([*base, "--expected-peak-context-tokens", "16000"]), {"name": "cpu"}
+    )
     with pytest.raises(SystemExit):
         parse_args([*base, "--rollout-concurrency", "0"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--expected-peak-context-tokens", "0"])

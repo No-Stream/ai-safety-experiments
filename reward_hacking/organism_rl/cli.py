@@ -101,9 +101,26 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
-def resolve_rollout_concurrency(requested: int | None, episodes_per_step: int) -> int:
-    """Start every episode; per-turn KV admission controls request pressure."""
-    return episodes_per_step if requested is None else requested
+def resolve_rollout_concurrency(
+    requested: int | None,
+    episodes_per_step: int,
+    *,
+    capacity_tokens: int,
+    target_usage: float,
+    expected_peak_context_tokens: int,
+) -> int:
+    """Bound episode fan-out by the KV pool and an expected peak episode context."""
+    if min(episodes_per_step, capacity_tokens, expected_peak_context_tokens) < 1:
+        raise ValueError("episode count, KV capacity and expected peak context must be positive")
+    if requested is not None and requested < 1:
+        raise ValueError("requested rollout concurrency must be positive")
+    if not 0 < target_usage < 1:
+        raise ValueError("KV target usage must be between zero and one")
+    kv_limited_fanout = max(
+        1, math.floor(capacity_tokens * target_usage / expected_peak_context_tokens)
+    )
+    requested_fanout = episodes_per_step if requested is None else requested
+    return min(episodes_per_step, requested_fanout, kv_limited_fanout)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
@@ -151,7 +168,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument(
         "--rollout-concurrency",
         type=int,
-        help="cap episodes sampled at once; defaults to all episodes in the step",
+        help="cap episodes sampled at once; defaults to the KV pool-derived fan-out",
+    )
+    parser.add_argument(
+        "--expected-peak-context-tokens",
+        type=int,
+        help="expected peak live context per episode; defaults to half of effective max-sequence-tokens",
     )
     parser.add_argument(
         "--kv-capacity-tokens",
@@ -281,6 +303,8 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
         )
     if args.rollout_concurrency is not None and args.rollout_concurrency < 1:
         parser.error("rollout-concurrency must be positive")
+    if args.expected_peak_context_tokens is not None and args.expected_peak_context_tokens < 1:
+        parser.error("expected-peak-context-tokens must be positive")
     if args.kv_capacity_tokens is not None and args.kv_capacity_tokens < 1:
         parser.error("kv-capacity-tokens must be positive")
     if args.prompts_per_step < 1:
@@ -407,6 +431,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "leak_channel_splits",
         "gpu_memory_utilization",
         "rollout_concurrency",
+        "expected_peak_context_tokens",
         "kv_capacity_tokens",
     }
     return {key: value for key, value in flags.items() if key not in operational}
@@ -843,10 +868,6 @@ def main(argv: list[str] | None = None) -> None:
     server_log_path = args.output_dir / "vllm-server.log"
     server_log_offset = server_log_path.stat().st_size if server_log_path.exists() else 0
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
-        rollout_concurrency = resolve_rollout_concurrency(
-            args.rollout_concurrency,
-            args.prompts_per_step * generations,
-        )
         if args.endpoint is None:
             with server_log_path.open("rb") as log_file:
                 log_file.seek(server_log_offset)
@@ -854,13 +875,26 @@ def main(argv: list[str] | None = None) -> None:
         else:
             capacity_tokens = cast("int", args.kv_capacity_tokens)
         admission = LiveKVAdmission(endpoint, capacity_tokens=capacity_tokens)
+        expected_peak_context_tokens = (
+            args.expected_peak_context_tokens
+            if args.expected_peak_context_tokens is not None
+            else max(1, max_tokens // 2)
+        )
+        rollout_concurrency = resolve_rollout_concurrency(
+            args.rollout_concurrency,
+            args.prompts_per_step * generations,
+            capacity_tokens=capacity_tokens,
+            target_usage=admission.target_usage,
+            expected_peak_context_tokens=expected_peak_context_tokens,
+        )
         source.backend.request_admission = admission
         logger.info(
             "organism model=%s episodes_per_step=%d rollout_concurrency=%d "
-            "kv_capacity_tokens=%d kv_admission_target=%.2f",
+            "expected_peak_context_tokens=%d kv_capacity_tokens=%d kv_admission_target=%.2f",
             args.model,
             args.prompts_per_step * generations,
             rollout_concurrency,
+            expected_peak_context_tokens,
             capacity_tokens,
             admission.target_usage,
         )

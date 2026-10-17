@@ -17,7 +17,7 @@ import pytest
 
 from reward_hacking.distill.episodes import render_student_contexts, trace_hint
 from reward_hacking.ladder import runner
-from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome
 from reward_hacking.organism_rl import health, ladder_source
 from reward_hacking.organism_rl.ladder_source import load_training_scenarios, score_ladder_task
@@ -218,7 +218,10 @@ def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuratio
 ) -> tuple[ladder_source.LadderEpisodeSource, list[int]]:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
-        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+        model_id="synthetic-base",
+        sampling=SamplingConfig(max_new_tokens=256),
+        tokenizer=object(),
+        request_admission=None,
     )
     monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(
@@ -264,6 +267,29 @@ def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuratio
 
     monkeypatch.setattr(runner, "_run_one", fake_run)
     return source, calls
+
+
+def test_native_ladder_turn_uses_server_time_after_admission(tmp_path: Path) -> None:
+    native_trace = tmp_path / "native.jsonl"
+    summary: dict[str, object] = {
+        "record": "episode_summary",
+        "uncompleted_model_call_seconds": 0.0,
+        "final_report_model_call_seconds": 1.0,
+        "model_call_seconds": 8.0,
+    }
+    write_trace(native_trace, [{"record": "turn", "generation_seconds": 7.0}, summary])
+    backend = SimpleNamespace(request_admission=object(), take_request_timings=lambda: [(5.0, 2.0)])
+    record: dict[str, object] = {"trace_summary": summary}
+
+    ladder_source._record_ladder_request_timings(  # pyright: ignore[reportPrivateUsage]
+        cast("VLLMHTTPBackend", backend), record, native_trace
+    )
+
+    records = runner._load_records(native_trace)
+    assert records[0]["admission_wait_seconds"] == 5.0
+    assert records[0]["generation_seconds"] == 2.0
+    assert records[1]["admission_wait_seconds"] == 5.0
+    assert records[1]["model_call_seconds"] == 3.0
 
 
 def test_source_identity_separates_semantic_identity_from_provenance(
@@ -485,7 +511,10 @@ def test_source_keeps_and_replays_thinking_budget_overshoot_as_unscorable(
 ) -> None:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
-        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+        model_id="synthetic-base",
+        sampling=SamplingConfig(max_new_tokens=256),
+        tokenizer=object(),
+        request_admission=None,
     )
     monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(
@@ -570,7 +599,10 @@ def test_ladder_source_supports_real_claimed_arms_and_configured_sampler(
 ) -> None:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
-        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+        model_id="synthetic-base",
+        sampling=SamplingConfig(max_new_tokens=256),
+        tokenizer=object(),
+        request_admission=None,
     )
 
     def fake_backend(*_args: object, **kwargs: object) -> SimpleNamespace:
@@ -733,7 +765,10 @@ def test_ladder_source_rejects_invalid_hint_identity(
 ) -> None:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
-        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+        model_id="synthetic-base",
+        sampling=SamplingConfig(max_new_tokens=256),
+        tokenizer=object(),
+        request_admission=None,
     )
     monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(

@@ -1,4 +1,12 @@
-"""Admit organism turn requests from the served model's live KV occupancy."""
+"""Admit organism turns using live KV occupancy and protected cached prefixes.
+
+The server gauge is the authoritative occupancy. Local reservations cover requests the gauge
+has not yet seen and preserve idle episodes' last cached sequence across tool calls. Idle
+episodes retain only the observed prompt and generated tokens; active requests reserve the
+remaining generation allowance as well. Cached turns get priority when space is tight because
+their incremental cost is small. If no cached turn fits, the cheapest waiting continuation
+eventually runs alone; an overfull pool cannot preserve every prefix and must make progress.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +30,15 @@ RUNNING_METRIC = "vllm:num_requests_running"
 WAITING_METRIC = "vllm:num_requests_waiting"
 METRIC_LINE = re.compile(r"(?P<name>[\w:]+)(?:\{[^}]*\})?\s+(?P<value>[-+\w.eE]+)(?:\s+\d+)?")
 KV_CAPACITY_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
+STALLED_CACHED_ESCAPE_SECONDS = 0.5
+
+
+@dataclass
+class RequestReservation:
+    """The completion count is filled from the server response before releasing KV headroom."""
+
+    wait_seconds: float = 0.0
+    completed_tokens: int | None = None
 
 
 def kv_capacity_tokens(server_log: str) -> int:
@@ -96,7 +114,7 @@ class LiveKVAdmission:
         self._lock = threading.Lock()
         self._active_requests: dict[int, int] = {}
         self._prefix_tokens: dict[int, int] = {}
-        self._baseline_usage = 0.0
+        self._waiting_requests: dict[int, int] = {}
         self.reset_step()
 
     def reset_step(self) -> None:
@@ -104,6 +122,8 @@ class LiveKVAdmission:
         with self._lock:
             if self._active_requests:
                 raise RuntimeError("cannot reset KV admission during a request")
+            if self._waiting_requests:
+                raise RuntimeError("cannot reset KV admission while requests wait")
             self._prefix_tokens.clear()
             self._samples = 0
             self._running_sum = 0.0
@@ -153,76 +173,101 @@ class LiveKVAdmission:
                 future.result()
 
     @contextmanager
-    def request(self, *, prompt_tokens: int, max_tokens: int) -> Generator[None]:
-        """Reserve the request and its cached prefix until the episode finishes."""
+    def request(self, *, prompt_tokens: int, max_tokens: int) -> Generator[RequestReservation]:
+        """Reserve the request, then retain only its observed cached sequence."""
         if prompt_tokens <= 0 or max_tokens <= 0:
             raise ValueError("admitted request token counts must be positive")
         thread_id = threading.get_ident()
-        self._admit(thread_id, prompt_tokens + max_tokens)
+        reservation = RequestReservation()
         try:
-            yield
+            reservation.wait_seconds = self._admit(thread_id, prompt_tokens + max_tokens)
         finally:
-            self._release(thread_id)
+            with self._lock:
+                self._waiting_requests.pop(thread_id, None)
+        try:
+            yield reservation
+        finally:
+            self._release(thread_id, prompt_tokens, reservation.completed_tokens)
 
-    def _admit(self, thread_id: int, requested_prefix_tokens: int) -> None:
+    def _admit(self, thread_id: int, requested_prefix_tokens: int) -> float:
         waited_at = 0.0
         while True:
             with self._lock:
                 if thread_id in self._active_requests:
                     raise RuntimeError("nested KV admission requests are unsupported")
                 usage, running, waiting = self._sample(force=not waited_at)
-                if not self._active_requests:
-                    self._baseline_usage = usage
-                cached_prefix_fraction = (
-                    sum(
-                        tokens
-                        for owner, tokens in self._prefix_tokens.items()
-                        if owner not in self._active_requests
-                    )
-                    / self.capacity_tokens
+                incremental_tokens = max(
+                    requested_prefix_tokens - self._prefix_tokens.get(thread_id, 0), 0
                 )
-                active_fraction = sum(self._active_requests.values()) / self.capacity_tokens
-                effective_usage = self._baseline_usage + max(
-                    usage - self._baseline_usage, active_fraction
+                self._waiting_requests[thread_id] = incremental_tokens
+                reserved_tokens = sum(self._prefix_tokens.values()) + sum(
+                    tokens - self._prefix_tokens.get(owner, 0)
+                    for owner, tokens in self._active_requests.items()
                 )
                 planned_usage = (
-                    effective_usage
-                    + cached_prefix_fraction
-                    + max(requested_prefix_tokens - self._prefix_tokens.get(thread_id, 0), 0)
-                    / self.capacity_tokens
+                    max(usage * self.capacity_tokens, reserved_tokens) + incremental_tokens
                 )
-                only_request_can_progress = (
-                    running == 0
-                    and waiting == 0
-                    and not self._active_requests
-                    and (
-                        thread_id in self._prefix_tokens or (usage == 0 and not self._prefix_tokens)
+                cached_waiters = {
+                    owner: delta
+                    for owner, delta in self._waiting_requests.items()
+                    if owner in self._prefix_tokens
+                }
+                available_tokens = self.target_usage * self.capacity_tokens - max(
+                    usage * self.capacity_tokens, reserved_tokens
+                )
+                fitting_cached = {
+                    owner: delta
+                    for owner, delta in cached_waiters.items()
+                    if delta <= available_tokens
+                }
+                has_cached_priority = (
+                    thread_id in fitting_cached
+                    and incremental_tokens == min(fitting_cached.values())
+                ) or not fitting_cached
+                no_server_or_local_request = (
+                    running == 0 and waiting == 0 and not self._active_requests
+                )
+                only_request_can_progress = no_server_or_local_request and (
+                    (thread_id in self._prefix_tokens and len(self._prefix_tokens) == 1)
+                    or (usage == 0 and not self._prefix_tokens)
+                    or (
+                        thread_id in cached_waiters
+                        and not fitting_cached
+                        and incremental_tokens == min(cached_waiters.values())
+                        and waited_at > 0
+                        and time.monotonic() - waited_at >= STALLED_CACHED_ESCAPE_SECONDS
                     )
                 )
-                if planned_usage <= self.target_usage or only_request_can_progress:
+                if has_cached_priority and (
+                    planned_usage <= self.target_usage * self.capacity_tokens
+                    or only_request_can_progress
+                ):
                     self._active_requests[thread_id] = requested_prefix_tokens
-                    self._prefix_tokens[thread_id] = max(
-                        requested_prefix_tokens, self._prefix_tokens.get(thread_id, 0)
-                    )
                     self._max_live_prefix_fraction = max(
                         self._max_live_prefix_fraction,
-                        sum(self._prefix_tokens.values()) / self.capacity_tokens,
+                        (reserved_tokens + incremental_tokens) / self.capacity_tokens,
                     )
                     self._admitted_requests += 1
                     if waited_at:
-                        self._wait_seconds += time.monotonic() - waited_at
-                    return
+                        duration = time.monotonic() - waited_at
+                        self._wait_seconds += duration
+                        return duration
+                    return 0.0
                 if not waited_at:
                     waited_at = time.monotonic()
                     self._admission_waits += 1
             time.sleep(self.poll_seconds)
 
-    def _release(self, thread_id: int) -> None:
+    def _release(self, thread_id: int, prompt_tokens: int, completed_tokens: int | None) -> None:
         with self._lock:
             try:
                 self._sample(force=True)
             finally:
                 del self._active_requests[thread_id]
+                if completed_tokens is not None:
+                    if completed_tokens < 0:
+                        raise ValueError("completion token count must be nonnegative")
+                    self._prefix_tokens[thread_id] = prompt_tokens + completed_tokens
 
     def finish_episode(self) -> None:
         """Free the cached-prefix reservation once a worker finishes its episode."""

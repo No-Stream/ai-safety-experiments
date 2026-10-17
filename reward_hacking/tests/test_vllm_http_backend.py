@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -15,10 +16,13 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from reward_hacking import model_backend
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 from reward_hacking.model_backend import SamplingConfig, VLLMBackend, VLLMHTTPBackend, build_backend
+from reward_hacking.organism_rl.admission import RequestReservation
 
 
 @pytest.fixture
@@ -135,6 +139,43 @@ def test_completion_holds_admission_through_http_request(
     backend.request_admission = Admission()  # type: ignore[assignment]
     backend.complete_rendered("hello", max_tokens=3, seed=1)
     assert events == ["admitted", "released"]
+
+
+def test_request_timing_separates_admission_from_server(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [0, 0, 0]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    class Admission:
+        def request(self, *, prompt_tokens: int, max_tokens: int) -> Admission:
+            del prompt_tokens, max_tokens
+            return self
+
+        def __enter__(self) -> RequestReservation:
+            time.sleep(0.04)
+            return RequestReservation(wait_seconds=0.04)
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    backend.request_admission = Admission()  # type: ignore[assignment]
+    post = model_backend._post_vllm_completion_with_retries  # pyright: ignore[reportPrivateUsage]
+
+    def slow_post(*args: Any, **kwargs: Any) -> httpx2.Response:
+        time.sleep(0.03)
+        return post(*args, **kwargs)
+
+    monkeypatch.setattr(model_backend, "_post_vllm_completion_with_retries", slow_post)
+    backend.complete_rendered("hello", max_tokens=3, seed=1)
+    timings = backend.take_request_timings()
+    assert len(timings) == 1
+    assert timings[0][0] == pytest.approx(0.04)
+    assert 0.03 <= timings[0][1] < 0.2
+    assert backend.take_request_timings() == []
 
 
 @pytest.mark.parametrize("thinking", [True, False])

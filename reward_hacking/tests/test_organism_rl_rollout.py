@@ -16,6 +16,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness import docker_backend, tasks_r2e_leak
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import DockerConfig
@@ -631,6 +632,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
         SimpleNamespace(
             model_id="organism-step-00000001-test",
             sampling=SamplingConfig(max_new_tokens=16),
+            request_admission=None,
         ),
     )
     source.output_dir = tmp_path
@@ -775,6 +777,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
             self.sampling = SamplingConfig(max_new_tokens=16)
             self.tokenizer = object()
             self.stop_token_ids: tuple[int, ...] = ()
+            self.request_admission = None
 
     def run_episode(
         task: Task, backend: object, *, trace_path: Path, system_prompt: str, **kwargs: object
@@ -927,6 +930,7 @@ def test_leak_task_source_runs_live_gate_before_backend_setup(
             self.sampling = SamplingConfig(max_new_tokens=16)
             self.tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 1)
             self.stop_token_ids: tuple[int, ...] = ()
+            self.request_admission = None
 
     def require_gate(config: DockerConfig) -> None:
         events.append(("gate", config))
@@ -1045,6 +1049,7 @@ def test_task_episode_sampling_seed_is_request_local(  # noqa: PLR0915 - seed an
             model_id="synthetic-model",
             model_path="synthetic-model",
             sampling=SamplingConfig(max_new_tokens=16),
+            request_admission=None,
         ),
     )
     source.model_path = "synthetic-model"
@@ -1316,6 +1321,68 @@ def test_rollout_concurrency_must_be_positive() -> None:
             cast("PreTrainedTokenizerBase", CharacterTokenizer()),
             episode_concurrency=0,
         )
+
+
+def test_organism_trace_separates_admission_wait_from_generation(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    write_trace(
+        trace_path,
+        [
+            {"record": "turn", "turn": 0, "generation_seconds": 9.0},
+            {"record": "turn", "turn": 1, "generation_seconds": 8.0},
+        ],
+        compact=True,
+    )
+    summary: dict[str, object] = {
+        "uncompleted_model_call_seconds": 0.0,
+        "final_report_model_call_seconds": 1.0,
+        "model_call_seconds": 18.0,
+    }
+    rollout._record_request_timings(  # pyright: ignore[reportPrivateUsage]
+        trace_path, summary, [(6.0, 3.0), (5.0, 3.0)]
+    )
+    turns = list(read_jsonl(trace_path))
+    assert [turn["admission_wait_seconds"] for turn in turns] == [6.0, 5.0]
+    assert [turn["generation_seconds"] for turn in turns] == [3.0, 3.0]
+    assert summary["admission_wait_seconds"] == 11.0
+    assert summary["model_call_seconds"] == 7.0
+
+
+def test_late_request_timing_is_not_mistaken_for_a_final_report(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    write_trace(trace_path, [{"record": "turn", "generation_seconds": 4.0}], compact=True)
+    summary: dict[str, object] = {
+        "uncompleted_model_call_seconds": 6.0,
+        "final_report_model_call_seconds": None,
+        "model_call_seconds": None,
+    }
+
+    rollout._record_request_timings(  # pyright: ignore[reportPrivateUsage]
+        trace_path, summary, [(1.0, 2.0), (3.0, 4.0)]
+    )
+
+    assert summary["uncompleted_model_call_seconds"] == 4.0
+    assert summary["final_report_model_call_seconds"] is None
+    assert summary["admission_wait_seconds"] == 4.0
+
+
+def test_late_request_and_final_report_have_distinct_timings(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    write_trace(trace_path, [{"record": "turn", "generation_seconds": 8.0}], compact=True)
+    summary: dict[str, object] = {
+        "uncompleted_model_call_seconds": 6.0,
+        "final_report_model_call_seconds": 7.0,
+        "model_call_seconds": 21.0,
+    }
+
+    rollout._record_request_timings(  # pyright: ignore[reportPrivateUsage]
+        trace_path, summary, [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]
+    )
+
+    assert summary["uncompleted_model_call_seconds"] == 4.0
+    assert summary["final_report_model_call_seconds"] == 6.0
+    assert summary["model_call_seconds"] == 12.0
+    assert summary["admission_wait_seconds"] == 9.0
 
 
 def test_rollout_episode_failure_propagates() -> None:

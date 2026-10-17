@@ -35,6 +35,7 @@ from reward_hacking.harness.loop import (
     effective_grader_timeout,
     grader_reported_success,
     run_grader,
+    submission_grader_reuse_identity,
 )
 from reward_hacking.harness.math_evidence import (
     MathEvidence,
@@ -205,6 +206,14 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
                     "math_evidence": math_evidence,
                 },
             )
+        proxy_reuse_identity = submission_grader_reuse_identity(
+            task,
+            directory,
+            arm=AgenticArmConfig(),
+            timeout=LADDER_COMMAND_TIMEOUT,
+            jail_backend=jail_backend,
+            artifact_sha256=artifact_sha256,
+        )
         grader_result = run_grader(
             task,
             directory,
@@ -230,6 +239,11 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             evidence={
                 "artifact_sha256": artifact_sha256,
                 "command_evidence": asdict(grader_result),
+                **(
+                    {"proxy_reuse_identity": proxy_reuse_identity}
+                    if proxy_reuse_identity is not None
+                    else {}
+                ),
             },
         )
 
@@ -969,6 +983,46 @@ def _persist_episode_summary(
     write_trace(temporary_trace_path, [dict(record) for record in records], compact=True)
 
 
+def _record_request_timings(
+    trace_path: Path,
+    summary_record: dict[str, object],
+    timings: list[tuple[float, float]],
+) -> None:
+    """Replace ladder's outer call timer with transport timing in organism traces."""
+    records = [dict(record) for record in _read_trace(trace_path)]
+    turns = [record for record in records if record.get("record") == "turn"]
+    if len(timings) < len(turns) or len(timings) > len(turns) + 2:
+        raise ValueError("server request timings do not align with completed turns")
+    for record, (wait_seconds, request_seconds) in zip(turns, timings, strict=False):
+        record["admission_wait_seconds"] = wait_seconds
+        record["generation_seconds"] = request_seconds
+    summary_record["admission_wait_seconds"] = sum(wait for wait, _ in timings)
+    extra_timings = timings[len(turns) :]
+    original_report_seconds = summary_record["final_report_model_call_seconds"]
+    uncompleted_and_report = len(extra_timings) > 1
+    if uncompleted_and_report or (
+        len(extra_timings) == 1
+        and isinstance(original_report_seconds, (int, float))
+        and original_report_seconds > 0
+    ):
+        summary_record["final_report_model_call_seconds"] = extra_timings[-1][1]
+    if uncompleted_and_report or (
+        len(extra_timings) == 1
+        and (original_report_seconds is None or original_report_seconds == 0)
+    ):
+        summary_record["uncompleted_model_call_seconds"] = extra_timings[0][1]
+    uncompleted = summary_record["uncompleted_model_call_seconds"]
+    final_report = summary_record["final_report_model_call_seconds"]
+    if isinstance(uncompleted, (int, float)) and isinstance(final_report, (int, float)):
+        summary_record["model_call_seconds"] = (
+            sum(request for _, request in timings[: len(turns)]) + uncompleted + final_report
+        )
+    for record in records:
+        if record.get("record") == "episode_summary":
+            record.update(summary_record)
+    write_trace(trace_path, records, compact=True)
+
+
 def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to persisted trace identity
     task: Task,
     summary_record: dict[str, object],
@@ -1297,7 +1351,7 @@ class TaskEpisodeSource:
         )
         self.torn_trace_count = 0
 
-    def __call__(  # noqa: C901, PLR0915 - resume validation and native episode publication
+    def __call__(  # noqa: C901, PLR0912, PLR0915 - resume validation and native episode publication
         self, task_id: str, *, seed: int, step: int, replica: int
     ) -> EpisodeSample:
         """Persist and score one jail episode using the currently served adapter."""
@@ -1421,6 +1475,10 @@ class TaskEpisodeSource:
                 **self.convention_identity,
                 **_terminal_collection_metadata(task, evidence_path),
             }
+            if backend.request_admission is not None:
+                _record_request_timings(
+                    temporary_trace_path, summary_record, backend.take_request_timings()
+                )
             _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
             summary_record["true_pass"] = recorded_true_pass(summary_record)
