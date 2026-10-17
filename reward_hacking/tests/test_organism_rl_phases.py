@@ -116,6 +116,49 @@ def server() -> tuple[httpx2.MockTransport, ServerState]:
     return httpx2.MockTransport(handle), state
 
 
+def _record_phase_host_budget_calls(
+    monkeypatch: pytest.MonkeyPatch, controller: VLLMPhaseController
+) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]], list[tuple[int, int]]]:
+    combined_budget_calls: list[tuple[int, int, str]] = []
+    host_budget_calls: list[tuple[int, str]] = []
+    planned_arena_bytes: list[tuple[int, int]] = []
+    original_combined_budget = phases.check_pinned_and_sleeping_weight_budget
+    original_host_budget = controller._check_host_memory_budget
+    original_planned_bytes = phases.PolicyTransfers.planned_host_bytes
+
+    def record_combined_budget(
+        *,
+        pinned_bytes: int,
+        sleeping_weight_bytes: int,
+        host_memory_budget_bytes: int,
+        phase: str,
+    ) -> None:
+        combined_budget_calls.append((pinned_bytes, sleeping_weight_bytes, phase))
+        original_combined_budget(
+            pinned_bytes=pinned_bytes,
+            sleeping_weight_bytes=sleeping_weight_bytes,
+            host_memory_budget_bytes=host_memory_budget_bytes,
+            phase=phase,
+        )
+
+    def record_host_budget(required_bytes: int, phase: str) -> None:
+        host_budget_calls.append((required_bytes, phase))
+        original_host_budget(required_bytes, phase)
+
+    def record_planned_bytes(
+        transfers: phases.PolicyTransfers, optimizer: torch.optim.Optimizer | None
+    ) -> int:
+        existing_host_bytes = transfers.host_bytes
+        planned_bytes = original_planned_bytes(transfers, optimizer)
+        planned_arena_bytes.append((planned_bytes, existing_host_bytes))
+        return planned_bytes
+
+    monkeypatch.setattr(phases, "check_pinned_and_sleeping_weight_budget", record_combined_budget)
+    monkeypatch.setattr(controller, "_check_host_memory_budget", record_host_budget)
+    monkeypatch.setattr(phases.PolicyTransfers, "planned_host_bytes", record_planned_bytes)
+    return combined_budget_calls, host_budget_calls, planned_arena_bytes
+
+
 def test_sample_train_sync_cycle(
     server: tuple[httpx2.MockTransport, ServerState], tmp_path: Path
 ) -> None:
@@ -393,8 +436,14 @@ def test_resolve_host_memory_budget_reads_cgroup_ancestor_limits(tmp_path: Path)
     leaf.mkdir(parents=True)
     (parent / "memory.max").write_text("10000\n", encoding="ascii")
     (parent / "memory.current").write_text("6000\n", encoding="ascii")
+    (parent / "memory.stat").write_text(
+        "anon 6000\nactive_file 0\ninactive_file 0\n", encoding="ascii"
+    )
     (leaf / "memory.max").write_text("12000\n", encoding="ascii")
     (leaf / "memory.current").write_text("7000\n", encoding="ascii")
+    (leaf / "memory.stat").write_text(
+        "anon 7000\nactive_file 0\ninactive_file 0\n", encoding="ascii"
+    )
     process_cgroup = tmp_path / "self.cgroup"
     process_cgroup.write_text("0::/job/worker\n", encoding="ascii")
 
@@ -415,10 +464,14 @@ def test_cgroup_namespace_falls_back_to_mounted_root_when_membership_path_is_mis
     cgroup_root.mkdir()
     (cgroup_root / "memory.max").write_text("12000\n", encoding="ascii")
     (cgroup_root / "memory.current").write_text("7000\n", encoding="ascii")
+    (cgroup_root / "memory.stat").write_text(
+        "anon 3000\nfile 4000\nshmem 1000\nactive_file 2000\ninactive_file 1000\n", encoding="ascii"
+    )
     process_cgroup = tmp_path / "self.cgroup"
     process_cgroup.write_text("0::/non-systemd\n", encoding="ascii")
 
-    assert phases._cgroup_memory_states(cgroup_root, process_cgroup) == ((12000, 7000),)
+    # Reclaimable page cache (e.g. safetensors just read) is not memory the job holds.
+    assert phases._cgroup_memory_states(cgroup_root, process_cgroup) == ((12000, 4000),)
 
 
 def test_host_memory_budget_guard_accounts_for_current_usage_and_margin() -> None:
@@ -475,6 +528,69 @@ def test_offload_budget_refusal_happens_before_host_storage_allocation(
 
     assert controller._transfers is not None
     assert controller._transfers.host_bytes == 0
+    controller.close()
+
+
+def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=8192, available=8192),
+    )
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=4096,
+        host_memory_safety_margin_bytes=0,
+        sleeping_weight_bytes=20,
+        http_transport=transport,
+    )
+    combined_budget_calls, host_budget_calls, planned_arena_bytes = _record_phase_host_budget_calls(
+        monkeypatch, controller
+    )
+    model = ToyAdapter()
+    model.weight.requires_grad_(False)
+    optimizer = torch.optim.AdamW(
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    )
+    trainer = ToyTrainer(model, optimizer, ToyState())
+    controller.initialize(trainer)
+    assert controller._transfers is not None
+    assert controller._transfers.frozen_host_storage_ids
+    first_planned_bytes, first_existing_bytes = planned_arena_bytes[0]
+    assert first_existing_bytes == 0
+    assert combined_budget_calls[0] == (first_planned_bytes, 0, "offload")
+    assert host_budget_calls[0] == (first_planned_bytes, "offload")
+
+    controller.before_training(trainer)
+    assert combined_budget_calls[1] == (first_planned_bytes, 20, "vLLM sleep")
+    assert host_budget_calls[1] == (20, "vLLM sleep")
+    assert not controller._transfers.frozen_host_storage_ids
+    retained_mutable_bytes = controller._transfers.host_bytes
+    assert retained_mutable_bytes > 0
+
+    loss = model(torch.ones(1, 2)).square().sum()
+    loss.backward()
+    optimizer.step()
+    trainer.state.global_step = 1
+    controller.after_optimizer_step(trainer)
+
+    second_planned_bytes, second_existing_bytes = planned_arena_bytes[1]
+    assert second_planned_bytes > second_existing_bytes == retained_mutable_bytes
+    assert combined_budget_calls[2] == (second_planned_bytes, 20, "offload")
+    assert host_budget_calls[2] == (
+        second_planned_bytes - second_existing_bytes,
+        "offload",
+    )
+    assert controller._transfers.frozen_host_storage_ids
     controller.close()
 
 

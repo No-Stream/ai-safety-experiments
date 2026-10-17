@@ -1,5 +1,6 @@
 """CPU plumbing and real GRPO loss execution for the opt-in GPU benchmark."""
 
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,11 +11,14 @@ from transformers import GPT2LMHeadModel
 import reward_hacking.distill.train as distill_train
 from reward_hacking.organism_rl.microstep_benchmark import (
     _build_trainer,
+    _record_phase_transfer,
+    _TransferPhaseMetadata,
     diagnostic_overrides,
     main,
     parse_args,
     run_microstep,
 )
+from reward_hacking.organism_rl.transfers import PolicyTransfers
 from reward_hacking.tests.test_organism_rl_trainer import _trainer
 
 
@@ -27,6 +31,24 @@ def test_benchmark_defaults_keep_production_precision() -> None:
     assert args.backbone_checkpointing
     assert args.head_checkpointing
     assert args.base_quantization == "none"
+    assert args.transfer_host_memory == "pageable"
+
+
+@pytest.mark.parametrize("host_memory", ["pageable", "pinned"])
+def test_benchmark_accepts_transfer_host_memory_modes(host_memory: str) -> None:
+    args = parse_args(
+        [
+            "--model",
+            "cached-model",
+            "--output",
+            "artifacts/benchmark.jsonl",
+            "--phase-transfers",
+            "--transfer-host-memory",
+            host_memory,
+        ]
+    )
+    assert args.phase_transfers
+    assert args.transfer_host_memory == host_memory
 
 
 def test_benchmark_accepts_int8_without_phase_transfers() -> None:
@@ -114,6 +136,68 @@ def test_cpu_microstep_runs_native_loss_backward_and_fp32_adam(tmp_path: Path) -
     assert record["loss"] < 0
     assert optimizer.state
     assert {state["exp_avg"].dtype for state in optimizer.state.values()} == {torch.float32}
+
+
+def test_cpu_phase_transfers_emit_persistent_per_phase_memory_records(tmp_path: Path) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    (model(torch.ones((1, 2))).sum()).backward()
+    optimizer.step()
+    transfers = PolicyTransfers(model, torch.device("cpu"), pin_memory=False)
+    output_path = tmp_path / "transfers.jsonl"
+
+    with output_path.open("w", encoding="utf-8") as output:
+        _record_phase_transfer(
+            output,
+            transfers,
+            optimizer,
+            _TransferPhaseMetadata(
+                cycle=0, warmup=True, phase="offload", frozen_weight_host_memory_mode="pageable"
+            ),
+        )
+        _record_phase_transfer(
+            output,
+            transfers,
+            optimizer,
+            _TransferPhaseMetadata(
+                cycle=0, warmup=True, phase="restore", frozen_weight_host_memory_mode="pageable"
+            ),
+        )
+        _record_phase_transfer(
+            output,
+            transfers,
+            optimizer,
+            _TransferPhaseMetadata(
+                cycle=1, warmup=False, phase="offload", frozen_weight_host_memory_mode="pageable"
+            ),
+        )
+        _record_phase_transfer(
+            output,
+            transfers,
+            optimizer,
+            _TransferPhaseMetadata(
+                cycle=1, warmup=False, phase="restore", frozen_weight_host_memory_mode="pageable"
+            ),
+        )
+
+    records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert [(record["cycle"], record["phase"]) for record in records] == [
+        (0, "offload"),
+        (0, "restore"),
+        (1, "offload"),
+        (1, "restore"),
+    ]
+    for record in records:
+        assert record["kind"] == "phase_transfer"
+        assert record["frozen_weight_host_memory_mode"] == "pageable"
+        assert record["mutable_host_memory_mode"] == "pageable"
+        assert record["moved_bytes"] > 0
+        assert record["seconds"] > 0
+        assert record["gb_per_second"] > 0
+        assert record["host_rss_bytes_before"] > 0
+        assert record["host_rss_bytes_after"] > 0
+        assert record["host_available_bytes_before"] > 0
+        assert record["host_available_bytes_after"] > 0
 
 
 def test_local_model_loader_runs_checkpointed_bf16_microstep(tmp_path: Path) -> None:

@@ -1,13 +1,15 @@
 """Storage-preserving host staging for sequential policy/sampler ownership.
 
-Frozen storage is copied to host only once. Mutable storage is refreshed on every
-training cycle. Tensor subclasses (including TorchAO wrappers) require a separate
-representation-aware implementation and are refused before any placement changes.
+Frozen host arenas exist only during rollout and are released after restore.
+Mutable storage is refreshed on every training cycle. Tensor subclasses (including
+TorchAO wrappers) require a separate representation-aware implementation and are
+refused before any placement changes.
 """
 
 from __future__ import annotations
 
 import logging
+import mmap
 import time
 from dataclasses import dataclass
 from typing import cast
@@ -34,6 +36,48 @@ class TransferReport:
         return self.frozen_bytes + self.mutable_bytes
 
 
+class _HostArena:
+    """Exact-size mapped storage, optionally registered without CachingHostAllocator.
+
+    Pageable mode avoids repeated CUDA registration cost (especially on WSL).
+    Pinned mode permits asynchronous DMA but pays registration on every rollout.
+    Compare complete phase times before selecting a machine's faster mode.
+    """
+
+    def __init__(self, size: int, *, pin_memory: bool) -> None:
+        self._mapping: mmap.mmap | None = mmap.mmap(-1, max(size, 1))
+        self.buffer: torch.Tensor | None = torch.frombuffer(
+            self._mapping, dtype=torch.uint8, count=max(size, 1)
+        )[:size]
+        self._registered = pin_memory and size > 0
+        if self._registered:
+            runtime = torch.cuda.cudart()
+            if runtime is None:
+                raise RuntimeError("CUDA runtime is unavailable for host registration")
+            status = runtime.cudaHostRegister(self.buffer.data_ptr(), size, 0)
+            if status != runtime.cudaError.success:
+                self.buffer = None
+                self._mapping.close()
+                raise RuntimeError(f"cudaHostRegister failed: {status}")
+
+    def release(self) -> None:
+        """Unregister after the caller's synchronization, then return pages to the OS."""
+        if self.buffer is None:
+            raise RuntimeError("host arena already released")
+        if self._registered:
+            runtime = torch.cuda.cudart()
+            if runtime is None:
+                raise RuntimeError("CUDA runtime is unavailable for host registration")
+            status = runtime.cudaHostUnregister(self.buffer.data_ptr())
+            if status != runtime.cudaError.success:
+                raise RuntimeError(f"cudaHostUnregister failed: {status}")
+        self.buffer = None
+        # frombuffer's storage owns the mapping too. Dropping our reference unmaps it
+        # immediately unless a caller still owns a detached host alias; that alias
+        # must remain valid until its owner releases it.
+        self._mapping = None
+
+
 @dataclass
 class _TensorView:
     tensor: torch.Tensor
@@ -57,7 +101,6 @@ class _StorageGroup:
     mutable: bool
     target: torch.device
     category: str
-    initialized: bool = False
 
     def source_bytes(self) -> torch.Tensor:
         tensor = self.views[0].tensor
@@ -117,12 +160,21 @@ def _parameter_category(name: str) -> str:
 
 
 class PolicyTransfers:
-    """Keep host weight storage while releasing all policy GPU storage between phases."""
+    """Stage frozen weights transiently; retain only mutable host storage during training."""
 
-    def __init__(self, model: torch.nn.Module, training_device: torch.device) -> None:
-        """Capture the already-loaded policy, after checkpoint restoration."""
+    def __init__(
+        self, model: torch.nn.Module, training_device: torch.device, *, pin_memory: bool = False
+    ) -> None:
+        """Capture the policy after checkpoint restoration.
+
+        pin_memory selects frozen arena registration; mutable CUDA state stays pinned.
+        Detached snapshots borrowed while offloaded retain host pages until released.
+        """
         self.model = model
         self.training_device = training_device
+        # Pageable is provisional until phase benchmarks measure registration plus copy cost.
+        self.pin_memory = pin_memory and training_device.type == "cuda"
+        self._frozen_arenas: list[_HostArena] = []
         self._groups: list[_StorageGroup] = []
         self._host = False
         self._rebuild_head = any(
@@ -135,7 +187,7 @@ class PolicyTransfers:
 
     @property
     def frozen_host_storage_ids(self) -> tuple[int, ...]:
-        """Stable host storage identifiers for transfer accounting and diagnostics."""
+        """Currently live frozen host storage identifiers; empty during training."""
         return tuple(
             group.host.untyped_storage().data_ptr() for group in self._groups if not group.mutable
         )
@@ -236,21 +288,32 @@ class PolicyTransfers:
         if not pending:
             return
         # torch.save refuses different dtypes sharing a storage, so use one arena per dtype.
-        batches: dict[torch.dtype, list[list[tuple[torch.Tensor, bool, torch.device, str]]]] = {}
+        batches: dict[
+            tuple[torch.dtype, bool], list[list[tuple[torch.Tensor, bool, torch.device, str]]]
+        ] = {}
         for values in pending:
-            batches.setdefault(values[0][0].dtype, []).append(values)
-        for batch in batches.values():
-            arena = torch.empty(
-                sum(_aligned_bytes(values[0][0].untyped_storage().nbytes()) for values in batch),
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=self.training_device.type == "cuda",
-            )
+            mutable = any(mutable for _, mutable, _, _ in values)
+            batches.setdefault((values[0][0].dtype, mutable), []).append(values)
+        for (_, mutable), batch in batches.items():
+            size = sum(_aligned_bytes(values[0][0].untyped_storage().nbytes()) for values in batch)
+            if mutable:
+                buffer = torch.empty(
+                    size,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=self.training_device.type == "cuda",
+                )
+            else:
+                arena = _HostArena(size, pin_memory=self.pin_memory)
+                self._frozen_arenas.append(arena)
+                if arena.buffer is None:
+                    raise RuntimeError("new host arena has no storage")
+                buffer = arena.buffer
             offset = 0
             for values in batch:
                 tensor = values[0][0]
                 size = tensor.untyped_storage().nbytes()
-                host = arena[offset : offset + size]
+                host = buffer[offset : offset + size]
                 offset += _aligned_bytes(size)
                 views = [
                     _TensorView(
@@ -273,8 +336,10 @@ class PolicyTransfers:
             "policy host storage bytes=%d breakdown=%s", self.host_bytes, self.host_byte_breakdown
         )
 
-    def _finish(self, started: float, frozen: int, mutable: int, phase: str) -> TransferReport:
-        if self.training_device.type == "cuda":
+    def _finish(
+        self, started: float, frozen: int, mutable: int, phase: str, *, synchronize: bool = True
+    ) -> TransferReport:
+        if synchronize and self.training_device.type == "cuda":
             torch.cuda.synchronize(self.training_device)
         report = TransferReport(frozen, mutable, time.perf_counter() - started)
         logger.info(
@@ -292,7 +357,7 @@ class PolicyTransfers:
         return report
 
     def offload(self, optimizer: torch.optim.Optimizer | None) -> TransferReport:
-        """Refresh mutable host storage, then release device storage after one synchronization."""
+        """Copy all frozen and mutable storage, then release device storage after synchronization."""
         started = time.perf_counter()
         if self._host:
             return TransferReport(0, 0, time.perf_counter() - started)
@@ -301,13 +366,14 @@ class PolicyTransfers:
         self._collect_groups(optimizer)
         frozen = mutable = 0
         for group in self._groups:
-            if group.mutable or not group.initialized:
-                group.host.copy_(group.source_bytes(), non_blocking=True)
-                if group.mutable:
-                    mutable += group.host.numel()
-                else:
-                    frozen += group.host.numel()
-                group.initialized = True
+            group.host.copy_(
+                group.source_bytes(),
+                non_blocking=self.training_device.type == "cuda",
+            )
+            if group.mutable:
+                mutable += group.host.numel()
+            else:
+                frozen += group.host.numel()
         report = self._finish(started, frozen, mutable, "offload")
         for group in self._groups:
             group.bind(group.host)
@@ -315,22 +381,35 @@ class PolicyTransfers:
         return report
 
     def restore(self, optimizer: torch.optim.Optimizer | None) -> TransferReport:
-        """Restore cached and mutable storage without replacing Parameter objects."""
+        """Restore storage without replacing Parameters; synchronize before freeing frozen arenas."""
         del optimizer
         started = time.perf_counter()
         if not self._host:
             return TransferReport(0, 0, time.perf_counter() - started)
+        frozen, mutable = self._restore_device_storage()
+        if self._rebuild_head:
+            prepare_fp32_head(self.model)
+        if self.training_device.type == "cuda":
+            torch.cuda.synchronize(self.training_device)
+        self._groups = [group for group in self._groups if group.mutable]
+        for arena in self._frozen_arenas:
+            arena.release()
+        self._frozen_arenas.clear()
+        self._host = False
+        return self._finish(started, frozen, mutable, "restore", synchronize=False)
+
+    def _restore_device_storage(self) -> tuple[int, int]:
+        # Keep borrowed host views local so none survive when restore releases their mappings.
         frozen = mutable = 0
         for group in self._groups:
             storage = torch.empty(group.host.shape, dtype=torch.uint8, device=group.target)
-            storage.copy_(group.host, non_blocking=True)
+            storage.copy_(
+                group.host,
+                non_blocking=self.training_device.type == "cuda",
+            )
             group.bind(storage)
             if group.mutable:
                 mutable += group.host.numel()
             else:
                 frozen += group.host.numel()
-        if self._rebuild_head:
-            prepare_fp32_head(self.model)
-        report = self._finish(started, frozen, mutable, "restore")
-        self._host = False
-        return report
+        return frozen, mutable

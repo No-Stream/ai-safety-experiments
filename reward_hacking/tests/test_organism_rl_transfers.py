@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import weakref
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -12,7 +14,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from reward_hacking.distill.train import prepare_fp32_head
 from reward_hacking.organism_rl.precision import assert_fp32_training_state
-from reward_hacking.organism_rl.transfers import PolicyTransfers
+from reward_hacking.organism_rl.transfers import PolicyTransfers, _HostArena
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -68,7 +70,6 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
     assert first.frozen_bytes == sum(
         value.numel() * value.element_size() for value in frozen.values()
     )
-    first_host_ids = transfers.frozen_host_storage_ids
     inputs = torch.tensor([[1, 2, 3, 4]])
     for _ in range(2):
         transfers.restore(optimizer)
@@ -90,9 +91,8 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
             id(parameter.grad) for parameter in model.parameters() if parameter.grad is not None
         }
         report = transfers.offload(optimizer)
-        assert report.frozen_bytes == 0
+        assert report.frozen_bytes == first.frozen_bytes
         assert report.mutable_bytes > 0
-        assert transfers.frozen_host_storage_ids == first_host_ids
         assert {name: id(value) for name, value in model.named_parameters()} == identities
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
         torch.save(
@@ -121,7 +121,7 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
                 )
 
 
-def test_restore_rebinds_cached_values_and_shared_storage_views() -> None:
+def test_restore_rebinds_staged_values_and_shared_storage_views() -> None:
     model: Any = torch.nn.Module()
     model.register_parameter(
         "weight", torch.nn.Parameter(torch.arange(12.0).reshape(3, 4), requires_grad=False)
@@ -154,7 +154,7 @@ def test_tensor_subclass_refused_before_model_mutation() -> None:
     assert id(model.weight) == identity
 
 
-def test_frozen_fp32_head_buffer_cached_and_mutable_buffer_refreshed() -> None:
+def test_frozen_fp32_head_buffer_staged_and_mutable_buffer_refreshed() -> None:
     model: Any = torch.nn.Linear(3, 2, dtype=torch.bfloat16)
     model.requires_grad_(False)
     model.register_buffer("cached_head", model.weight.float().detach().clone(), persistent=False)
@@ -166,16 +166,15 @@ def test_frozen_fp32_head_buffer_cached_and_mutable_buffer_refreshed() -> None:
         tensor.numel() * tensor.element_size()
         for tensor in [model.weight, model.bias, model.cached_head]
     )
-    host_ids = transfers.frozen_host_storage_ids
     transfers.restore(None)
     model.counter.add_(7)
     second = transfers.offload(None)
-    assert second.frozen_bytes == 0
+    assert second.frozen_bytes == first.frozen_bytes
     assert second.mutable_bytes == model.counter.numel() * model.counter.element_size()
     transfers.restore(None)
     assert model.counter.item() == 7
     assert model.cached_head.dtype == torch.float32
-    assert transfers.frozen_host_storage_ids == host_ids
+    assert not transfers.frozen_host_storage_ids
 
 
 def test_transfers_use_one_arena_per_dtype_for_many_storages_and_preserve_offsets(
@@ -188,18 +187,18 @@ def test_transfers_use_one_arena_per_dtype_for_many_storages_and_preserve_offset
             torch.nn.Parameter(torch.full((3,), float(index)), requires_grad=False),
         )
     model.register_buffer("counter", torch.tensor([123], dtype=torch.int64))
-    original_empty = torch.empty
+    frombuffer = torch.frombuffer
     host_allocations: list[int] = []
 
-    def counted_empty(*args: Any, **kwargs: Any) -> torch.Tensor:
-        if "pin_memory" in kwargs:
-            host_allocations.append(int(args[0]))
-        return original_empty(*args, **kwargs)
+    def counted_frombuffer(*args: Any, **kwargs: Any) -> torch.Tensor:
+        result = frombuffer(*args, **kwargs)
+        host_allocations.append(result.numel())
+        return result
 
-    monkeypatch.setattr(torch, "empty", counted_empty)
+    monkeypatch.setattr(torch, "frombuffer", counted_frombuffer)
     transfers = PolicyTransfers(model, torch.device("cpu"))
     first = transfers.offload(None)
-    assert len(host_allocations) == 2
+    assert len(host_allocations) == 1
     assert first.moved_bytes == 40 * 3 * 4 + 8
     assert sum(transfers.host_byte_breakdown.values()) == transfers.host_bytes
     assert transfers.host_byte_breakdown["mutable.buffers"] == 8
@@ -209,7 +208,7 @@ def test_transfers_use_one_arena_per_dtype_for_many_storages_and_preserve_offset
             torch.testing.assert_close(parameter, torch.full((3,), float(index)))
         assert model.get_buffer("counter").item() == 123
         transfers.offload(None)
-    assert len(host_allocations) == 2
+    assert len(host_allocations) == 3
 
 
 def test_planned_host_bytes_counts_shared_storage_once_without_allocating(
@@ -228,3 +227,75 @@ def test_planned_host_bytes_counts_shared_storage_once_without_allocating(
 
     monkeypatch.setattr(torch, "empty", no_allocation)
     assert transfers.planned_host_bytes(None) == 16
+
+
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_qwen_transient_frozen_arena_released_after_each_restore(pin_memory: bool) -> None:
+    model = tiny_policy()
+    transfers = PolicyTransfers(model, torch.device("cpu"), pin_memory=pin_memory)
+    expected = {name: value.detach().clone() for name, value in model.named_parameters()}
+    for _ in range(3):
+        report = transfers.offload(None)
+        assert report.frozen_bytes > 0
+        arenas = transfers._frozen_arenas
+        assert arenas
+        arena_ref = weakref.ref(arenas[0])
+        buffer_ref = weakref.ref(arenas[0].buffer)
+        mapping_ref = weakref.ref(arenas[0]._mapping)
+        del arenas
+        transfers.restore(None)
+        assert mapping_ref() is None
+        assert not transfers._frozen_arenas
+        assert arena_ref() is None
+        assert buffer_ref() is None
+        assert not transfers.frozen_host_storage_ids
+        for name, value in model.named_parameters():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
+
+def test_registered_arena_unregisters_and_unmaps_without_pinned_allocator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def register(pointer: int, size: int, flags: int) -> int:
+        assert size == 4096
+        assert flags == 0
+        calls.append(("register", pointer))
+        return 0
+
+    def unregister(pointer: int) -> int:
+        calls.append(("unregister", pointer))
+        return 0
+
+    runtime = SimpleNamespace(
+        cudaHostRegister=register,
+        cudaHostUnregister=unregister,
+        cudaError=SimpleNamespace(success=0),
+    )
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    arena = _HostArena(4096, pin_memory=True)
+    assert arena.buffer is not None
+    mapping_ref = weakref.ref(arena._mapping)
+    pointer = arena.buffer.data_ptr()
+    buffer_ref = weakref.ref(arena.buffer)
+    arena.release()
+    assert calls == [("register", pointer), ("unregister", pointer)]
+    assert arena._mapping is None
+    assert mapping_ref() is None
+    assert buffer_ref() is None
+
+
+def test_restore_keeps_caller_owned_host_alias_valid_until_released() -> None:
+    model = tiny_policy()
+    transfers = PolicyTransfers(model, torch.device("cpu"))
+    transfers.offload(None)
+    parameter = next(parameter for parameter in model.parameters() if not parameter.requires_grad)
+    alias = parameter.detach()
+    expected = alias.clone()
+    mapping_ref = weakref.ref(transfers._frozen_arenas[0]._mapping)
+    transfers.restore(None)
+    torch.testing.assert_close(alias, expected, rtol=0, atol=0)
+    assert mapping_ref() is not None
+    del alias
+    assert mapping_ref() is None

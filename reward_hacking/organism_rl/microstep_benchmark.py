@@ -2,7 +2,9 @@
 
 Each invocation measures one explicitly selected variant. Defaults retain fp32 head computation,
 fp32 LoRA storage/gradients/Adam and all-assistant IS. Reduced precision variants are diagnostics,
-not admission to training. Loading and setup are untimed; native loss metrics and entropy are timed.
+not admission to training. Loading and setup are untimed. Microsteps time native losses and entropy;
+optional phase-transfer records time each offload/restore and capture host memory before and after.
+The transfer mode selects the frozen-weight host arena; mutable storage keeps its existing mode.
 """
 
 import argparse
@@ -12,12 +14,13 @@ import os
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, cast, override
+from typing import Any, Literal, TextIO, cast, override
 from unittest.mock import patch
 
+import psutil
 import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
@@ -33,6 +36,14 @@ from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
 from reward_hacking.organism_rl.transfers import PolicyTransfers
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TransferPhaseMetadata:
+    cycle: int
+    warmup: bool
+    phase: Literal["offload", "restore"]
+    frozen_weight_host_memory_mode: Literal["pageable", "pinned"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,6 +72,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--phase-transfers",
         action="store_true",
         help="also time actual offload/restore after every step",
+    )
+    parser.add_argument(
+        "--transfer-host-memory",
+        choices=("pageable", "pinned"),
+        default="pageable",
+        help="frozen-weight host arena mode (default: pageable, provisional and unmeasured)",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -172,6 +189,52 @@ def run_microstep(
     }
 
 
+def _record_phase_transfer(
+    output: TextIO,
+    transfers: PolicyTransfers,
+    optimizer: torch.optim.Optimizer,
+    metadata: _TransferPhaseMetadata,
+) -> None:
+    """Measure one complete transfer phase and persist its host-memory snapshots."""
+    memory_before = psutil.virtual_memory()
+    rss_before = psutil.Process().memory_info().rss
+    started = time.perf_counter()
+    report = (
+        transfers.offload(optimizer)
+        if metadata.phase == "offload"
+        else transfers.restore(optimizer)
+    )
+    seconds = time.perf_counter() - started
+    memory_after = psutil.virtual_memory()
+    rss_after = psutil.Process().memory_info().rss
+    moved_bytes = report.frozen_bytes + report.mutable_bytes
+    record = {
+        "kind": "phase_transfer",
+        "cycle": metadata.cycle,
+        "warmup": metadata.warmup,
+        "phase": metadata.phase,
+        "frozen_weight_host_memory_mode": metadata.frozen_weight_host_memory_mode,
+        "mutable_host_memory_mode": (
+            "pinned" if transfers.training_device.type == "cuda" else "pageable"
+        ),
+        "frozen_bytes": report.frozen_bytes,
+        "mutable_bytes": report.mutable_bytes,
+        "moved_bytes": moved_bytes,
+        "seconds": seconds,
+        "gb_per_second": moved_bytes / seconds / 1e9,
+        "host_storage_bytes": transfers.host_bytes,
+        "host_rss_bytes_before": rss_before,
+        "host_rss_bytes_after": rss_after,
+        "host_rss_delta_bytes": rss_after - rss_before,
+        "host_available_bytes_before": memory_before.available,
+        "host_available_bytes_after": memory_after.available,
+        "host_available_delta_bytes": memory_after.available - memory_before.available,
+    }
+    output.write(json.dumps(record) + "\n")
+    output.flush()
+    os.fsync(output.fileno())
+
+
 def _unused_rollout(prompts: list[Any], trainer: Any) -> dict[str, Any]:  # noqa: ANN401
     del prompts, trainer
     raise RuntimeError("the microstep benchmark must never sample")
@@ -280,7 +343,11 @@ def main(argv: list[str] | None = None) -> None:
         optimizer = torch.optim.AdamW(
             parameter for parameter in model.parameters() if parameter.requires_grad
         )
-        transfers = PolicyTransfers(model, device) if args.phase_transfers else None
+        transfers = (
+            PolicyTransfers(model, device, pin_memory=args.transfer_host_memory == "pinned")
+            if args.phase_transfers
+            else None
+        )
         metadata = {
             "kind": "configuration",
             "flags": {
@@ -290,9 +357,9 @@ def main(argv: list[str] | None = None) -> None:
             "torch_version": torch.__version__,
             "device": torch.cuda.get_device_name(device),
             "device_total_bytes": torch.cuda.get_device_properties(device).total_memory,
+            "includes": ["phase transfers"] if args.phase_transfers else [],
             "excludes": [
                 "sampling",
-                "phase transfers",
                 "checkpoint files",
                 "gradient accumulation",
                 "gradient clipping",
@@ -305,14 +372,32 @@ def main(argv: list[str] | None = None) -> None:
             )
             record.update(kind="microstep", index=step, warmup=step < args.warmup)
             record["precision"] = tensor_dtype_inventory(model, optimizer)
-            if transfers is not None:
-                record["phase_transfers"] = {
-                    "offload": asdict(transfers.offload(optimizer)),
-                    "restore": asdict(transfers.restore(optimizer)),
-                }
             output.write(json.dumps(record) + "\n")
             output.flush()
             os.fsync(output.fileno())
+            if transfers is not None:
+                _record_phase_transfer(
+                    output,
+                    transfers,
+                    optimizer,
+                    _TransferPhaseMetadata(
+                        cycle=step,
+                        warmup=step < args.warmup,
+                        phase="offload",
+                        frozen_weight_host_memory_mode=args.transfer_host_memory,
+                    ),
+                )
+                _record_phase_transfer(
+                    output,
+                    transfers,
+                    optimizer,
+                    _TransferPhaseMetadata(
+                        cycle=step,
+                        warmup=step < args.warmup,
+                        phase="restore",
+                        frozen_weight_host_memory_mode=args.transfer_host_memory,
+                    ),
+                )
             logger.info(
                 "microstep %d: %.1f sequence tokens/s", step, record["sequence_tokens_per_second"]
             )

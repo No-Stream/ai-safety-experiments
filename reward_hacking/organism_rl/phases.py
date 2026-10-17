@@ -151,7 +151,7 @@ def _process_cgroup_directory(
 
 
 def _cgroup_memory_state(cgroup_directory: Path) -> tuple[int, int] | None:
-    """Read a finite limit and current use from one cgroup directory."""
+    """Read a finite limit and current use, excluding reclaimable page cache, from one cgroup directory."""
     memory_max_path = cgroup_directory / "memory.max"
     if not memory_max_path.is_file():
         return None
@@ -163,7 +163,13 @@ def _cgroup_memory_state(cgroup_directory: Path) -> tuple[int, int] | None:
     current_bytes = _parse_cgroup_bytes(
         current_path.read_text(encoding="ascii").strip(), current_path, allow_zero=True
     )
-    return maximum_bytes, current_bytes
+    stat_path = cgroup_directory / "memory.stat"
+    stat = dict(line.split() for line in stat_path.read_text(encoding="ascii").splitlines())
+    reclaimable_file_bytes = sum(
+        _parse_cgroup_bytes(stat[key], stat_path, allow_zero=True)
+        for key in ("active_file", "inactive_file")
+    )
+    return maximum_bytes, max(0, current_bytes - reclaimable_file_bytes)
 
 
 def _cgroup_memory_states(
@@ -451,11 +457,14 @@ class VLLMPhaseController:
         if self._transfers is None:
             self._transfers = PolicyTransfers(trainer.model, self.training_device)
         planned_host_bytes = self._transfers.planned_host_bytes(trainer.optimizer)
+        sleeping_weight_bytes = (
+            self.sleeping_weight_bytes
+            if self._vllm_sleeping and self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL
+            else 0
+        )
         check_pinned_and_sleeping_weight_budget(
             pinned_bytes=planned_host_bytes,
-            sleeping_weight_bytes=(
-                0 if self.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL else self.sleeping_weight_bytes
-            ),
+            sleeping_weight_bytes=sleeping_weight_bytes,
             host_memory_budget_bytes=self.host_memory_budget_bytes,
             phase="offload",
         )
