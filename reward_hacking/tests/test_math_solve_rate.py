@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from transformers import AutoTokenizer
+from vllm.config import ReasoningConfig
 
+from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl import math_solve_rate
 from reward_hacking.organism_rl.math_solve_rate import (
     GenerationRuntime,
@@ -115,6 +118,13 @@ def test_engine_kwargs_use_admitted_fp8_and_mtp_defaults(
         "num_speculative_tokens": 2,
     }
     assert engine_kwargs["max_num_batched_tokens"] == 8192
+    assert engine_kwargs["reasoning_config"] == dict(QWEN_THINKING_REASONING_CONFIG)
+    assert math_solve_rate.engine_constructor_kwargs(engine_kwargs)[
+        "reasoning_config"
+    ] == ReasoningConfig(
+        reasoning_start_str=QWEN_THINKING_REASONING_CONFIG["reasoning_start_str"],
+        reasoning_end_str=QWEN_THINKING_REASONING_CONFIG["reasoning_end_str"],
+    )
     assert engine_kwargs["kv_cache_dtype"] == "fp8"
     assert engine_kwargs["quantization"] == "fp8_per_block"
     assert engine_kwargs["quantization_config"] == {
@@ -339,3 +349,11 @@ def test_summary_bands_problem_solve_rates_and_aggregates_sources() -> None:
         0.0,
         1.0,
     ]
+
+
+def test_chat_prompt_token_ids_are_plain_integers_from_the_real_tokenizer() -> None:
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+    token_ids = math_solve_rate.chat_prompt_token_ids(tokenizer, "Solve 1 + 1.")
+    assert token_ids
+    assert all(type(token_id) is int for token_id in token_ids)
+    assert tokenizer.decode(token_ids).endswith("<think>\n")

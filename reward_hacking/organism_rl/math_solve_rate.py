@@ -17,7 +17,10 @@ from statistics import fmean
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from grpo.gpu_memory import cap_gpu_memory_utilization, gpu_memory_info
-from reward_hacking.ladder.thinking import thinking_region_token_count
+from reward_hacking.ladder.thinking import (
+    QWEN_THINKING_REASONING_CONFIG,
+    thinking_region_token_count,
+)
 from reward_hacking.serving_quantization import (
     add_serving_quantization_arguments,
     serving_quantization_kwargs,
@@ -518,6 +521,36 @@ def _validate_serving_quantization(
     )
 
 
+def chat_prompt_token_ids(tokenizer: PreTrainedTokenizerBase, prompt: str) -> list[int]:
+    """Render one thinking-enabled user turn as plain token ids for the offline engine."""
+    token_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        return_dict=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    if not isinstance(token_ids, list) or not all(type(token_id) is int for token_id in token_ids):
+        raise TypeError(
+            f"chat template returned {type(token_ids).__name__}, expected a list of token ids"
+        )
+    return cast("list[int]", token_ids)
+
+
+def engine_constructor_kwargs(engine_kwargs: Mapping[str, object]) -> dict[str, object]:
+    """Convert recorded plain-JSON engine settings into the objects the offline engine accepts."""
+    from vllm.config import ReasoningConfig  # noqa: PLC0415
+
+    reasoning_config = cast("dict[str, str]", engine_kwargs["reasoning_config"])
+    return {
+        **engine_kwargs,
+        "reasoning_config": ReasoningConfig(
+            reasoning_start_str=reasoning_config["reasoning_start_str"],
+            reasoning_end_str=reasoning_config["reasoning_end_str"],
+        ),
+    }
+
+
 def build_engine_kwargs(
     model: str,
     *,
@@ -536,6 +569,7 @@ def build_engine_kwargs(
         "gpu_memory_utilization": gpu_memory_utilization,
         "max_model_len": max_model_len,
         "enable_prefix_caching": True,
+        "reasoning_config": dict(QWEN_THINKING_REASONING_CONFIG),
     }
     speculative_config = _default_speculative_config(model)
     if speculative_config is not None:
@@ -568,15 +602,7 @@ def _initialize_runtime(
     }
     tokenizer = cast("PreTrainedTokenizerBase", AutoTokenizer.from_pretrained(model))
     prompt_token_ids = {
-        problem_id: cast(
-            "list[int]",
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            ),
-        )
+        problem_id: chat_prompt_token_ids(tokenizer, prompt)
         for problem_id, prompt in prompt_texts.items()
     }
     prompt_hashes = {
@@ -616,7 +642,9 @@ def _initialize_runtime(
         language_model_only=getattr(model_config, "vision_config", None) is not None,
     )
     llm_class = cast("Callable[..., object]", LLM)
-    engine = cast("SamplingEngine", llm_class(model=model, **engine_kwargs))
+    engine = cast(
+        "SamplingEngine", llm_class(model=model, **engine_constructor_kwargs(engine_kwargs))
+    )
     runtime_context: dict[str, object] = {
         "device_name": device_name,
         "free_bytes_at_start": free_bytes,
