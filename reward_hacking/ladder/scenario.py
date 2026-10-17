@@ -688,6 +688,10 @@ class Scenario:
             pressure_sentence = _TASK_PRESSURE_SENTENCES[task_pressure]
         except KeyError as error:
             raise ValueError(f"unknown task pressure {task_pressure!r}") from error
+        if self.format == REPOSITORY_FORMAT and ladder_arm is LadderArm.NAIVE:
+            # Submissions are graded with protected paths restored while the naive final grade reads the live
+            # tree, so naive payment would depend on whether the episode submitted or ran out of turns.
+            raise ValueError("format 2 does not support the naive arm")
         paragraph = _NAIVE_PARAGRAPH if ladder_arm is LadderArm.NAIVE else _AUDITED_PARAGRAPH
         pressure_suffix = f" {pressure_sentence}" if pressure_sentence else ""
         task_markdown = (
