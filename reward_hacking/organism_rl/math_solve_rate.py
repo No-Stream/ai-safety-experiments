@@ -1,4 +1,4 @@
-"""Fetch hard competition math items and measure solve rates with offline vLLM."""
+"""Fetch competition math items and measure solve rates with offline vLLM."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -39,10 +40,12 @@ logger = logging.getLogger(__name__)
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = REPOSITORY_ROOT / "external" / "hard-math"
 NORMALIZED_DATA_PATH = DATA_ROOT / "problems.jsonl"
+EASY_NORMALIZED_DATA_PATH = DATA_ROOT / "easy-problems.jsonl"
 ARTIFACT_ROOT = REPOSITORY_ROOT / "artifacts" / "hard-math-pilot"
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 GPU_MEMORY_MARGIN_FRACTION = 0.02
 GENERATION_CHUNK_SIZE = 256
+VLLM_REQUEST_ID_SUFFIX_LENGTH = 8
 DEFAULT_QUANTIZATION_ADMISSION = Path(
     "artifacts/organism-rl/admissions/fp8-block-sampler-fp8-kv-2026-10-16.json"
 )
@@ -56,9 +59,15 @@ DATASET_IDS = (
     "MathArena/smt_2025",
     "MathArena/hmmt_feb_2026",
 )
+EASY_DATASET_SPECS: tuple[tuple[str, str, frozenset[int] | None], ...] = (
+    ("gneubig/aime-1983-2024", "cc0-1.0", None),
+    ("AI-MO/aimo-validation-amc", "apache-2.0", frozenset({2022, 2023})),
+)
+CORPUS_CHOICES = ("hard", "easy")
 PROBLEM_COLUMN_CANDIDATES = ("problem", "question", "problem_text", "question_text", "prompt")
 ANSWER_COLUMN_CANDIDATES = ("answer", "final_answer", "target", "solution")
 ID_COLUMN_CANDIDATES = ("problem_id", "problem_idx", "question_id", "id")
+_AMC_YEAR = re.compile(r"/(20\d{2})_AMC_")
 _BOXED_START = re.compile(r"\\boxed\s*\{")
 _INTEGER = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9.-]*")
@@ -98,17 +107,66 @@ class GenerationOutput(Protocol):
 
 
 class SamplingEngine(Protocol):
-    """The subset of the offline vLLM API used by this runner."""
+    """Stream finished completions from a bounded, continuously refilled submission."""
 
-    def generate(
+    def generate_stream(
+        self,
+        prompts: Sequence[Mapping[str, Sequence[int]]],
+        sampling_params: Sequence[object],
+    ) -> Iterator[tuple[int, GenerationOutput]]:
+        """Yield each completion with its index in the supplied prompt sequence."""
+        ...
+
+
+class VLLMStepOutput(Protocol):
+    """Finished and incremental output returned by one vLLM engine step."""
+
+    request_id: str
+    finished: bool
+    prompt_token_ids: Sequence[int] | None
+    outputs: Sequence[GenerationChoice]
+
+
+class VLLMEngineCore(Protocol):
+    """The incremental vLLM engine methods used by the streaming adapter."""
+
+    def has_unfinished_requests(self) -> bool:
+        """Return whether submitted requests remain in the engine."""
+        ...
+
+    def step(self) -> Sequence[VLLMStepOutput]:
+        """Advance generation and return outputs produced during this step."""
+        ...
+
+    def abort_request(self, request_ids: Sequence[str]) -> None:
+        """Remove the specified outstanding requests from the engine."""
+        ...
+
+
+class OfflineVLLMEngine(Protocol):
+    """The public enqueue method and incremental engine exposed by ``vllm.LLM``."""
+
+    llm_engine: VLLMEngineCore
+
+    def enqueue(
         self,
         prompts: Sequence[Mapping[str, Sequence[int]]],
         sampling_params: Sequence[object],
         *,
         use_tqdm: bool,
-    ) -> Sequence[GenerationOutput]:
-        """Generate one sample for each supplied prompt and sampling configuration."""
+    ) -> Sequence[str]:
+        """Add prompts to vLLM without waiting for their completions."""
         ...
+
+
+@dataclass(slots=True)
+class _VLLMStreamingSubmission:
+    prompts: Sequence[Mapping[str, Sequence[int]]]
+    sampling_params: Sequence[object]
+    engine: VLLMEngineCore
+    outstanding: dict[str, int]
+    answered: set[str]
+    next_prompt_index: int = 0
 
 
 class DatasetRows(Protocol):
@@ -123,6 +181,101 @@ class DatasetRows(Protocol):
     def __len__(self) -> int:
         """Return the number of records in the split."""
         ...
+
+
+class _VLLMSamplingEngine:
+    """Adapt ``vllm.LLM`` to a bounded stream of individually seeded completions."""
+
+    def __init__(self, llm: object) -> None:
+        self._llm = cast("OfflineVLLMEngine", llm)
+
+    def generate_stream(
+        self,
+        prompts: Sequence[Mapping[str, Sequence[int]]],
+        sampling_params: Sequence[object],
+    ) -> Iterator[tuple[int, GenerationOutput]]:
+        if len(prompts) != len(sampling_params):
+            raise ValueError("prompts and sampling parameters must have the same length")
+        engine = self._llm.llm_engine
+        if engine.has_unfinished_requests():
+            raise RuntimeError("offline vLLM engine already has unfinished requests")
+        submission = _VLLMStreamingSubmission(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            engine=engine,
+            outstanding={},
+            answered=set(),
+        )
+
+        try:
+            _enqueue_stream_requests(self._llm, submission, GENERATION_CHUNK_SIZE)
+            while engine.has_unfinished_requests():
+                finished_this_step = 0
+                for output in engine.step():
+                    if not output.finished:
+                        continue
+                    finished_this_step += 1
+                    yield _streamed_prompt_index(output, submission), output
+                if finished_this_step:
+                    _enqueue_stream_requests(self._llm, submission, finished_this_step)
+            if submission.outstanding:
+                raise RuntimeError(
+                    f"vLLM drained with {len(submission.outstanding)} of "
+                    f"{len(prompts)} requests unanswered"
+                )
+        finally:
+            if submission.outstanding:
+                engine.abort_request(list(submission.outstanding))
+
+
+def _enqueue_stream_requests(
+    llm: OfflineVLLMEngine, submission: _VLLMStreamingSubmission, request_count: int
+) -> None:
+    batch_start = submission.next_prompt_index
+    batch_end = min(batch_start + request_count, len(submission.prompts))
+    if batch_end == batch_start:
+        return
+    internal_request_ids = llm.enqueue(
+        submission.prompts[batch_start:batch_end],
+        submission.sampling_params[batch_start:batch_end],
+        use_tqdm=False,
+    )
+    # Outputs and abort_request use the external id; enqueue returns it plus vLLM's random suffix.
+    request_ids = [_external_request_id(request_id) for request_id in internal_request_ids]
+    if len(request_ids) != batch_end - batch_start:
+        submission.engine.abort_request(request_ids)
+        raise RuntimeError(
+            f"vLLM enqueued {len(request_ids)} requests for {batch_end - batch_start} prompts"
+        )
+    for offset, request_id in enumerate(request_ids):
+        if request_id in submission.outstanding or request_id in submission.answered:
+            submission.engine.abort_request(request_ids)
+            raise RuntimeError(f"vLLM reused request id {request_id!r}")
+        submission.outstanding[request_id] = batch_start + offset
+    submission.next_prompt_index = batch_end
+
+
+def _external_request_id(internal_request_id: str) -> str:
+    external_request_id, separator, suffix = internal_request_id.rpartition("-")
+    if not separator or not external_request_id or len(suffix) != VLLM_REQUEST_ID_SUFFIX_LENGTH:
+        raise RuntimeError(f"unexpected vLLM internal request id {internal_request_id!r}")
+    return external_request_id
+
+
+def _streamed_prompt_index(output: VLLMStepOutput, submission: _VLLMStreamingSubmission) -> int:
+    request_id = output.request_id
+    prompt_index = submission.outstanding.pop(request_id, None)
+    if prompt_index is None:
+        if request_id in submission.answered:
+            raise RuntimeError(f"vLLM returned a second completion for request {request_id!r}")
+        raise RuntimeError(f"vLLM returned completion for unknown request {request_id!r}")
+    expected_prompt_tokens = submission.prompts[prompt_index]["prompt_token_ids"]
+    if output.prompt_token_ids is None or tuple(output.prompt_token_ids) != tuple(
+        expected_prompt_tokens
+    ):
+        raise RuntimeError(f"vLLM returned a different prompt for request {request_id!r}")
+    submission.answered.add(request_id)
+    return prompt_index
 
 
 class SampleRecord(TypedDict):
@@ -200,6 +353,15 @@ class GenerationRuntime:
     sampling_params_factory: Callable[..., object]
 
 
+@dataclass(frozen=True, slots=True)
+class NormalizationMetadata:
+    """Optional provenance and answer-parsing rules for a source row."""
+
+    year: int | None = None
+    license_name: str | None = None
+    allow_integral_float: bool = False
+
+
 def extract_integer_answer(text: str) -> int | None:
     r"""Return the last integer-valued ``\boxed{}`` expression in a completion."""
     boxed_integers: list[int] = []
@@ -223,9 +385,11 @@ def extract_integer_answer(text: str) -> int | None:
     return boxed_integers[-1] if boxed_integers else None
 
 
-def _parse_dataset_integer(value: object) -> int | None:
+def _parse_dataset_integer(value: object, *, allow_integral_float: bool = False) -> int | None:
     if type(value) is int:
         return value
+    if allow_integral_float and isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
     if not isinstance(value, str):
         return None
     boxed_answer = extract_integer_answer(value)
@@ -242,14 +406,18 @@ def normalize_row(
     row: Mapping[str, object],
     row_index: int,
     columns: Mapping[str, str],
+    metadata: NormalizationMetadata | None = None,
 ) -> dict[str, object] | None:
     """Normalize one dataset row, omitting rows whose answer is not an integer."""
+    metadata = metadata or NormalizationMetadata()
     problem_column = columns["problem"]
     answer_column = columns["answer"]
     problem = row[problem_column]
     if not isinstance(problem, str) or not problem.strip():
         raise TypeError(f"{source} row {row_index} has no non-empty text in {problem_column!r}")
-    answer = _parse_dataset_integer(row[answer_column])
+    answer = _parse_dataset_integer(
+        row[answer_column], allow_integral_float=metadata.allow_integral_float
+    )
     if answer is None:
         return None
     id_column = columns.get("id")
@@ -258,32 +426,52 @@ def normalize_row(
         if id_column is not None and row.get(id_column) is not None
         else str(row_index)
     )
-    return {
+    normalized: dict[str, object] = {
         "source": source,
         "problem_id": problem_id,
         "problem": problem.strip(),
         "answer": answer,
     }
+    if metadata.year is not None:
+        normalized["year"] = metadata.year
+    if metadata.license_name is not None:
+        normalized["license"] = metadata.license_name
+    return normalized
 
 
-def _select_dataset_columns(column_names: Sequence[str], source: str) -> dict[str, str]:
-    column_set = set(column_names)
+def _select_dataset_columns(
+    column_names: Sequence[str], source: str, *, case_insensitive: bool = False
+) -> dict[str, str]:
+    columns_by_key = {name.casefold() if case_insensitive else name: name for name in column_names}
+
+    def lookup(candidate: str) -> str | None:
+        key = candidate.casefold() if case_insensitive else candidate
+        return columns_by_key.get(key)
+
     selected: dict[str, str] = {}
     for field, candidates in (
         ("problem", PROBLEM_COLUMN_CANDIDATES),
         ("answer", ANSWER_COLUMN_CANDIDATES),
     ):
-        match = next((candidate for candidate in candidates if candidate in column_set), None)
+        match = next(
+            (column for candidate in candidates if (column := lookup(candidate)) is not None),
+            None,
+        )
         if match is None:
             raise ValueError(
                 f"{source} has no supported {field} column; columns={list(column_names)!r}"
             )
         selected[field] = match
     id_match = next(
-        (candidate for candidate in ID_COLUMN_CANDIDATES if candidate in column_set), None
+        (column for candidate in ID_COLUMN_CANDIDATES if (column := lookup(candidate)) is not None),
+        None,
     )
     if id_match is not None:
         selected["id"] = id_match
+    for metadata_field in ("year", "url"):
+        metadata_column = lookup(metadata_field)
+        if metadata_column is not None:
+            selected[metadata_field] = metadata_column
     return selected
 
 
@@ -303,8 +491,32 @@ def _require_gitignored_path(path: Path) -> None:
         raise subprocess.CalledProcessError(result.returncode, result.args)
 
 
-def fetch_datasets() -> dict[str, int | None]:
-    """Fetch each requested HF dataset and write integer-answer rows to the ignored corpus."""
+def _corpus_path(corpus: str) -> Path:
+    if corpus == "hard":
+        return NORMALIZED_DATA_PATH
+    if corpus == "easy":
+        return EASY_NORMALIZED_DATA_PATH
+    raise ValueError(f"unsupported corpus {corpus!r}; expected one of {CORPUS_CHOICES!r}")
+
+
+def _run_directory(corpus: str, label: str) -> Path:
+    _corpus_path(corpus)
+    if corpus == "hard":
+        return ARTIFACT_ROOT / label
+    return ARTIFACT_ROOT / "easy" / label
+
+
+def fetch_datasets(corpus: str = "hard") -> dict[str, int | None]:
+    """Fetch and normalize the named integer-answer corpus into its ignored data file."""
+    if corpus == "easy":
+        return _fetch_easy_datasets()
+    if corpus != "hard":
+        _corpus_path(corpus)
+    return _fetch_hard_datasets()
+
+
+def _fetch_hard_datasets() -> dict[str, int | None]:
+    """Fetch existing hard datasets without changing their resume path or row identities."""
     from datasets import (  # noqa: PLC0415 - data-fetch dependency is unused by run and tests
         load_dataset,
     )
@@ -350,6 +562,111 @@ def fetch_datasets() -> dict[str, int | None]:
                 output_file.flush()
                 counts[dataset_id] = source_count
         temporary_path.replace(NORMALIZED_DATA_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return counts
+
+
+def _dataset_year(row: Mapping[str, object], columns: Mapping[str, str]) -> int | None:
+    year_column = columns.get("year")
+    if year_column is not None:
+        value = row.get(year_column)
+        if type(value) is int:
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+        if value is None:
+            return None
+        raise TypeError(f"year field {year_column!r} must contain an integer year")
+    url_column = columns.get("url")
+    if url_column is None:
+        return None
+    value = row.get(url_column)
+    if not isinstance(value, str):
+        return None
+    match = _AMC_YEAR.search(value)
+    return int(match.group(1)) if match is not None else None
+
+
+def _fetch_easy_datasets() -> dict[str, int | None]:
+    """Fetch verified historical AIME and 2022-2023 AMC integer-answer sources."""
+    from datasets import load_dataset  # noqa: PLC0415 - fetch-only dependency
+    from datasets.exceptions import DatasetNotFoundError  # noqa: PLC0415
+
+    _require_gitignored_path(DATA_ROOT)
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary_path = EASY_NORMALIZED_DATA_PATH.with_name(EASY_NORMALIZED_DATA_PATH.name + ".tmp")
+    counts: dict[str, int | None] = {}
+    seen_problem_texts: set[str] = set()
+    try:
+        with temporary_path.open("w", encoding="utf-8") as output_file:
+            for dataset_id, license_name, allowed_years in EASY_DATASET_SPECS:
+                try:
+                    dataset = load_dataset(dataset_id, cache_dir=str(DATA_ROOT / "hf-cache"))
+                except DatasetNotFoundError as error:
+                    logger.warning("HF dataset unavailable: %s (%s)", dataset_id, error)
+                    counts[dataset_id] = None
+                    continue
+                split_rows = cast("Mapping[str, DatasetRows]", dataset)
+                source_count = 0
+                duplicate_count = 0
+                out_of_range_year_count = 0
+                for split_name, rows in split_rows.items():
+                    columns = _select_dataset_columns(
+                        rows.column_names, dataset_id, case_insensitive=True
+                    )
+                    split_count = 0
+                    for row_index, row in enumerate(rows):
+                        year = _dataset_year(row, columns)
+                        if allowed_years is not None and year not in allowed_years:
+                            out_of_range_year_count += 1
+                            continue
+                        normalized = normalize_row(
+                            dataset_id,
+                            row,
+                            row_index,
+                            columns,
+                            NormalizationMetadata(
+                                year=year,
+                                license_name=license_name,
+                                allow_integral_float=True,
+                            ),
+                        )
+                        if normalized is None:
+                            continue
+                        normalized["problem_id"] = (
+                            f"{dataset_id}:{split_name}:{normalized['problem_id']}"
+                        )
+                        problem_key = " ".join(cast("str", normalized["problem"]).split())
+                        if problem_key in seen_problem_texts:
+                            duplicate_count += 1
+                            continue
+                        seen_problem_texts.add(problem_key)
+                        output_file.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+                        source_count += 1
+                        split_count += 1
+                    logger.info(
+                        "fetched easy source=%s split=%s rows=%d columns=%s "
+                        "unique_integer_answer_problems=%d",
+                        dataset_id,
+                        split_name,
+                        len(rows),
+                        list(rows.column_names),
+                        split_count,
+                    )
+                output_file.flush()
+                counts[dataset_id] = source_count
+                logger.info(
+                    "easy source=%s unique_integer_answer_problems=%d duplicates=%d "
+                    "excluded_year_rows=%d license=%s",
+                    dataset_id,
+                    source_count,
+                    duplicate_count,
+                    out_of_range_year_count,
+                    license_name,
+                )
+        temporary_path.replace(EASY_NORMALIZED_DATA_PATH)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -452,21 +769,20 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return records
 
 
-def _read_corpus(limit_problems: int | None) -> list[dict[str, object]]:
-    rows = _read_jsonl(NORMALIZED_DATA_PATH)
+def _read_corpus(corpus: str, limit_problems: int | None) -> list[dict[str, object]]:
+    corpus_path = _corpus_path(corpus)
+    rows = _read_jsonl(corpus_path)
     if limit_problems is not None:
         if limit_problems < 1:
             raise ValueError("limit-problems must be positive")
         rows = rows[:limit_problems]
     if not rows:
-        raise ValueError(
-            f"no problems found in {NORMALIZED_DATA_PATH}; run the fetch subcommand first"
-        )
+        raise ValueError(f"no problems found in {corpus_path}; run the fetch subcommand first")
     for row in rows:
         if not isinstance(row.get("source"), str) or not isinstance(row.get("problem_id"), str):
-            raise TypeError(f"invalid normalized problem identity in {NORMALIZED_DATA_PATH}")
+            raise TypeError(f"invalid normalized problem identity in {corpus_path}")
         if not isinstance(row.get("problem"), str) or type(row.get("answer")) is not int:
-            raise TypeError(f"invalid normalized problem content in {NORMALIZED_DATA_PATH}")
+            raise TypeError(f"invalid normalized problem content in {corpus_path}")
     return rows
 
 
@@ -646,9 +962,7 @@ def _initialize_runtime(
         language_model_only=getattr(model_config, "vision_config", None) is not None,
     )
     llm_class = cast("Callable[..., object]", LLM)
-    engine = cast(
-        "SamplingEngine", llm_class(model=model, **engine_constructor_kwargs(engine_kwargs))
-    )
+    engine = _VLLMSamplingEngine(llm_class(model=model, **engine_constructor_kwargs(engine_kwargs)))
     runtime_context: dict[str, object] = {
         "device_name": device_name,
         "free_bytes_at_start": free_bytes,
@@ -754,15 +1068,23 @@ def _sample_record(
     }
 
 
-def _generate_batch(
+def _persist_sample_records(records_path: Path, records: Sequence[dict[str, object]]) -> None:
+    with records_path.open("a", encoding="utf-8") as records_file:
+        for record in records:
+            records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        records_file.flush()
+
+
+def _generate_pending_samples(
     runtime: GenerationRuntime,
     rows_by_id: Mapping[str, Mapping[str, object]],
-    batch: Sequence[tuple[str, int]],
+    pending: Sequence[tuple[str, int]],
     records_path: Path,
 ) -> int:
+    """Continuously refill vLLM and persist each fixed-size group of finished samples."""
     settings = runtime.settings
     prompts = [
-        {"prompt_token_ids": runtime.prompt_token_ids[problem_id]} for problem_id, _ in batch
+        {"prompt_token_ids": runtime.prompt_token_ids[problem_id]} for problem_id, _ in pending
     ]
     sampling_params = [
         runtime.sampling_params_factory(
@@ -772,36 +1094,36 @@ def _generate_batch(
             thinking_token_budget=settings.thinking_token_budget,
             seed=_request_seed(settings.model, problem_id, sample),
         )
-        for problem_id, sample in batch
+        for problem_id, sample in pending
     ]
-    outputs = runtime.engine.generate(prompts, sampling_params=sampling_params, use_tqdm=True)
-    if len(outputs) != len(batch):
-        raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(batch)} requests")
     generated_tokens = 0
-    for (problem_id, sample), output in zip(batch, outputs, strict=True):
+    seen_indices: set[int] = set()
+    pending_records: list[dict[str, object]] = []
+    for prompt_index, output in runtime.engine.generate_stream(prompts, sampling_params):
+        if type(prompt_index) is not int or not 0 <= prompt_index < len(pending):
+            raise RuntimeError(f"streaming vLLM returned invalid prompt index {prompt_index!r}")
+        if prompt_index in seen_indices:
+            raise RuntimeError(f"streaming vLLM returned prompt index {prompt_index} twice")
         if len(output.outputs) != 1:
             raise RuntimeError(
                 f"vLLM returned {len(output.outputs)} choices for one sample request"
             )
+        seen_indices.add(prompt_index)
+        problem_id, sample = pending[prompt_index]
         record = _sample_record(runtime, rows_by_id, problem_id, sample, output.outputs[0])
-        with records_path.open("a", encoding="utf-8") as records_file:
-            records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            records_file.flush()
+        pending_records.append(record)
         generated_tokens += cast("int", record["output_tokens"])
-    return generated_tokens
-
-
-def _generate_pending_samples(
-    runtime: GenerationRuntime,
-    rows_by_id: Mapping[str, Mapping[str, object]],
-    pending: Sequence[tuple[str, int]],
-    records_path: Path,
-) -> int:
-    """Submit large request chunks and persist each chunk before queuing the next."""
-    generated_tokens = 0
-    for chunk_start in range(0, len(pending), GENERATION_CHUNK_SIZE):
-        chunk = pending[chunk_start : chunk_start + GENERATION_CHUNK_SIZE]
-        generated_tokens += _generate_batch(runtime, rows_by_id, chunk, records_path)
+        if len(pending_records) == GENERATION_CHUNK_SIZE:
+            _persist_sample_records(records_path, pending_records)
+            logger.info("persisted completed samples=%d", len(seen_indices))
+            pending_records.clear()
+    if len(seen_indices) != len(pending):
+        raise RuntimeError(
+            f"streaming vLLM returned {len(seen_indices)} of {len(pending)} completions"
+        )
+    if pending_records:
+        _persist_sample_records(records_path, pending_records)
+        logger.info("persisted completed samples=%d", len(seen_indices))
     return generated_tokens
 
 
@@ -848,16 +1170,18 @@ def run_generation(  # noqa: PLR0913 - explicit run identity, corpus slice and b
     *,
     thinking_token_budget: int,
     max_new_tokens: int,
+    corpus: str = "hard",
 ) -> None:
-    """Run resumable, batched offline generation for the selected model and corpus slice."""
+    """Run resumable, streamed offline generation for the selected model and corpus slice."""
     if _LABEL.fullmatch(label) is None:
         raise ValueError(f"label must be a lowercase path-safe slug: {label!r}")
+    _corpus_path(corpus)
     settings = _run_settings(model, samples, thinking_token_budget, max_new_tokens)
-    rows = _read_corpus(limit_problems)
+    rows = _read_corpus(corpus, limit_problems)
     rows_by_id = {cast("str", row["problem_id"]): row for row in rows}
     if len(rows_by_id) != len(rows):
         raise ValueError("normalized corpus contains duplicate problem_id values")
-    run_dir = ARTIFACT_ROOT / label
+    run_dir = _run_directory(corpus, label)
     _require_gitignored_path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     records_path = run_dir / "records.jsonl"
@@ -866,6 +1190,7 @@ def run_generation(  # noqa: PLR0913 - explicit run identity, corpus slice and b
     all_pairs = pending_sample_pairs(list(rows_by_id), samples, completed)
     pending_count = len(all_pairs)
     provenance: dict[str, object] = {
+        "corpus": corpus,
         "model": settings.model,
         "samples_per_problem": settings.samples,
         "max_new_tokens": settings.max_new_tokens,
@@ -876,16 +1201,20 @@ def run_generation(  # noqa: PLR0913 - explicit run identity, corpus slice and b
         "quantization_admission": str(quantization_arguments.quantization_admission)
         if quantization_arguments.quantization_admission is not None
         else None,
-        "generation_chunk_size": GENERATION_CHUNK_SIZE,
+        "live_request_window": GENERATION_CHUNK_SIZE,
+        "record_persistence_chunk_size": GENERATION_CHUNK_SIZE,
         "runtime_context": runtime.runtime_context,
     }
     _write_provenance(run_dir, provenance)
     logger.info(
-        "math solve-rate generation model=%s problems=%d samples_per_problem=%d pending_samples=%d chunk_size=%d",
+        "math solve-rate generation corpus=%s model=%s problems=%d samples_per_problem=%d "
+        "pending_samples=%d live_window=%d persistence_chunk=%d",
+        corpus,
         settings.model,
         len(rows),
         samples,
         pending_count,
+        GENERATION_CHUNK_SIZE,
         GENERATION_CHUNK_SIZE,
     )
     generation_started_at = time.perf_counter()
@@ -919,10 +1248,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("fetch", help="download and normalize the selected Hugging Face datasets")
+    fetch_parser = subparsers.add_parser(
+        "fetch", help="download and normalize the selected Hugging Face datasets"
+    )
+    fetch_parser.add_argument("--corpus", choices=CORPUS_CHOICES, default="hard")
     run_parser = subparsers.add_parser(
         "run", help="run offline vLLM samples against the normalized corpus"
     )
+    run_parser.add_argument("--corpus", choices=CORPUS_CHOICES, default="hard")
     run_parser.add_argument("--label", required=True)
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--samples", type=int, default=8)
@@ -943,6 +1276,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "summary", help="write a run summary from persisted records"
     )
     summary_parser.add_argument("--label", required=True)
+    summary_parser.add_argument("--corpus", choices=CORPUS_CHOICES, default="hard")
     return parser
 
 
@@ -952,7 +1286,7 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     if args.command == "fetch":
-        counts = fetch_datasets()
+        counts = fetch_datasets(args.corpus)
         for dataset_id, count in counts.items():
             logger.info(
                 "dataset %s integer_answer_problems=%s",
@@ -971,11 +1305,12 @@ def main() -> None:
             args,
             thinking_token_budget=args.thinking_token_budget,
             max_new_tokens=args.max_new_tokens,
+            corpus=args.corpus,
         )
     elif args.command == "summary":
         if _LABEL.fullmatch(args.label) is None:
             raise ValueError(f"label must be a lowercase path-safe slug: {args.label!r}")
-        run_dir = ARTIFACT_ROOT / args.label
+        run_dir = _run_directory(args.corpus, args.label)
         _require_gitignored_path(run_dir)
         provenance_path = run_dir / "provenance.json"
         provenance = _read_json_object(provenance_path) if provenance_path.exists() else None

@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+import datasets
 import pytest
 from transformers import AutoTokenizer
 from vllm.config import ReasoningConfig
@@ -27,7 +28,7 @@ from reward_hacking.organism_rl.math_solve_rate import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
     from pathlib import Path
 
     from transformers import PreTrainedTokenizerBase
@@ -49,38 +50,125 @@ class FakeOutput:
 class FakeEngine:
     def __init__(self, records_path: Path) -> None:
         self.records_path = records_path
-        self.batch_sizes: list[int] = []
-        self.records_before_calls: list[int] = []
+        self.submitted_sizes: list[int] = []
+        self.records_before_yields: list[tuple[int, int]] = []
+        self.sampling_parameters: list[object] = []
 
-    def generate(
+    def generate_stream(
+        self,
+        prompts: Sequence[Mapping[str, Sequence[int]]],
+        sampling_params: Sequence[object],
+    ) -> Iterator[tuple[int, FakeOutput]]:
+        assert len(prompts) == len(sampling_params)
+        self.submitted_sizes.append(len(prompts))
+        self.sampling_parameters.extend(sampling_params)
+        for index in range(len(prompts)):
+            if index in (0, math_solve_rate.GENERATION_CHUNK_SIZE):
+                existing_records = (
+                    self.records_path.read_text(encoding="utf-8").splitlines()
+                    if self.records_path.exists()
+                    else []
+                )
+                self.records_before_yields.append((index, len(existing_records)))
+            yield (
+                index,
+                FakeOutput(
+                    outputs=[
+                        FakeChoice(
+                            text=r"\boxed{1}",
+                            token_ids=[101],
+                            finish_reason="stop",
+                            stop_reason=None,
+                        )
+                    ]
+                ),
+            )
+
+
+@dataclass
+class FakeVLLMRequestOutput:
+    request_id: str
+    prompt: Mapping[str, Sequence[int]]
+    outputs: Sequence[FakeChoice]
+
+    @property
+    def finished(self) -> bool:
+        return True
+
+    @property
+    def prompt_token_ids(self) -> Sequence[int]:
+        return self.prompt["prompt_token_ids"]
+
+
+class FakeVLLMEngineCore:
+    def __init__(self) -> None:
+        self.queued: list[FakeVLLMRequestOutput] = []
+        self.queue_sizes_before_steps: list[int] = []
+        self.aborted_request_ids: list[str] = []
+
+    def has_unfinished_requests(self) -> bool:
+        return bool(self.queued)
+
+    def step(self) -> Sequence[FakeVLLMRequestOutput]:
+        self.queue_sizes_before_steps.append(len(self.queued))
+        return [self.queued.pop(0)]
+
+    def abort_request(self, request_ids: Sequence[str]) -> None:
+        self.aborted_request_ids.extend(request_ids)
+        self.queued = [request for request in self.queued if request.request_id not in request_ids]
+
+
+class FakeEnqueueLLM:
+    def __init__(self, request_id_batches: Sequence[Sequence[str]] = ()) -> None:
+        self.llm_engine = FakeVLLMEngineCore()
+        self.enqueue_sizes: list[int] = []
+        self.pending_sizes_at_enqueue: list[int] = []
+        self.request_id_batches = list(request_id_batches)
+
+    def enqueue(
         self,
         prompts: Sequence[Mapping[str, Sequence[int]]],
         sampling_params: Sequence[object],
         *,
         use_tqdm: bool,
-    ) -> Sequence[FakeOutput]:
-        assert use_tqdm is True
+    ) -> Sequence[str]:
+        assert use_tqdm is False
         assert len(prompts) == len(sampling_params)
-        self.batch_sizes.append(len(prompts))
-        existing_records = (
-            self.records_path.read_text(encoding="utf-8").splitlines()
-            if self.records_path.exists()
-            else []
+        self.enqueue_sizes.append(len(prompts))
+        self.pending_sizes_at_enqueue.append(len(self.llm_engine.queued))
+        external_request_ids = (
+            list(self.request_id_batches.pop(0))
+            if self.request_id_batches
+            else [f"{len(self.enqueue_sizes)}{index}" for index in range(len(prompts))]
         )
-        self.records_before_calls.append(len(existing_records))
-        return [
-            FakeOutput(
-                outputs=[
-                    FakeChoice(
-                        text=r"\boxed{1}",
-                        token_ids=[101],
-                        finish_reason="stop",
-                        stop_reason=None,
-                    )
-                ]
-            )
-            for _ in prompts
+        assert len(prompts) == len(external_request_ids)
+        # vLLM 0.31 returns internal ids with an 8-character random suffix; outputs carry the external id.
+        request_ids = [
+            f"{request_id}-{index:08x}" for index, request_id in enumerate(external_request_ids)
         ]
+        for prompt, request_id in zip(prompts, external_request_ids, strict=True):
+            self.llm_engine.queued.append(
+                FakeVLLMRequestOutput(
+                    request_id=request_id,
+                    prompt=prompt,
+                    outputs=[
+                        FakeChoice(r"\boxed{1}", list(prompt["prompt_token_ids"]), "stop", None)
+                    ],
+                )
+            )
+        return request_ids
+
+
+@dataclass
+class FakeDatasetRows:
+    column_names: Sequence[str]
+    rows: Sequence[Mapping[str, object]]
+
+    def __iter__(self) -> Iterator[Mapping[str, object]]:
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
 
 
 def _valid_admission_record(path: Path) -> None:
@@ -177,6 +265,159 @@ def test_quantized_run_rejects_missing_admission_record(tmp_path: Path) -> None:
     assert error.value.code == 2
 
 
+def test_corpus_cli_keeps_hard_as_default_and_accepts_easy() -> None:
+    parser = math_solve_rate._build_parser()
+
+    assert parser.parse_args(["fetch"]).corpus == "hard"
+    assert parser.parse_args(["fetch", "--corpus", "easy"]).corpus == "easy"
+    assert parser.parse_args(["run", "--label", "synthetic"]).corpus == "hard"
+    assert parser.parse_args(["run", "--label", "synthetic", "--corpus", "easy"]).corpus == "easy"
+    assert math_solve_rate._corpus_path("hard") == math_solve_rate.NORMALIZED_DATA_PATH
+    assert math_solve_rate._corpus_path("easy") == math_solve_rate.EASY_NORMALIZED_DATA_PATH
+    assert (
+        math_solve_rate._run_directory("hard", "legacy") == math_solve_rate.ARTIFACT_ROOT / "legacy"
+    )
+    assert (
+        math_solve_rate._run_directory("easy", "legacy")
+        == math_solve_rate.ARTIFACT_ROOT / "easy" / "legacy"
+    )
+
+
+def test_easy_column_matching_does_not_change_hard_corpus_matching() -> None:
+    uppercase_columns = ("ID", "Year", "Question", "Answer")
+
+    with pytest.raises(ValueError, match="no supported problem column"):
+        math_solve_rate._select_dataset_columns(uppercase_columns, "synthetic-hard")
+
+    assert math_solve_rate._select_dataset_columns(
+        uppercase_columns, "synthetic-easy", case_insensitive=True
+    ) == {
+        "problem": "Question",
+        "answer": "Answer",
+        "id": "ID",
+        "year": "Year",
+    }
+
+
+def test_easy_fetch_filters_years_deduplicates_normalized_text_and_keeps_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    historical_source = "gneubig/aime-1983-2024"
+    amc_source = "AI-MO/aimo-validation-amc"
+    fake_datasets = {
+        historical_source: {
+            "train": FakeDatasetRows(
+                column_names=("ID", "Year", "Question", "Answer"),
+                rows=(
+                    {
+                        "ID": "aime-1",
+                        "Year": 2024,
+                        "Question": "Synthetic shared prompt",
+                        "Answer": "7",
+                    },
+                ),
+            )
+        },
+        amc_source: {
+            "train": FakeDatasetRows(
+                column_names=("id", "problem", "answer", "url"),
+                rows=(
+                    {
+                        "id": 1,
+                        "problem": "  Synthetic   shared prompt  ",
+                        "answer": 7.0,
+                        "url": "https://example.invalid/2023_AMC_12A_Problems/Problem_1",
+                    },
+                    {
+                        "id": 2,
+                        "problem": "Synthetic AMC prompt",
+                        "answer": 9.0,
+                        "url": "https://example.invalid/2022_AMC_10A_Problems/Problem_2",
+                    },
+                    {
+                        "id": 3,
+                        "problem": "Synthetic fractional answer prompt",
+                        "answer": 2.5,
+                        "url": "https://example.invalid/2023_AMC_12A_Problems/Problem_3",
+                    },
+                    {
+                        "id": 4,
+                        "problem": "Synthetic out-of-range year prompt",
+                        "answer": 3.0,
+                        "url": "https://example.invalid/2024_AMC_12A_Problems/Problem_4",
+                    },
+                ),
+            )
+        },
+    }
+
+    def load_synthetic_dataset(dataset_id: str, *, cache_dir: str) -> Mapping[str, FakeDatasetRows]:
+        assert cache_dir == str(tmp_path / "hf-cache")
+        return fake_datasets[dataset_id]
+
+    monkeypatch.setattr(datasets, "load_dataset", load_synthetic_dataset)
+    monkeypatch.setattr(math_solve_rate, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        math_solve_rate, "EASY_NORMALIZED_DATA_PATH", tmp_path / "easy-problems.jsonl"
+    )
+    monkeypatch.setattr(math_solve_rate, "_require_gitignored_path", lambda _: None)
+
+    counts = math_solve_rate.fetch_datasets("easy")
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "easy-problems.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert counts == {historical_source: 1, amc_source: 1}
+    assert [
+        (
+            row["source"],
+            row["problem_id"],
+            row["answer"],
+            row.get("year"),
+            row["license"],
+        )
+        for row in rows
+    ] == [
+        (historical_source, f"{historical_source}:train:aime-1", 7, 2024, "cc0-1.0"),
+        (amc_source, f"{amc_source}:train:2", 9, 2022, "apache-2.0"),
+    ]
+
+
+def test_streaming_vllm_adapter_refills_while_requests_remain_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(math_solve_rate, "GENERATION_CHUNK_SIZE", 2)
+    llm = FakeEnqueueLLM()
+    engine = math_solve_rate._VLLMSamplingEngine(llm)
+    prompts = [{"prompt_token_ids": [index + 1]} for index in range(3)]
+    sampling_params = [{"seed": index} for index in range(3)]
+
+    streamed = list(engine.generate_stream(prompts, sampling_params))
+
+    assert [(index, output.outputs[0].token_ids) for index, output in streamed] == [
+        (0, [1]),
+        (1, [2]),
+        (2, [3]),
+    ]
+    assert llm.enqueue_sizes == [2, 1]
+    assert llm.pending_sizes_at_enqueue == [0, 1]
+    assert llm.llm_engine.queue_sizes_before_steps == [2, 2, 1]
+
+
+def test_streaming_vllm_adapter_aborts_all_requests_after_reused_request_id() -> None:
+    llm = FakeEnqueueLLM(request_id_batches=[["duplicate", "duplicate", "untracked"]])
+    engine = math_solve_rate._VLLMSamplingEngine(llm)
+    prompts = [{"prompt_token_ids": [index + 1]} for index in range(3)]
+    sampling_params = [{"seed": index} for index in range(3)]
+
+    with pytest.raises(RuntimeError, match="reused request id"):
+        list(engine.generate_stream(prompts, sampling_params))
+
+    assert llm.llm_engine.queued == []
+    assert "untracked" in llm.llm_engine.aborted_request_ids
+
+
 def test_chunked_generation_persists_chunks_and_resumes_completed_samples(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,10 +470,37 @@ def test_chunked_generation_persists_chunks_and_resumes_completed_samples(
 
     assert len(pending) == 319
     assert generated_tokens == 319
-    assert engine.batch_sizes == [256, 63]
-    old_worst_case_concurrency = 1
-    assert engine.batch_sizes[0] > old_worst_case_concurrency
-    assert engine.records_before_calls == [1, 257]
+    assert engine.submitted_sizes == [319]
+    assert engine.records_before_yields == [(0, 1), (256, 257)]
+    assert engine.sampling_parameters[0] == {
+        "temperature": 0.6,
+        "top_k": 20,
+        "top_p": 1.0,
+        "max_tokens": 128,
+        "presence_penalty": 0.0,
+        "thinking_token_budget": 32,
+        "seed": math_solve_rate._request_seed("Qwen/Qwen3.5-9B", "problem-000", 1),
+    }
+    sampled_parameters = [
+        cast("Mapping[str, object]", parameters) for parameters in engine.sampling_parameters
+    ]
+    assert [
+        (
+            parameters["seed"],
+            parameters["temperature"],
+            parameters["top_k"],
+            parameters["top_p"],
+        )
+        for parameters in sampled_parameters
+    ] == [
+        (
+            math_solve_rate._request_seed("Qwen/Qwen3.5-9B", problem_id, sample),
+            0.6,
+            20,
+            1.0,
+        )
+        for problem_id, sample in pending
+    ]
     assert len(_completed_samples(records_path, rows_by_id, runtime)) == 320
     runtime.engine_settings["quantization"] = "fp8_per_block"
     with pytest.raises(ValueError, match="different run identity"):
