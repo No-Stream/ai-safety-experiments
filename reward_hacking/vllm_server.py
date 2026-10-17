@@ -40,6 +40,11 @@ class VLLMServerStartupError(RuntimeError):
     """The external server failed to become healthy."""
 
 
+# vLLM caps each step's scheduled tokens at max_num_batched_tokens and draft slots share that budget; its
+# consumer-GPU default (2,048) is below the 8,192 floor vLLM itself warns about when drafting is on.
+SPECULATIVE_MAX_NUM_BATCHED_TOKENS = 8_192
+
+
 @dataclass(frozen=True, slots=True)
 class VLLMServerConfig:
     """All settings that determine one externally served vLLM engine.
@@ -190,6 +195,13 @@ class VLLMServerConfig:
             arguments.append(f"{name}={served_adapter}")
         return arguments
 
+    @property
+    def resolved_max_num_batched_tokens(self) -> int | None:
+        """The per-step token budget, raised by default when speculative drafting shares it."""
+        if self.max_num_batched_tokens is None and self.speculative_config is not None:
+            return SPECULATIVE_MAX_NUM_BATCHED_TOKENS
+        return self.max_num_batched_tokens
+
     def command(self) -> list[str]:  # noqa: C901, PLR0912 - each CLI flag is explicit and ordered
         """Build the verified ``vllm serve`` command line."""
         command = [self.executable, "serve", self.model]
@@ -222,7 +234,7 @@ class VLLMServerConfig:
             ("--kv-cache-dtype", self.kv_cache_dtype),
             ("--mamba-cache-mode", self.mamba_cache_mode),
             ("--mamba-ssm-cache-dtype", self.mamba_ssm_cache_dtype),
-            ("--max-num-batched-tokens", self.max_num_batched_tokens),
+            ("--max-num-batched-tokens", self.resolved_max_num_batched_tokens),
             ("--quantization", self.quantization),
         ):
             if value is not None:

@@ -519,6 +519,23 @@ def test_command_passes_speculative_json_without_changing_values(fake_vllm: Path
     )
 
 
+def _batched_tokens_flag(config: VLLMServerConfig) -> str | None:
+    command = config.command()
+    if "--max-num-batched-tokens" not in command:
+        return None
+    return command[command.index("--max-num-batched-tokens") + 1]
+
+
+def test_speculative_drafting_raises_the_default_scheduled_token_budget(fake_vllm: Path) -> None:
+    speculative = replace(
+        _config(fake_vllm), speculative_config={"method": "mtp", "num_speculative_tokens": 2}
+    )
+    assert _batched_tokens_flag(speculative) == str(vllm_server.SPECULATIVE_MAX_NUM_BATCHED_TOKENS)
+    assert _batched_tokens_flag(_config(fake_vllm)) is None
+    explicit = replace(speculative, max_num_batched_tokens=4096)
+    assert _batched_tokens_flag(explicit) == "4096"
+
+
 @pytest.mark.parametrize("under_wsl", [True, False])
 def test_server_environment_enables_pin_memory_only_on_wsl_and_preserves_runner_choice(
     under_wsl: bool, fake_vllm: Path, monkeypatch: pytest.MonkeyPatch
