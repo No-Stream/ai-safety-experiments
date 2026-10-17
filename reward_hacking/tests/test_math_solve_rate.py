@@ -357,3 +357,29 @@ def test_chat_prompt_token_ids_are_plain_integers_from_the_real_tokenizer() -> N
     assert token_ids
     assert all(type(token_id) is int for token_id in token_ids)
     assert tokenizer.decode(token_ids).endswith("<think>\n")
+
+
+def test_run_budget_flags_reach_the_run_settings() -> None:
+    parser = math_solve_rate._build_parser()
+    defaults = parser.parse_args(["run", "--label", "synthetic"])
+    default_settings = math_solve_rate._run_settings(
+        defaults.model, defaults.samples, defaults.thinking_token_budget, defaults.max_new_tokens
+    )
+    assert (default_settings.thinking_token_budget, default_settings.max_new_tokens) == (2048, 8192)
+    longer = parser.parse_args(
+        [
+            "run",
+            "--label",
+            "synthetic",
+            "--thinking-token-budget",
+            "8192",
+            "--max-new-tokens",
+            "12288",
+        ]
+    )
+    settings = math_solve_rate._run_settings(
+        longer.model, longer.samples, longer.thinking_token_budget, longer.max_new_tokens
+    )
+    assert (settings.thinking_token_budget, settings.max_new_tokens) == (8192, 12288)
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        math_solve_rate._run_settings(longer.model, 4, 8192, 8192)

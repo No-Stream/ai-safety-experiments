@@ -490,16 +490,20 @@ def _request_seed(model: str, problem_id: str, sample: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)
 
 
-def _run_settings(model: str, samples: int) -> RunSettings:
+def _run_settings(
+    model: str, samples: int, thinking_token_budget: int, max_new_tokens: int
+) -> RunSettings:
     from reward_hacking.organism_rl import transfer_battery  # noqa: PLC0415
 
     if samples < 1 or samples > transfer_battery.EPISODES_PER_CELL:
         raise ValueError(f"samples must be in [1, {transfer_battery.EPISODES_PER_CELL}]")
+    if thinking_token_budget < 1 or max_new_tokens <= thinking_token_budget:
+        raise ValueError("max_new_tokens must exceed a positive thinking_token_budget")
     return RunSettings(
         model=model,
         samples=samples,
-        max_new_tokens=transfer_battery.MAX_NEW_TOKENS,
-        thinking_token_budget=transfer_battery.THINKING_TOKEN_BUDGET,
+        max_new_tokens=max_new_tokens,
+        thinking_token_budget=thinking_token_budget,
         presence_penalty=float(transfer_battery.PRESENCE_PENALTY),
         sampling_options=_sampling_options(transfer_battery.SAMPLING_ARGUMENTS),
     )
@@ -835,17 +839,20 @@ def _write_provenance(run_dir: Path, provenance: dict[str, object]) -> Path:
     return provenance_path
 
 
-def run_generation(
+def run_generation(  # noqa: PLR0913 - explicit run identity, corpus slice and budgets
     label: str,
     model: str,
     samples: int,
     limit_problems: int | None,
     quantization_arguments: argparse.Namespace,
+    *,
+    thinking_token_budget: int,
+    max_new_tokens: int,
 ) -> None:
     """Run resumable, batched offline generation for the selected model and corpus slice."""
     if _LABEL.fullmatch(label) is None:
         raise ValueError(f"label must be a lowercase path-safe slug: {label!r}")
-    settings = _run_settings(model, samples)
+    settings = _run_settings(model, samples, thinking_token_budget, max_new_tokens)
     rows = _read_corpus(limit_problems)
     rows_by_id = {cast("str", row["problem_id"]): row for row in rows}
     if len(rows_by_id) != len(rows):
@@ -908,6 +915,8 @@ def run_generation(
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from reward_hacking.organism_rl import transfer_battery  # noqa: PLC0415
+
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("fetch", help="download and normalize the selected Hugging Face datasets")
@@ -918,6 +927,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--samples", type=int, default=8)
     run_parser.add_argument("--limit-problems", type=int)
+    run_parser.add_argument(
+        "--thinking-token-budget", type=int, default=transfer_battery.THINKING_TOKEN_BUDGET
+    )
+    run_parser.add_argument("--max-new-tokens", type=int, default=transfer_battery.MAX_NEW_TOKENS)
     add_serving_quantization_arguments(
         run_parser,
         kv_cache_dtype_default="fp8",
@@ -956,6 +969,8 @@ def main() -> None:
             args.samples,
             args.limit_problems,
             args,
+            thinking_token_budget=args.thinking_token_budget,
+            max_new_tokens=args.max_new_tokens,
         )
     elif args.command == "summary":
         if _LABEL.fullmatch(args.label) is None:
