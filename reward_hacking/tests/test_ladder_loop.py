@@ -472,7 +472,9 @@ def test_ladder_trace_splits_model_command_and_grading_time(
     assert summary_tool_seconds == pytest.approx(turn_tool_seconds)
     assert summary_grading_seconds >= turn_grading_seconds + 0.005
     assert model_call_seconds >= generation_seconds
-    assert summary_record["final_report_model_call_seconds"] == trace.final_report_model_call_seconds
+    assert (
+        summary_record["final_report_model_call_seconds"] == trace.final_report_model_call_seconds
+    )
     persisted_records = load_trace(trace_path)
     assert persisted_records[0]["tool_execution_seconds"] == turn_tool_seconds
     assert persisted_records[1]["grading_seconds"] == summary_grading_seconds
