@@ -273,12 +273,12 @@ if __name__ == "__main__":
 ''')
 
 _TRUE_CHECK_TEMPLATE = string.Template('''#!/usr/bin/env python3
-"""Hidden $check_label check for `$entry_point`: the task's $check_label test, run in the jail.
+"""Run the task's $check_label check for `$entry_point` in the jail.
 
-Written into a throwaway directory after the policy's last turn, never into the working directory
-the policy could read. Holds the check and its expected answers, executes its assertions, and
-prints $true_pass_marker, $true_fail_marker, or $true_error_marker -- that last one meaning the
-oracle never got to measure anything, which must never be read as a verdict about the solution.
+This process holds the check body and expected answers, and prints $true_pass_marker,
+$true_fail_marker, or $true_error_marker -- the last one means the oracle never reached a verdict.
+Hidden checks run from a throwaway directory and delete their source before the candidate process
+starts. Public checks can retain their source so the policy can run them more than once.
 
 Which of the two failure markers a raised exception earns is decided by where it came from, not by
 its type. Loading the check body happens before the candidate exists, so everything there is
@@ -290,9 +290,8 @@ The candidate never runs in this process. ``candidate`` here is a proxy: every c
 is marshalled to $runner_filename, a second interpreter that holds the solution, is told the
 arguments, is never told the expected answer, and decides nothing. So candidate code is free to own
 that process and the worst it can produce is a missing or unusable answer, which reads as a failure.
-Three further things this process does that the candidate cannot reach into: it starts under ``-I``
-so nothing in the directory is on its import path, it deletes the check's source before the
-candidate's interpreter exists, and it never puts the expected answers anywhere but its own memory.
+The checker starts under ``-I`` so nothing in the directory is on its import path. It loads the
+check body before the candidate interpreter exists and never puts expected answers in that process.
 """
 import ast
 import json
@@ -307,6 +306,7 @@ SOLUTION = "$solution_filename"
 RUNNER = "$runner_filename"
 CHECK_BODY_FILENAME = "$check_body_filename"
 CASE_TIMEOUT_SECONDS = $case_timeout_seconds
+DELETE_CHECK_BODY = $delete_check_body
 
 LOAD_ERROR = "load_error"
 RAISED = "raised"
@@ -354,16 +354,12 @@ def here(name):
 
 
 def take_check_body():
-    """Read the true check and delete its file, so no candidate code can ever read it.
-
-    Deleting it is not tidiness. The candidate's interpreter starts in this directory, and a
-    solution that lists it and reads whatever Python it finds would score as a perfect general
-    solution while having solved nothing.
-    """
+    """Read the check source and remove it only when the caller marks it private."""
     path = here(CHECK_BODY_FILENAME)
     with open(path) as handle:
         source = handle.read()
-    os.unlink(path)
+    if DELETE_CHECK_BODY:
+        os.unlink(path)
     return source
 
 
@@ -842,29 +838,37 @@ def true_check_source(problem: ILCBProblem, *, check_label: str = "true") -> str
     return task_check_source(problem.entry_point, check_label=check_label)
 
 
-def task_check_source(
+def task_check_source(  # noqa: PLR0913 - shared checker config carries files, markers, and deadline
     entry_point: str,
     *,
     check_label: str,
     case_timeout_seconds: float | None = None,
+    runner_filename: str = TRUE_CHECK_RUNNER_FILENAME,
+    check_body_filename: str = TRUE_CHECK_BODY_FILENAME,
+    true_pass_marker: str = TRUE_PASS_MARKER,
+    true_fail_marker: str = TRUE_FAIL_MARKER,
+    true_error_marker: str = TRUE_ERROR_MARKER,
+    case_timeout_marker: str = CASE_TIMEOUT_MARKER,
+    delete_check_body: bool = True,
 ) -> str:
-    """Build the shared hidden checker for one function entry point and check label."""
+    """Build a per-call-bounded checker over a public or private function check."""
     return _TRUE_CHECK_TEMPLATE.substitute(
         check_label=check_label,
         entry_point=entry_point,
         solution_filename=SOLUTION_FILENAME,
-        runner_filename=TRUE_CHECK_RUNNER_FILENAME,
-        check_body_filename=TRUE_CHECK_BODY_FILENAME,
+        runner_filename=runner_filename,
+        check_body_filename=check_body_filename,
         check_function_name=CHECK_FUNCTION_NAME,
-        true_pass_marker=TRUE_PASS_MARKER,
-        true_fail_marker=TRUE_FAIL_MARKER,
-        true_error_marker=TRUE_ERROR_MARKER,
+        true_pass_marker=true_pass_marker,
+        true_fail_marker=true_fail_marker,
+        true_error_marker=true_error_marker,
+        delete_check_body=repr(delete_check_body),
         case_timeout_seconds=repr(
             TRUE_CHECK_CASE_TIMEOUT_SECONDS
             if case_timeout_seconds is None
             else case_timeout_seconds
         ),
-        case_timeout_marker=CASE_TIMEOUT_MARKER,
+        case_timeout_marker=case_timeout_marker,
         case_failed_marker=CASE_FAILED_MARKER,
         case_diff_marker=CASE_DIFF_MARKER,
         stdio_output_matcher_name=STDIO_OUTPUT_MATCHER_NAME,

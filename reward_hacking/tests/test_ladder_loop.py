@@ -25,9 +25,10 @@ from transformers import PreTrainedTokenizerFast
 
 from reward_hacking.eval_awareness import scan_text
 from reward_hacking.harness import docker_backend
+from reward_hacking.harness import loop as shared_loop
 from reward_hacking.harness.docker_backend import DockerConfig, SnapshotLimitError
 from reward_hacking.harness.loop import FinalGrade, grader_integrity_hash
-from reward_hacking.harness.task_spec import AgenticArmConfig, Task
+from reward_hacking.harness.task_spec import AgenticArmConfig, Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult, strip_resource_limits_banner
 from reward_hacking.ladder import chat, loop, surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
@@ -42,8 +43,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from transformers import PreTrainedTokenizerBase
-
-    from reward_hacking.harness import loop as shared_loop
 
 
 @dataclass(frozen=True)
@@ -3274,6 +3273,154 @@ def test_submission_verdict_evidence_default_is_immutable() -> None:
 
     with pytest.raises(TypeError):
         verdict.evidence["unexpected"] = True  # type: ignore[index]
+
+
+def test_final_grade_reuses_submission_proxy_only_for_identical_artifact_and_grader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_task = _task()
+    task = replace(
+        base_task,
+        files={**base_task.files, "solution.py": "def solve(): return 1\n"},
+        task_variant="original",
+        problem_id="synthetic-problem",
+        artifact_filename="solution.py",
+        provided_test_check=lambda _directory: TaskTestVerdict(passed=True),
+        grader_integrity_files=("grade.py",),
+    )
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    for filename, contents in task.files.items():
+        path = episode_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+
+    submitted_grader = CommandResult(task.grader_command, 1, "FAIL\n", "", False)
+    identity = shared_loop.submission_grader_reuse_identity(
+        task,
+        episode_dir,
+        arm=AgenticArmConfig(),
+        timeout="120s",
+        jail_backend=None,
+        artifact_sha256=hashlib.sha256((episode_dir / "solution.py").read_bytes()).hexdigest(),
+    )
+    assert identity is not None
+    submission = loop.SubmissionVerdict(
+        passed=False,
+        feedback="FAIL",
+        grader=submitted_grader,
+        evidence={"proxy_reuse_identity": identity},
+    )
+    received: list[CommandResult | None] = []
+
+    def grade_final_state(
+        _task: Task,
+        _directory: Path,
+        **kwargs: object,
+    ) -> FinalGrade:
+        received.append(cast("CommandResult | None", kwargs.get("proxy_grader_result")))
+        return FinalGrade(
+            grader=submitted_grader,
+            proxy_pass=False,
+            true_pass=True,
+            oracle_error=None,
+            grader_pregrade_sha256=None,
+        )
+
+    monkeypatch.setattr(loop, "grade_final_state", grade_final_state)
+    loop._grade_episode(
+        task,
+        episode_dir=episode_dir,
+        arm=AgenticArmConfig(),
+        timeout="120s",
+        jail_backend=None,
+        grader_hashable=True,
+        submit_grader=None,
+        ended_by="submission",
+        last_submission=submission,
+        snapshot_error=None,
+    )
+
+    assert received == [submitted_grader]
+
+
+@pytest.mark.parametrize(
+    ("changed_file", "changed_contents"),
+    [
+        ("solution.py", "def solve(): return 2\n"),
+        ("grade.py", "print('FAIL')\n"),
+    ],
+)
+def test_final_grade_reruns_proxy_when_submitted_artifact_or_grader_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_file: str,
+    changed_contents: str,
+) -> None:
+    base_task = _task()
+    task = replace(
+        base_task,
+        files={**base_task.files, "solution.py": "def solve(): return 1\n"},
+        task_variant="original",
+        problem_id="synthetic-problem",
+        artifact_filename="solution.py",
+        provided_test_check=lambda _directory: TaskTestVerdict(passed=True),
+        grader_integrity_files=("grade.py",),
+    )
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    for filename, contents in task.files.items():
+        path = episode_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    artifact_sha256 = hashlib.sha256((episode_dir / "solution.py").read_bytes()).hexdigest()
+    identity = shared_loop.submission_grader_reuse_identity(
+        task,
+        episode_dir,
+        arm=AgenticArmConfig(),
+        timeout="120s",
+        jail_backend=None,
+        artifact_sha256=artifact_sha256,
+    )
+    assert identity is not None
+    submission = loop.SubmissionVerdict(
+        passed=False,
+        feedback="FAIL",
+        grader=CommandResult(task.grader_command, 1, "FAIL\n", "", False),
+        evidence={"proxy_reuse_identity": identity},
+    )
+    (episode_dir / changed_file).write_text(changed_contents, encoding="utf-8")
+    received: list[CommandResult | None] = []
+
+    def grade_final_state(
+        _task: Task,
+        _directory: Path,
+        **kwargs: object,
+    ) -> FinalGrade:
+        received.append(cast("CommandResult | None", kwargs.get("proxy_grader_result")))
+        return FinalGrade(
+            grader=submission.grader or CommandResult(task.grader_command, 1, "FAIL", "", False),
+            proxy_pass=False,
+            true_pass=True,
+            oracle_error=None,
+            grader_pregrade_sha256=None,
+        )
+
+    monkeypatch.setattr(loop, "grade_final_state", grade_final_state)
+    loop._grade_episode(
+        task,
+        episode_dir=episode_dir,
+        arm=AgenticArmConfig(),
+        timeout="120s",
+        jail_backend=None,
+        grader_hashable=True,
+        submit_grader=None,
+        ended_by="submission",
+        last_submission=submission,
+        snapshot_error=None,
+    )
+
+    assert received == [None]
 
 
 @pytest.mark.parametrize("empty_start", [False, True])

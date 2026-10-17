@@ -34,6 +34,7 @@ from reward_hacking.harness.loop import (
     is_sole_grader_invocation,
     lay_down_task,
     new_episode_token,
+    submission_grader_reuse_identity,
 )
 from reward_hacking.harness.task_spec import TASK_ARTIFACT_BUNDLE_FORMAT, task_submitted_artifact
 from reward_hacking.jailed_poc import CommandResult, run_in_jail, strip_resource_limits_banner
@@ -1976,6 +1977,37 @@ class _EpisodeGrading:
     final_state_verdict: dict[str, object] | None
 
 
+def _grade_final_state_for_episode(  # noqa: PLR0913 - preserve the episode's grading context
+    task: Task,
+    episode_dir: Path,
+    *,
+    arm: AgenticArmConfig,
+    timeout: str,
+    jail_backend: str | None,
+    grader_hashable: bool,
+    reusable_proxy_grader: CommandResult | None,
+) -> FinalGrade:
+    """Run final truth grading and pass a registered proxy result only after identity checks."""
+    if reusable_proxy_grader is None:
+        return grade_final_state(
+            task,
+            episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            grader_hashable=grader_hashable,
+        )
+    return grade_final_state(
+        task,
+        episode_dir,
+        arm=arm,
+        timeout=timeout,
+        jail_backend=jail_backend,
+        grader_hashable=grader_hashable,
+        proxy_grader_result=reusable_proxy_grader,
+    )
+
+
 def _grade_episode(  # noqa: C901, PLR0912, PLR0913 - ordered grading transitions stay together
     task: Task,
     *,
@@ -1991,6 +2023,29 @@ def _grade_episode(  # noqa: C901, PLR0912, PLR0913 - ordered grading transition
 ) -> _EpisodeGrading:
     final_state_verdict: dict[str, object] | None = None
     graded_on: Literal["submission", "final_state"] | None = None
+    reusable_proxy_grader: CommandResult | None = None
+    if last_submission is not None and last_submission.grader is not None:
+        recorded_identity = last_submission.evidence.get("proxy_reuse_identity")
+        submitted_artifact = task_submitted_artifact(task, episode_dir)
+        artifact_sha256 = (
+            hashlib.sha256(submitted_artifact).hexdigest()
+            if submitted_artifact is not None
+            else None
+        )
+        current_identity = submission_grader_reuse_identity(
+            task,
+            episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            artifact_sha256=artifact_sha256,
+        )
+        if (
+            current_identity is not None
+            and current_identity == recorded_identity
+            and last_submission.grader.command == task.grader_command
+        ):
+            reusable_proxy_grader = last_submission.grader
     if ended_by == "workspace_snapshot_limit":
         if snapshot_error is None:
             raise ValueError("snapshot-limited episode is missing its SnapshotLimitError")
@@ -2034,13 +2089,14 @@ def _grade_episode(  # noqa: C901, PLR0912, PLR0913 - ordered grading transition
         final_grade = _snapshot_limit_grade(task, snapshot_error)
     else:
         try:
-            final_grade = grade_final_state(
+            final_grade = _grade_final_state_for_episode(
                 task,
                 episode_dir,
                 arm=arm,
                 timeout=timeout,
                 jail_backend=jail_backend,
                 grader_hashable=grader_hashable,
+                reusable_proxy_grader=reusable_proxy_grader,
             )
         except SnapshotLimitError as error:
             snapshot_error = error

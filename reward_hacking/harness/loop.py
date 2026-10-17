@@ -1237,6 +1237,32 @@ def effective_grader_timeout(task: Task, fallback_timeout: str) -> str:
     return f"{format(Decimal(str(seconds)), 'f')}s"
 
 
+def submission_grader_reuse_identity(  # noqa: PLR0913 - exact execution context makes reuse safe
+    task: Task,
+    episode_dir: Path,
+    *,
+    arm: AgenticArmConfig,
+    timeout: str,
+    jail_backend: str | None,
+    artifact_sha256: str | None,
+) -> dict[str, object] | None:
+    """Identify when a registered jail grader result also grades the final artifact exactly."""
+    if task.docker_config is not None or artifact_sha256 is None:
+        return None
+    grader_sha256 = grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+    if grader_sha256 is None:
+        return None
+    return {
+        "artifact_sha256": artifact_sha256,
+        "grader_sha256": grader_sha256,
+        "command": task.grader_command,
+        "success_marker": task.success_marker,
+        "timeout": effective_grader_timeout(task, timeout),
+        "jail_backend": jail_backend,
+        "grader_visibility": arm.grader_visibility.value,
+    }
+
+
 def run_grader(  # noqa: PLR0913 - submitted_patch binds grading to the artifact digest recorded for this episode
     task: Task,
     episode_dir: Path,
@@ -1881,6 +1907,7 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
     jail_backend: str | None,
     grader_hashable: bool,
     true_check_timeout: str | None = None,
+    proxy_grader_result: CommandResult | None = None,
 ) -> FinalGrade:
     """Grade ``/work`` as the turns left it: the authoritative proxy run, then the oracle.
 
@@ -1904,12 +1931,13 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
             jail_backend=jail_backend,
             true_check_timeout=true_check_timeout,
             grader_pregrade_sha256=grader_pregrade_sha256,
+            proxy_grader_result=proxy_grader_result,
         )
     except SnapshotLimitError as exc:
         return _snapshot_limit_grade(task, exc, grader_pregrade_sha256=grader_pregrade_sha256)
 
 
-def _grade_final_state(  # noqa: PLR0913 - private implementation of the public grade operation
+def _grade_final_state(  # noqa: C901, PLR0912, PLR0913 - keep ordered grader transitions together
     task: Task,
     episode_dir: Path,
     *,
@@ -1918,6 +1946,7 @@ def _grade_final_state(  # noqa: PLR0913 - private implementation of the public 
     jail_backend: str | None,
     true_check_timeout: str | None,
     grader_pregrade_sha256: str | None,
+    proxy_grader_result: CommandResult | None,
 ) -> FinalGrade:
     true_check = _true_check_for_grade(task, true_check_timeout)
     submitted_patch: bytes | None = None
@@ -1931,14 +1960,19 @@ def _grade_final_state(  # noqa: PLR0913 - private implementation of the public 
             template_dir=task.docker_grader_template,
         )
         submitted_patch_sha256 = hashlib.sha256(submitted_patch).hexdigest()
-    grader = run_grader(
-        task,
-        episode_dir,
-        arm=arm,
-        timeout=timeout,
-        jail_backend=jail_backend,
-        submitted_patch=submitted_patch,
-    )
+    if proxy_grader_result is None:
+        grader = run_grader(
+            task,
+            episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            submitted_patch=submitted_patch,
+        )
+    else:
+        if proxy_grader_result.command != task.grader_command:
+            raise ValueError("reused proxy grader result belongs to a different command")
+        grader = proxy_grader_result
     oracle_error: str | None = None
     true_evidence: dict[str, object] | None = None
     if task.docker_config is None:
