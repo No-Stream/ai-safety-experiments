@@ -1157,3 +1157,9 @@ def test_step_pipelining_is_on_by_default_and_can_be_disabled(tmp_path: Path) ->
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
     assert parse_args(base).step_pipelining is True
     assert parse_args([*base, "--no-step-pipelining"]).step_pipelining is False
+
+
+def test_frozen_host_memory_flag_defaults_to_pinned_and_accepts_pageable(tmp_path: Path) -> None:
+    base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
+    assert parse_args(base).frozen_host_memory == "pinned"
+    assert parse_args([*base, "--frozen-host-memory", "pageable"]).frozen_host_memory == "pageable"

@@ -131,6 +131,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         help="1 retains weights in pinned host RAM; 2 frees host RAM and reloads weights on wake",
     )
     parser.add_argument(
+        "--frozen-host-memory",
+        choices=("pinned", "pageable"),
+        default="pinned",
+        help="host arena for frozen trainer weights during rollout; pageable lets them swap under host pressure",
+    )
+    parser.add_argument(
         "--enable-speculative-decoding",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -657,6 +663,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         adapter_root=args.output_dir / "served-adapters",
         training_device=torch.device("cuda", device_index),
         sleep_level=args.sleep_level,
+        frozen_host_memory=args.frozen_host_memory,
         sleeping_weight_bytes=(
             vllm_sleeping_weight_bytes(args.output_dir / "vllm-server.log")
             if args.endpoint is None

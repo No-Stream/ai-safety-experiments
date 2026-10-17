@@ -363,6 +363,7 @@ class VLLMPhaseController:
         host_memory_budget_bytes: int | None = None,
         host_memory_safety_margin_bytes: int | None = None,
         sleeping_weight_bytes: int | None = None,
+        frozen_host_memory: str = "pinned",
         http_transport: httpx2.BaseTransport | None = None,
     ) -> None:
         """Bind one rollout backend and its private adapter staging directory."""
@@ -401,6 +402,9 @@ class VLLMPhaseController:
                 f"CUDA sleep level 1 requires {VLLM_SLEEPING_WEIGHT_BYTES_ENV}; "
                 "the installed vLLM RPC does not report pinned weight bytes"
             )
+        if frozen_host_memory not in ("pinned", "pageable"):
+            raise ValueError("frozen_host_memory must be pinned or pageable")
+        self.frozen_host_memory = frozen_host_memory
         self.sleep_level = sleep_level
         self._configured_host_memory_limit_bytes = configured_budget_bytes
         self._physical_memory_limit_bytes = physical_memory_bytes
@@ -408,6 +412,7 @@ class VLLMPhaseController:
         self.sleeping_weight_bytes = configured_sleeping_weight_bytes or 0
         self._weights_discarded = False
         self._vllm_sleeping = False
+        self._vllm_backup_resident = False
         self.backend = backend
         self.adapter_root = adapter_root
         self.training_device = training_device
@@ -455,7 +460,9 @@ class VLLMPhaseController:
 
     def _offload(self, trainer: PhaseTrainer) -> None:
         if self._transfers is None:
-            self._transfers = PolicyTransfers(trainer.model, self.training_device)
+            self._transfers = PolicyTransfers(
+                trainer.model, self.training_device, pin_memory=self.frozen_host_memory == "pinned"
+            )
         planned_host_bytes = self._transfers.planned_host_bytes(trainer.optimizer)
         sleeping_weight_bytes = (
             self.sleeping_weight_bytes
@@ -536,9 +543,12 @@ class VLLMPhaseController:
 
     def sleep(self) -> None:
         """Free server GPU allocations and verify the acknowledged sleep state."""
+        # vLLM's pinned weight backup stays allocated in its process after the first level-1 sleep.
         expected_host_bytes = (
             self.sleeping_weight_bytes
-            if self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL and not self._vllm_sleeping
+            if self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL
+            and not self._vllm_sleeping
+            and not self._vllm_backup_resident
             else 0
         )
         pinned_host_bytes = self._transfers.host_bytes if self._transfers is not None else 0
@@ -555,6 +565,7 @@ class VLLMPhaseController:
         self._assert_sleeping(expected=True)
         self._weights_discarded = self.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL
         self._vllm_sleeping = True
+        self._vllm_backup_resident = self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL
         logger.info(
             "vLLM sleeping: level=%d host_available_bytes=%d",
             self.sleep_level,

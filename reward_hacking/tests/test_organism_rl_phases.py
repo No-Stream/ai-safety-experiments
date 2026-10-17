@@ -591,6 +591,11 @@ def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
         "offload",
     )
     assert controller._transfers.frozen_host_storage_ids
+
+    # vLLM's pinned weight backup stays allocated in its process after the first sleep.
+    controller.before_training(trainer)
+    assert combined_budget_calls[3] == (second_planned_bytes, 20, "vLLM sleep")
+    assert host_budget_calls[3] == (0, "vLLM sleep")
     controller.close()
 
 
@@ -723,3 +728,41 @@ def test_sleeping_weight_bytes_come_from_the_owned_server_log(tmp_path: Path) ->
     server_log.write_text("no load line yet\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="Model loading took"):
         phases.vllm_sleeping_weight_bytes(server_log)
+
+
+def test_controller_builds_pageable_transfers_when_asked(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil, "virtual_memory", lambda: SimpleNamespace(total=1 << 30, available=1 << 30)
+    )
+    pin_memory_arguments: list[bool] = []
+    real_transfers = phases.PolicyTransfers
+
+    def recording_transfers(
+        model: torch.nn.Module, device: torch.device, *, pin_memory: bool
+    ) -> phases.PolicyTransfers:
+        pin_memory_arguments.append(pin_memory)
+        return real_transfers(model, device, pin_memory=pin_memory)
+
+    monkeypatch.setattr(phases, "PolicyTransfers", recording_transfers)
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=1 << 30,
+        host_memory_safety_margin_bytes=0,
+        sleeping_weight_bytes=20,
+        frozen_host_memory="pageable",
+        http_transport=transport,
+    )
+    model = ToyAdapter()
+    model.weight.requires_grad_(False)
+    controller.initialize(ToyTrainer(model, None, ToyState()))
+    assert pin_memory_arguments == [False]
+    controller.close()
