@@ -24,10 +24,10 @@ from transformers import (
     get_scheduler,
 )
 from transformers.trainer_utils import TrainOutput
-from trl.trainer.utils import entropy_from_logits
+from trl.trainer.utils import entropy_from_logits, selective_log_softmax
 
 from games.deltanet_kernels import bound_deltanet_kernels
-from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
+from games.train import build_callbacks, resolve_complete_resume_checkpoint
 from grpo.throughput import discover_lora_targets
 from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import (
@@ -313,10 +313,47 @@ def _copy_fp32_head_weights(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if not isinstance(head, torch.nn.Linear):
         raise TypeError("the output embedding must be a torch.nn.Linear module")
-    weight = head.weight.detach().to(dtype=torch.float32)
     bias_parameter = cast("torch.Tensor | None", head.bias)
-    bias = None if bias_parameter is None else bias_parameter.detach().to(dtype=torch.float32)
+    if head.weight.requires_grad or (bias_parameter is not None and bias_parameter.requires_grad):
+        if torch.is_grad_enabled():
+            raise ValueError("chunked training requires a frozen output head")
+        return (
+            head.weight.detach().to(dtype=torch.float32),
+            None if bias_parameter is None else bias_parameter.detach().to(dtype=torch.float32),
+        )
+    source_parameters = [head.weight] + ([] if bias_parameter is None else [bias_parameter])
+    source_signature = tuple(
+        (id(parameter), parameter._version, parameter.dtype)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        for parameter in source_parameters
+    )
+    weight_name = "_organism_fp32_head_weight"
+    bias_name = "_organism_fp32_head_bias"
+    weight = head._buffers.get(weight_name)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    bias = head._buffers.get(bias_name)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    if (
+        head.__dict__.get("_organism_head_source_signature") != source_signature
+        or weight is None
+        or weight.dtype != torch.float32
+        or weight.device != head.weight.device
+        or (bias_parameter is not None and (bias is None or bias.dtype != torch.float32))
+    ):
+        # Evaluation may populate this cache before a later training forward needs it for backward.
+        with torch.inference_mode(mode=False):
+            weight = head.weight.detach().to(dtype=torch.float32)
+            bias = (
+                None if bias_parameter is None else bias_parameter.detach().to(dtype=torch.float32)
+            )
+        head.register_buffer(weight_name, weight, persistent=False)
+        head.register_buffer(bias_name, bias, persistent=False)
+        head.__dict__["_organism_head_source_signature"] = source_signature
+        head.__dict__["_phase_frozen_buffer_names"] = {weight_name, bias_name}
     return weight, bias
+
+
+def prepare_fp32_head(model: torch.nn.Module) -> None:
+    """Cache the frozen head before phase offload so its fp32 copy follows the model."""
+    causal_model = cast("Any", model.get_base_model() if isinstance(model, PeftModel) else model)
+    _copy_fp32_head_weights(causal_model.get_output_embeddings())
 
 
 def _fp32_head_logits(
@@ -345,15 +382,15 @@ def _score_active_completion_positions(  # noqa: PLR0913 - explicit scoring and 
 
     def score_slice(
         hidden_states: torch.Tensor, position_slice: torch.Tensor, token_slice: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_slice = hidden_states.index_select(0, position_slice).unsqueeze(0)
-        return chunked_per_token_logps(
-            hidden_slice,
-            float32_head,
-            token_slice,
-            temperature=temperature,
-            chunk_tokens=chunk_tokens,
-        )
+        logits = float32_head(hidden_slice)
+        if temperature != 1.0:
+            logits.div_(temperature)
+        logps = selective_log_softmax(logits, token_slice)
+        with torch.no_grad():
+            entropy = entropy_from_logits(logits) if compute_entropy else None
+        return logps, entropy
 
     logprob_slices: list[torch.Tensor] = []
     entropy_slices: list[torch.Tensor] = []
@@ -361,18 +398,14 @@ def _score_active_completion_positions(  # noqa: PLR0913 - explicit scoring and 
         position_slice = active_positions[start : start + chunk_tokens]
         token_slice = packed_targets[:, start : start + chunk_tokens]
         if torch.is_grad_enabled():
-            logps = checkpoint(
+            logps, entropy = checkpoint(
                 score_slice, flat_hidden, position_slice, token_slice, use_reentrant=False
             )
         else:
-            logps = score_slice(flat_hidden, position_slice, token_slice)
+            logps, entropy = score_slice(flat_hidden, position_slice, token_slice)
         logprob_slices.append(logps)
-        if compute_entropy:
-            with torch.no_grad():
-                hidden_slice = flat_hidden.index_select(0, position_slice).unsqueeze(0)
-                entropy_slices.append(
-                    entropy_from_logits(float32_head(hidden_slice.detach()) / temperature)
-                )
+        if entropy is not None:
+            entropy_slices.append(entropy)
     packed_logps = torch.cat(logprob_slices, dim=1)
     packed_entropies = torch.cat(entropy_slices, dim=1) if compute_entropy else None
     return packed_logps, packed_entropies

@@ -43,6 +43,7 @@ class _TinyCausalModel(torch.nn.Module):
 def test_fp32_head_logits_keep_matmul_precision() -> None:
     torch.manual_seed(41)
     head = torch.nn.Linear(5, 7, bias=True).to(dtype=torch.bfloat16)
+    head.requires_grad_(False)
     hidden_states = torch.randn(3, 5, dtype=torch.bfloat16)
     weight, bias = _copy_fp32_head_weights(head)
 
@@ -60,6 +61,7 @@ def test_fp32_head_logits_keep_matmul_precision() -> None:
 def test_fp32_head_logits_pass_gradcheck_for_hidden_states() -> None:
     torch.manual_seed(42)
     head = torch.nn.Linear(3, 4, bias=False).to(dtype=torch.bfloat16)
+    head.requires_grad_(False)
     weight, bias = _copy_fp32_head_weights(head)
     hidden_states = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
 

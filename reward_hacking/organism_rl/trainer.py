@@ -33,7 +33,7 @@ from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUs
 from games.train import STEP_PADDED_TOKENS_METRIC, STEP_TRIMMED_TOKENS_METRIC, trim_micro_batch
 from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
-from reward_hacking.distill.train import chunked_completion_logps
+from reward_hacking.distill.train import chunked_completion_logps, prepare_fp32_head
 from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.admission import LiveKVAdmission
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
@@ -445,6 +445,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         if self.model is None:
             raise RuntimeError("Organism trainer requires a model")
         assert_fp32_training_state(self.model, self._precision_optimizer())
+        prepare_fp32_head(self.model)
         self._validate_configuration()
         TrainingThroughputCallback(non_training_seconds=lambda: self._non_training_seconds).attach(
             self
@@ -918,6 +919,10 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     ) -> None:
         validate_checkpoint(Path(resume_from_checkpoint))
         super()._load_from_checkpoint(resume_from_checkpoint, model)
+        loaded_model = self.model if model is None else model
+        if loaded_model is None:
+            raise RuntimeError("Organism trainer requires a model")
+        prepare_fp32_head(loaded_model)
 
     @override
     def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:

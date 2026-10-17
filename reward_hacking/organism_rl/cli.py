@@ -30,7 +30,11 @@ from reward_hacking.distill.memory import (
     load_base_model,
     prepare_checkpoint_offload,
 )
-from reward_hacking.distill.train import cast_lora_to_float32, memory_options_from_args
+from reward_hacking.distill.train import (
+    cast_lora_to_float32,
+    memory_options_from_args,
+    prepare_fp32_head,
+)
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
@@ -693,6 +697,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         model.enable_input_require_grads()
         cast_lora_to_float32(model)
         assert_fp32_training_state(model, None)
+        prepare_fp32_head(model)
         if options.tiled_mlp:
             install_tiled_mlp(model, skip_dead_mlp_recompute=options.skip_dead_mlp_recompute)
         offload = (

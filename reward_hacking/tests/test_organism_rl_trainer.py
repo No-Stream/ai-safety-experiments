@@ -25,6 +25,7 @@ from reward_hacking.organism_rl.trainer import (
     parse_vllm_rollout_log,
     validate_checkpoint,
 )
+from reward_hacking.organism_rl.transfers import PolicyTransfers
 
 
 def test_teacher_zero_preserves_plain_advantages() -> None:
@@ -429,7 +430,7 @@ def test_masked_chunked_logprobs_preserve_metrics_and_skip_inactive_head_positio
         )
     assert auxiliary_loss is None
     assert entropies is not None
-    assert sum(head_position_counts) == 2 * int(completion_mask.sum())
+    assert sum(head_position_counts) == int(completion_mask.sum())
     assert trainer._active_loss_inputs is None
     trainer._finish_training_step_metrics()
     active_gap = (full_logps - sampler_logps).masked_select(completion_mask)
@@ -1273,3 +1274,49 @@ def test_phase_transitions_are_timed_into_the_step_log(tmp_path: Path) -> None:
     for name in ("wake_sampler", "rollout", "restore_trainer"):
         assert first[f"organism/seconds_{name}"] >= 0
     assert second["organism/seconds_adapter_sync"] >= 0
+
+
+class StorageTransferPhase:
+    """Exercise real policy transfers inside the trainer's phase callbacks."""
+
+    def __init__(self) -> None:
+        self.transfers: PolicyTransfers | None = None
+        self.optimizer_steps = 0
+
+    def initialize(self, trainer: Any, step: int = 0) -> None:
+        del step
+        self.transfers = PolicyTransfers(trainer.model, torch.device("cpu"))
+        self.transfers.offload(trainer.optimizer)
+
+    def before_sampling(self, trainer: Any) -> None:
+        assert self.transfers is not None
+        self.transfers.offload(trainer.optimizer)
+
+    def before_training(self, trainer: Any) -> None:
+        assert self.transfers is not None
+        self.transfers.restore(trainer.optimizer)
+
+    def after_optimizer_step(self, trainer: Any) -> None:
+        assert self.transfers is not None
+        self.transfers.offload(trainer.optimizer)
+        self.optimizer_steps += 1
+
+
+def test_direct_trainer_initializes_head_before_phase_storage_snapshot(tmp_path: Path) -> None:
+    phase = StorageTransferPhase()
+    trainer = _trainer(tmp_path, max_steps=2, phase=phase)
+    trainer.train()
+    assert phase.optimizer_steps == 2
+    for step in (1, 2):
+        checkpoint = tmp_path / f"checkpoint-{step}"
+        validate_checkpoint(checkpoint)
+        state = torch.load(checkpoint / "optimizer.pt", weights_only=True)
+        assert state["state"]
+        assert all(
+            tensor.device.type == "cpu"
+            for values in state["state"].values()
+            for tensor in values.values()
+            if isinstance(tensor, torch.Tensor)
+        )
+    assert phase.transfers is not None
+    assert phase.transfers.frozen_host_storage_ids

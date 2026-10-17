@@ -332,3 +332,47 @@ def test_level_two_sync_replaces_adapter_without_reloading_previous_adapter(
     assert state.payloads[-1]["lora_name"] == backend.model_id
     assert state.loaded_adapters == state.adapters == {backend.model_id}
     controller.close()
+
+
+def test_phase_transfers_save_before_offload_without_module_to(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport, _ = server
+    model = ToyAdapter()
+    trainer = ToyTrainer(model, torch.optim.AdamW(model.parameters()), ToyState())
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        http_transport=transport,
+    )
+    pointers_at_save: list[int] = []
+    save_pretrained = model.save_pretrained
+
+    def save(directory: str) -> None:
+        pointers_at_save.append(model.weight.data_ptr())
+        save_pretrained(directory)
+
+    def forbidden_to(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("phase controller must use persistent storage transfers")
+
+    monkeypatch.setattr(model, "save_pretrained", save)
+    monkeypatch.setattr(model, "to", forbidden_to)
+    original_pointer = model.weight.data_ptr()
+    with caplog.at_level("INFO"):
+        controller.initialize(trainer)
+        assert pointers_at_save == [original_pointer]
+        assert model.weight.data_ptr() != original_pointer
+        controller.before_training(trainer)
+        training_pointer = model.weight.data_ptr()
+        controller.after_optimizer_step(trainer)
+    assert pointers_at_save[-1] == training_pointer
+    assert "phase=offload moved_bytes=" in caplog.text
+    assert "phase=restore moved_bytes=" in caplog.text
+    assert "GB/s=" in caplog.text
+    controller.close()

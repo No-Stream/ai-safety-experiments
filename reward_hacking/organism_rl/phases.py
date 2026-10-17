@@ -27,6 +27,7 @@ from safetensors import safe_open
 
 from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
+from reward_hacking.organism_rl.transfers import PolicyTransfers
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -173,6 +174,7 @@ class VLLMPhaseController:
         self._served_adapter_path: Path | None = None
         self._training = False
         self.last_sync_seconds: dict[str, float] = {}
+        self._transfers: PolicyTransfers | None = None
 
     def close(self) -> None:
         """Release the owned HTTP client."""
@@ -203,11 +205,11 @@ class VLLMPhaseController:
         return {cast("str", entry["id"]) for entry in payload["data"]}
 
     def _offload(self, trainer: PhaseTrainer) -> None:
-        trainer.model.to(torch.device("cpu"))
-        move_optimizer_state(trainer.optimizer, torch.device("cpu"))
+        if self._transfers is None:
+            self._transfers = PolicyTransfers(trainer.model, self.training_device)
+        self._transfers.offload(trainer.optimizer)
         gc.collect()
         if self.training_device.type == "cuda":
-            torch.cuda.synchronize(self.training_device)
             torch.cuda.empty_cache()
 
     def initialize(self, trainer: PhaseTrainer, step: int = 0) -> None:
@@ -253,8 +255,9 @@ class VLLMPhaseController:
         """Confirm server sleep before restoring trainer parameters and state."""
         self._assert_served()
         self.sleep()
-        trainer.model.to(self.training_device)
-        move_optimizer_state(trainer.optimizer, self.training_device)
+        if self._transfers is None:
+            raise RuntimeError("phase controller must initialize before training")
+        self._transfers.restore(trainer.optimizer)
         self._training = True
 
     def after_optimizer_step(self, trainer: PhaseTrainer) -> None:
