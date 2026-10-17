@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from peft import LoraConfig, get_peft_model
+from torchao.quantization import Int8Tensor, Int8WeightOnlyConfig, quantize_
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
+from reward_hacking.distill.memory import quantize_base_linear
 from reward_hacking.distill.train import prepare_fp32_head
 from reward_hacking.organism_rl.precision import assert_fp32_training_state
 from reward_hacking.organism_rl.transfers import PolicyTransfers, _HostArena
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def tiny_policy() -> Any:
+def tiny_policy(*, quantized: bool = False) -> Any:
     config = Qwen3_5TextConfig(
         vocab_size=32,
         hidden_size=16,
@@ -39,6 +41,8 @@ def tiny_policy() -> Any:
     )
     base_model: Any = Qwen3_5ForCausalLM(config)
     base_model.to(dtype=torch.bfloat16)
+    if quantized:
+        quantize_(base_model, Int8WeightOnlyConfig(), filter_fn=quantize_base_linear)
     model: Any = get_peft_model(
         base_model,
         LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"]),
@@ -48,6 +52,93 @@ def tiny_policy() -> Any:
     prepare_fp32_head(model)
     model.register_buffer("phase_counter", torch.zeros(1))
     return model
+
+
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_real_int8_qwen_storage_cycles_preserve_wrappers_and_exact_bits(
+    pin_memory: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_cuda(*args: object, **kwargs: object) -> None:
+        raise AssertionError("CPU quantized transfers must not call CUDA")
+
+    monkeypatch.setattr(torch.cuda, "cudart", forbidden_cuda)
+    monkeypatch.setattr(torch.cuda, "synchronize", forbidden_cuda)
+    model = tiny_policy(quantized=True)
+    wrappers = [parameter for parameter in model.parameters() if isinstance(parameter, Int8Tensor)]
+    assert wrappers
+    leaves = [
+        getattr(wrapper, name) for wrapper in wrappers for name in wrapper.__tensor_flatten__()[0]
+    ]
+    expected = [leaf.clone() for leaf in leaves]
+    identities = {name: id(value) for name, value in model.named_parameters()}
+    leaf_identities = [id(leaf) for leaf in leaves]
+    optimizer = torch.optim.AdamW(
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    )
+    transfers = PolicyTransfers(model, torch.device("cpu"), pin_memory=pin_memory)
+    storage_tensors = [
+        parameter for parameter in model.parameters() if not isinstance(parameter, Int8Tensor)
+    ] + leaves
+    expected_bytes = sum(
+        {
+            tensor.untyped_storage()._cdata: tensor.untyped_storage().nbytes()
+            for tensor in storage_tensors
+        }.values()
+    )
+    inputs = torch.tensor([[1, 2, 3, 4]])
+    for _ in range(2):
+        report = transfers.offload(optimizer)
+        assert (
+            report.frozen_bytes
+            + sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            )
+            == expected_bytes
+        )
+        assert transfers.frozen_host_storage_ids
+        mapping_refs = [weakref.ref(arena._mapping) for arena in transfers._frozen_arenas]
+        transfers.restore(optimizer)
+        assert all(reference() is None for reference in mapping_refs)
+        assert not transfers.frozen_host_storage_ids
+        assert {name: id(value) for name, value in model.named_parameters()} == identities
+        assert [
+            id(getattr(wrapper, name))
+            for wrapper in wrappers
+            for name in wrapper.__tensor_flatten__()[0]
+        ] == leaf_identities
+        for leaf, original in zip(leaves, expected, strict=True):
+            torch.testing.assert_close(leaf, original, rtol=0, atol=0)
+        optimizer.zero_grad()
+        model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
+        optimizer.step()
+
+
+def test_int8_wrapper_refresh_updates_outer_device_without_replacing_parameter() -> None:
+    model = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+    quantize_(model, Int8WeightOnlyConfig())
+    model.requires_grad_(False)
+    transfers = PolicyTransfers(model, torch.device("cpu"))
+    original: Any = model.weight
+    identity = id(original)
+    names, metadata = original.__tensor_flatten__()
+    stale = Int8Tensor.__tensor_unflatten__(
+        {name: getattr(original, name).to("meta") for name in names},
+        metadata,
+        original.shape,
+        original.stride(),
+    )
+    for name, value in original.__dict__.items():
+        setattr(stale, name, value)
+    torch.utils.swap_tensors(original, stale)
+    assert original.device.type == "meta"
+    assert original.qdata.device.type == "cpu"
+    transfers._refresh_wrappers()
+    assert id(model.weight) == identity
+    assert isinstance(model.weight, torch.nn.Parameter)
+    assert original.device.type == "cpu"
+    assert original.qdata.device.type == "cpu"
 
 
 def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:

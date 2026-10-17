@@ -1,9 +1,8 @@
 """Storage-preserving host staging for sequential policy/sampler ownership.
 
 Frozen host arenas exist only during rollout and are released after restore.
-Mutable storage is refreshed on every training cycle. Tensor subclasses (including
-TorchAO wrappers) require a separate representation-aware implementation and are
-refused before any placement changes.
+Mutable storage is refreshed on every training cycle. TorchAO weight-only int8
+wrappers retain their identities while their quantized storage tensors move.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from typing import cast
 
 import psutil
 import torch
+from torchao.quantization import Int8Tensor
 
 from reward_hacking.distill.train import drop_fp32_head, prepare_fp32_head
 
@@ -134,10 +134,27 @@ def _state_tensors(value: object) -> list[torch.Tensor]:
 def _validate_tensor(tensor: torch.Tensor) -> None:
     if type(tensor) not in (torch.Tensor, torch.nn.Parameter):
         raise TypeError(
-            "Policy phase transfer refuses tensor subclass storage, including TorchAO wrappers"
+            "Policy phase transfer refuses unsupported tensor subclass storage; "
+            "only TorchAO weight-only Int8Tensor wrappers are supported"
         )
     if tensor.layout != torch.strided or tensor.device.type not in ("cpu", "cuda"):
         raise ValueError("Policy phase transfer requires dense CPU or CUDA tensor storage")
+
+
+def _storage_tensors(tensor: torch.Tensor) -> list[torch.Tensor]:
+    if type(tensor) is Int8Tensor:
+        wrapper = tensor
+        if wrapper.requires_grad or wrapper.act_quant_kwargs is not None:
+            raise TypeError(
+                "Policy phase transfer requires frozen TorchAO weight-only int8 tensors"
+            )
+        names, _ = wrapper.__tensor_flatten__()
+        tensors = [cast("torch.Tensor", getattr(wrapper, name)) for name in names]
+        for inner in tensors:
+            _validate_tensor(inner)
+        return tensors
+    _validate_tensor(tensor)
+    return [tensor]
 
 
 def _aligned_bytes(size: int) -> int:
@@ -183,7 +200,23 @@ class PolicyTransfers:
         self._base = list(model.parameters()) + [tensor for _, tensor in self._buffers()]
         self._base_ids = {id(tensor) for tensor in self._base}
         for tensor in self._base:
-            _validate_tensor(tensor)
+            _storage_tensors(tensor)
+        self._wrappers = [tensor for tensor in self._base if type(tensor) is Int8Tensor]
+
+    def _refresh_wrappers(self) -> None:
+        # Inner tensors have moved in place; refresh the outer TensorImpl's device too.
+        for tensor in self._wrappers:
+            wrapper = tensor
+            names, metadata = wrapper.__tensor_flatten__()
+            replacement = Int8Tensor.__tensor_unflatten__(
+                {name: getattr(wrapper, name) for name in names},
+                metadata,
+                wrapper.shape,
+                wrapper.stride(),
+            )
+            for name, value in wrapper.__dict__.items():
+                setattr(replacement, name, value)
+            torch.utils.swap_tensors(wrapper, replacement)
 
     @property
     def frozen_host_storage_ids(self) -> tuple[int, ...]:
@@ -253,8 +286,11 @@ class PolicyTransfers:
                 (tensor, True, tensor.device, "optimizer")
                 for tensor in _state_tensors(optimizer.state)
             )
-        for tensor, _, _, _ in records:
-            _validate_tensor(tensor)
+        records = [
+            (inner, mutable, target, category)
+            for tensor, mutable, target, category in records
+            for inner in _storage_tensors(tensor)
+        ]
         current_ids = {id(tensor) for tensor, _, _, _ in records}
         self._groups = [
             group
@@ -377,6 +413,7 @@ class PolicyTransfers:
         report = self._finish(started, frozen, mutable, "offload")
         for group in self._groups:
             group.bind(group.host)
+        self._refresh_wrappers()
         self._host = True
         return report
 
@@ -387,6 +424,7 @@ class PolicyTransfers:
         if not self._host:
             return TransferReport(0, 0, time.perf_counter() - started)
         frozen, mutable = self._restore_device_storage()
+        self._refresh_wrappers()
         if self._rebuild_head:
             prepare_fp32_head(self.model)
         if self.training_device.type == "cuda":

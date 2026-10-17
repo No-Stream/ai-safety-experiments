@@ -6,12 +6,13 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx2
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from torchao.quantization import Int8Tensor
 
 from grpo import gpu_memory
 from reward_hacking.organism_rl import phases
@@ -22,6 +23,113 @@ from reward_hacking.organism_rl.phases import (
     move_optimizer_state,
     resolve_host_memory_budget_bytes,
 )
+from reward_hacking.tests.test_organism_rl_transfers import tiny_policy
+
+
+def _int8_policy_with_local_config(directory: Path) -> Any:
+    model = tiny_policy(quantized=True)
+    base_directory = directory / "Qwen3.5-synthetic-base"
+    model.config.save_pretrained(base_directory)
+    model.peft_config["default"].base_model_name_or_path = str(base_directory)
+    return model
+
+
+@pytest.mark.parametrize("frozen_host_memory", ["pinned", "pageable"])
+def test_real_int8_qwen_phase_cycles_and_host_budget(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    frozen_host_memory: Literal["pinned", "pageable"],
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil, "virtual_memory", lambda: SimpleNamespace(total=1 << 30, available=1 << 30)
+    )
+    model = _int8_policy_with_local_config(tmp_path)
+    parameters = {name: id(parameter) for name, parameter in model.named_parameters()}
+    wrappers = [parameter for parameter in model.parameters() if isinstance(parameter, Int8Tensor)]
+    leaves = [
+        getattr(wrapper, name) for wrapper in wrappers for name in wrapper.__tensor_flatten__()[0]
+    ]
+    expected = [leaf.clone() for leaf in leaves]
+    tensors = (
+        [parameter for parameter in model.parameters() if not isinstance(parameter, Int8Tensor)]
+        + leaves
+        + [buffer for name, buffer in model.named_buffers() if "_organism_fp32_head" not in name]
+    )
+    expected_host_bytes = sum(
+        {
+            tensor.untyped_storage().data_ptr(): ((tensor.untyped_storage().nbytes() + 7) // 8) * 8
+            for tensor in tensors
+        }.values()
+    )
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=1 << 30,
+        host_memory_safety_margin_bytes=0,
+        sleeping_weight_bytes=20,
+        frozen_host_memory=frozen_host_memory,
+        http_transport=transport,
+    )
+    optimizer = torch.optim.AdamW(
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    )
+    trainer = ToyTrainer(model, optimizer, ToyState())
+    _, _, planned = _record_phase_host_budget_calls(monkeypatch, controller)
+    controller.initialize(trainer)
+    assert planned[0] == (expected_host_bytes, 0)
+    assert controller._transfers is not None
+    assert controller._transfers.host_bytes == expected_host_bytes
+    controller.before_training(trainer)
+    assert not controller._transfers.frozen_host_storage_ids
+    inputs = torch.tensor([[1, 2, 3, 4]])
+    model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
+    optimizer.step()
+    trainer.state.global_step = 1
+    controller.after_optimizer_step(trainer)
+    controller.before_training(trainer)
+    assert {name: id(parameter) for name, parameter in model.named_parameters()} == parameters
+    for leaf, original in zip(leaves, expected, strict=True):
+        torch.testing.assert_close(leaf, original, rtol=0, atol=0)
+    controller.close()
+
+
+def test_int8_host_budget_refusal_precedes_any_arena_allocation(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil, "virtual_memory", lambda: SimpleNamespace(total=1 << 30, available=1 << 30)
+    )
+    model = _int8_policy_with_local_config(tmp_path)
+    identities = {name: id(parameter) for name, parameter in model.named_parameters()}
+
+    def forbidden_allocation(*args: object, **kwargs: object) -> None:
+        raise AssertionError("int8 budget refusal must precede arena allocation")
+
+    monkeypatch.setattr(phases.PolicyTransfers, "_collect_groups", forbidden_allocation)
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=1,
+        host_memory_safety_margin_bytes=0,
+        http_transport=transport,
+    )
+    with pytest.raises(RuntimeError, match="budget"):
+        controller.initialize(ToyTrainer(model, None, ToyState()))
+    assert controller._transfers is not None
+    assert controller._transfers.host_bytes == 0
+    assert {name: id(parameter) for name, parameter in model.named_parameters()} == identities
+    controller.close()
 
 
 class ToyAdapter(torch.nn.Linear):
