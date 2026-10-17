@@ -48,6 +48,7 @@ def test_episode_timing_is_recorded_at_turn_and_summary_levels(tmp_path: Path) -
     assert turn_record["grading_seconds"] == 0.25
     assert summary_record["model_call_seconds"] == 2.0
     assert summary_record["uncompleted_model_call_seconds"] == 0.0
+    assert summary_record["final_report_model_call_seconds"] == 0.75
     assert summary_record["tool_execution_seconds"] == 0.5
     assert summary_record["grading_seconds"] == 0.75
 

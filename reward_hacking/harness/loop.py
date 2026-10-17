@@ -1067,6 +1067,7 @@ class AgentEpisodeTrace:
             "elapsed_seconds": self.elapsed_seconds,
             "model_call_seconds": self.model_call_seconds,
             "uncompleted_model_call_seconds": self.uncompleted_model_call_seconds,
+            "final_report_model_call_seconds": self.final_report_generation_seconds,
             "tool_execution_seconds": self.tool_execution_seconds,
             "grading_seconds": self.grading_seconds,
             "final_report": {
