@@ -582,6 +582,7 @@ def run_ladder_wave(  # noqa: PLR0913 - explicit stage setup, collection, and ou
     model_revision: str | None = None,
     scenarios_dir: Path = DEFAULT_SCENARIOS_DIR,
     concurrency: int = LADDER_WAVE_CONCURRENCY,
+    persistent_jail: bool = True,
     server_args: Mapping[str, object] | None = None,
     hints_path: Path | None = None,
     hint_family: str | None = None,
@@ -609,6 +610,7 @@ def run_ladder_wave(  # noqa: PLR0913 - explicit stage setup, collection, and ou
         presence_penalty=LADDER_WAVE_PRESENCE_PENALTY,
         arms=LADDER_WAVE_ARMS,
         episode_concurrency=concurrency,
+        persistent_jail=persistent_jail,
         hint_family=hint.family,
         hint_strength=hint.strength,
         hint_text=hint.text,
@@ -759,6 +761,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-revision")
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--persistent-jail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse one actor jail per episode; disable for per-command jails",
+    )
     parser.add_argument("--scenarios-dir", type=Path, default=DEFAULT_SCENARIOS_DIR)
     parser.add_argument("--episode-concurrency", type=int, default=LADDER_WAVE_CONCURRENCY)
     parser.add_argument("--server-args-json", type=_parse_server_args)
@@ -782,6 +790,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_model_len=args.max_model_len,
             scenarios_dir=args.scenarios_dir,
             concurrency=args.episode_concurrency,
+            persistent_jail=args.persistent_jail,
             server_args=args.server_args_json,
             hints_path=args.hints,
             hint_family=args.hint_family,

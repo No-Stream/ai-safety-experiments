@@ -119,6 +119,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     """Parse explicit experiment, sampling, teacher and memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--persistent-jail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse one actor jail per episode; disable for per-command jails",
+    )
+
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--model-revision")
     parser.add_argument("--endpoint", help="use an externally managed vLLM server")
@@ -143,9 +150,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
     parser.add_argument(
         "--frozen-host-memory",
-        choices=("pinned", "pageable"),
+        choices=("pinned", "pageable", "persistent"),
         default="pinned",
-        help="host arena for frozen trainer weights during rollout; pageable lets them swap under host pressure",
+        help=(
+            "frozen trainer host arena: pinned/pageable allocate per rollout; "
+            "persistent retains a pinned copy across phases"
+        ),
     )
     parser.add_argument(
         "--enable-speculative-decoding",
@@ -920,6 +930,7 @@ def main(argv: list[str] | None = None) -> None:
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
         variants=(args.impossible_variant, "original"),
+        persistent_jail=args.persistent_jail,
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
     if args.ladder_fraction > 0:
@@ -937,6 +948,7 @@ def main(argv: list[str] | None = None) -> None:
             top_p=args.top_p,
             thinking_token_budget=args.thinking_token_budget,
             scenarios_dir=args.ladder_scenarios_dir,
+            persistent_jail=args.persistent_jail,
         )
         source = MixedEpisodeSource(coding_source, ladder_source)
     task_prompts = tuple(

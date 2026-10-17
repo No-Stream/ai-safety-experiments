@@ -768,7 +768,7 @@ def _parse_json_object(raw_value: str) -> dict[str, object]:
     return value
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI options
     """Parse generation, sampling and persistence settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     add_performance_arguments(parser)
@@ -905,6 +905,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--persistent-jail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse one actor jail per episode; disable for per-command jails",
+    )
+
     parser.add_argument("--jail-backend")
     add_leak_arguments(parser)
     args = parser.parse_args(argv)
@@ -2383,6 +2390,8 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "reward_hacking/harness/docker_backend.py",
         "reward_hacking/harness/cli.py",
         "reward_hacking/harness/loop.py",
+        "reward_hacking/harness/jail_session.py",
+        "reward_hacking/persistent_jail.py",
         "reward_hacking/organism_rl/leak_selection.py",
         "reward_hacking/organism_rl/leak_assets.py",
         "reward_hacking/r2e_leak_data.py",
@@ -2443,6 +2452,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "chat_template_kwargs": dict(args.chat_template_kwargs),
         "max_model_len": args.max_model_len,
         "jail_backend": args.jail_backend,
+        "persistent_jail": args.persistent_jail,
         "leak_channels_open": args.leak_channels_open,
     }
     concurrency_flags, serving_runtime_context = _serving_run_metadata(args)
@@ -2603,6 +2613,7 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         ilcb_split_manifest_path=args.ilcb_split_manifest,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
+        persistent_jail=args.persistent_jail,
         chat_template_kwargs=args.chat_template_kwargs,
         hint_family=args.hint_family,
         hint_strength=args.hint_strength,

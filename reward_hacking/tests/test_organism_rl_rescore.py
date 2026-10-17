@@ -14,7 +14,7 @@ from reward_hacking.harness.docker_backend import DockerConfig, SnapshotLimitErr
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult
-from reward_hacking.ladder.loop import SubmissionVerdict
+from reward_hacking.ladder.loop import LadderReplayOptions, SubmissionVerdict
 from reward_hacking.organism_rl import rescore
 from reward_hacking.tests.test_organism_leak_reward import recorded_leak
 from reward_hacking.trace import load_trace
@@ -87,6 +87,50 @@ def test_rescore_replays_and_grades_verified_final_artifact(
     assert cast("dict[str, object]", result["trace_summary"])["submission_verdicts"] == []
     assert calls == ["synthetic-write", "grade", "grade"]
     assert json.dumps(record, sort_keys=True) == original
+
+
+def test_rescore_defaults_missing_execution_mode_to_per_command(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, _calls = replay_fixture
+    replay_modes: list[bool] = []
+
+    def record_replay_mode(
+        _commands: object, _directory: Path, **kwargs: object
+    ) -> tuple[CommandResult, ...]:
+        execution_options = kwargs["execution_options"]
+        assert isinstance(execution_options, LadderReplayOptions)
+        replay_modes.append(execution_options.persistent_jail)
+        return ()
+
+    monkeypatch.setattr(rescore, "replay_ladder_commands", record_replay_mode)
+
+    rescore.rescore_record(record, task, jail_backend=None)
+
+    assert replay_modes == [False]
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "error_type"), [("shared", ValueError), (None, TypeError)]
+)
+def test_rescore_rejects_malformed_execution_mode(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    execution_mode: object,
+    error_type: type[Exception],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, _calls = replay_fixture
+    summary = cast("dict[str, object]", record["trace_summary"])
+    summary["execution_mode"] = execution_mode
+    monkeypatch.setattr(
+        rescore,
+        "replay_ladder_commands",
+        lambda *_args, **_kwargs: pytest.fail("invalid execution mode must fail before replay"),
+    )
+
+    with pytest.raises(error_type, match="execution_mode"):
+        rescore.rescore_record(record, task, jail_backend=None)
 
 
 @pytest.mark.parametrize("recorded_digest", [None, "b" * 64])

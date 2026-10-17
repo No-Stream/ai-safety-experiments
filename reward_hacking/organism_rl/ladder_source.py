@@ -228,6 +228,7 @@ class LadderEpisodeSource:
         scenarios_dir: Path = TRAIN_SCENARIOS_DIR,
         announced_turn_budget: int | None = None,
         jail_backend: str | None = None,
+        persistent_jail: bool = True,
         chat_template_kwargs: Mapping[str, str] | None = None,
     ) -> None:
         """Load only training scenarios before constructing the exact-token HTTP backend."""
@@ -319,6 +320,7 @@ class LadderEpisodeSource:
             hint_strength=hint_strength,
             hint_sha=hint_sha,
             jail_backend=jail_backend,
+            persistent_jail=persistent_jail,
             history_reasoning="retain",
             max_model_len_by_model=((served_model_id, max_model_len),),
             episode_concurrency=episode_concurrency,

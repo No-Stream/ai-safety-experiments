@@ -306,6 +306,7 @@ def test_ladder_wave_records_refreshable_episodes_and_resumes(
     ]
 
     assert summary["episodes"] == 8
+    assert sources[0].constructor_kwargs["persistent_jail"] is True
     assert sources[0].constructor_kwargs["max_turns"] == 80
     assert sources[0].constructor_kwargs["max_new_tokens"] == 16_384
     assert sources[0].constructor_kwargs["temperature"] == 0.6

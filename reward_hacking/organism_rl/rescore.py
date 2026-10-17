@@ -27,7 +27,11 @@ from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.trace_reference import leak_trace_records
-from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_commands
+from reward_hacking.ladder.loop import (
+    LADDER_COMMAND_TIMEOUT,
+    LadderReplayOptions,
+    replay_ladder_commands,
+)
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.tools import contains_submit_marker
 from reward_hacking.organism_reward import score_impossible_task
@@ -69,6 +73,15 @@ def _object(value: object, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError(f"{label} must be a JSON object")
     return cast("dict[str, object]", value)
+
+
+def _recorded_execution_mode(summary: Mapping[str, object]) -> Literal["persistent", "per_command"]:
+    execution_mode = summary.get("execution_mode", "per_command")
+    if not isinstance(execution_mode, str):
+        raise TypeError("trace_summary.execution_mode must be a string")
+    if execution_mode not in {"persistent", "per_command"}:
+        raise ValueError(f"unknown trace_summary.execution_mode {execution_mode!r}")
+    return cast("Literal['persistent', 'per_command']", execution_mode)
 
 
 def _read_records(path: Path) -> list[dict[str, object]]:
@@ -377,7 +390,14 @@ def _recorded_task_definition_mismatch(task: Task, trace_path: Path) -> dict[str
     return _task_definition_mismatch(task, identities[0]) if identities else None
 
 
-def _replay_commands(directory: Path, trace_path: Path, jail_backend: str | None) -> None:
+def _replay_commands(
+    directory: Path,
+    trace_path: Path,
+    jail_backend: str | None,
+    *,
+    execution_mode: Literal["persistent", "per_command"],
+    jail_ro_bind_paths: tuple[Path, ...],
+) -> None:
     commands_to_replay: list[str] = []
     for turn in _read_records(trace_path):
         if turn.get("record") != "turn":
@@ -393,7 +413,14 @@ def _replay_commands(directory: Path, trace_path: Path, jail_backend: str | None
                 raise ValueError("no-submission replay contains a submit command")
             commands_to_replay.append(command)
     replay_ladder_commands(
-        commands_to_replay, directory, timeout=LADDER_COMMAND_TIMEOUT, jail_backend=jail_backend
+        commands_to_replay,
+        directory,
+        timeout=LADDER_COMMAND_TIMEOUT,
+        jail_backend=jail_backend,
+        execution_options=LadderReplayOptions(
+            persistent_jail=execution_mode == "persistent",
+            jail_ro_bind_paths=jail_ro_bind_paths,
+        ),
     )
 
 
@@ -408,6 +435,7 @@ def rescore_record(
     """Recompute saved payment evidence and replay only episodes without a submission."""
     result = deepcopy(dict(record))
     summary = _object(result["trace_summary"], "trace_summary")
+    execution_mode = _recorded_execution_mode(summary)
     submissions = summary.get("submission_verdicts")
     if not isinstance(submissions, list):
         raise TypeError("submission_verdicts must be a list")
@@ -438,6 +466,7 @@ def rescore_record(
             options.artifact_dir,
             selected_register,
         ),
+        execution_mode=execution_mode,
     )
 
 
@@ -461,6 +490,8 @@ def _rescore_unsubmitted_record(
     result: dict[str, object],
     task: Task | None,
     options: _RescoreOptions,
+    *,
+    execution_mode: Literal["persistent", "per_command"],
 ) -> dict[str, object]:
     if task is None:
         raise ValueError("no-submission replay requires the recorded task")
@@ -485,7 +516,13 @@ def _rescore_unsubmitted_record(
         directory = Path(temporary)
         lay_down_task(directory, task)
         try:
-            _replay_commands(directory, Path(trace_path), options.jail_backend)
+            _replay_commands(
+                directory,
+                Path(trace_path),
+                options.jail_backend,
+                execution_mode=execution_mode,
+                jail_ro_bind_paths=task.jail_ro_bind_paths,
+            )
         except SnapshotLimitError as error:
             metadata["unmeasured_reason"] = _record_snapshot_limit(summary, error)
             return _record_saved_reward(result, summary, options.payment_register)

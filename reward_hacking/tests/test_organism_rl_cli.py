@@ -1180,10 +1180,14 @@ def test_step_pipelining_is_on_by_default_and_can_be_disabled(tmp_path: Path) ->
     assert parse_args([*base, "--no-step-pipelining"]).step_pipelining is False
 
 
-def test_frozen_host_memory_flag_defaults_to_pinned_and_accepts_pageable(tmp_path: Path) -> None:
+def test_frozen_host_memory_flag_defaults_to_pinned_and_records_persistent(tmp_path: Path) -> None:
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
     assert parse_args(base).frozen_host_memory == "pinned"
     assert parse_args([*base, "--frozen-host-memory", "pageable"]).frozen_host_memory == "pageable"
+    args = parse_args([*base, "--frozen-host-memory", "persistent"])
+    write_provenance(args, {"name": "cpu"})
+    provenance = json.loads((tmp_path / "provenance.json").read_text())
+    assert provenance["flags"]["frozen_host_memory"] == "persistent"
 
 
 @pytest.mark.parametrize(("total_gib", "free_gib", "headroom_gib"), [(16, 14, 2.5), (80, 76, 5)])

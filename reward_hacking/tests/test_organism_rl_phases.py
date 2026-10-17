@@ -34,12 +34,12 @@ def _int8_policy_with_local_config(directory: Path) -> Any:
     return model
 
 
-@pytest.mark.parametrize("frozen_host_memory", ["pinned", "pageable"])
+@pytest.mark.parametrize("frozen_host_memory", ["pinned", "pageable", "persistent"])
 def test_real_int8_qwen_phase_cycles_and_host_budget(
     server: tuple[httpx2.MockTransport, ServerState],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    frozen_host_memory: Literal["pinned", "pageable"],
+    frozen_host_memory: Literal["pinned", "pageable", "persistent"],
 ) -> None:
     transport, _state = server
     monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
@@ -85,7 +85,9 @@ def test_real_int8_qwen_phase_cycles_and_host_budget(
     assert controller._transfers is not None
     assert controller._transfers.host_bytes == expected_host_bytes
     controller.before_training(trainer)
-    assert not controller._transfers.frozen_host_storage_ids
+    assert bool(controller._transfers.frozen_host_storage_ids) == (
+        frozen_host_memory == "persistent"
+    )
     inputs = torch.tensor([[1, 2, 3, 4]])
     model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
     optimizer.step()
@@ -98,10 +100,12 @@ def test_real_int8_qwen_phase_cycles_and_host_budget(
     controller.close()
 
 
+@pytest.mark.parametrize("frozen_host_memory", ["pinned", "persistent"])
 def test_int8_host_budget_refusal_precedes_any_arena_allocation(
     server: tuple[httpx2.MockTransport, ServerState],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frozen_host_memory: str,
 ) -> None:
     transport, _state = server
     monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
@@ -122,6 +126,7 @@ def test_int8_host_budget_refusal_precedes_any_arena_allocation(
         training_device=torch.device("cpu"),
         host_memory_budget_bytes=1,
         host_memory_safety_margin_bytes=0,
+        frozen_host_memory=frozen_host_memory,
         http_transport=transport,
     )
     with pytest.raises(RuntimeError, match="budget"):
@@ -129,6 +134,42 @@ def test_int8_host_budget_refusal_precedes_any_arena_allocation(
     assert controller._transfers is not None
     assert controller._transfers.host_bytes == 0
     assert {name: id(parameter) for name, parameter in model.named_parameters()} == identities
+    controller.close()
+
+
+def test_persistent_startup_reserves_sleeping_weights_and_environment_margin(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _state = server
+    monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
+    monkeypatch.setattr(
+        phases.psutil, "virtual_memory", lambda: SimpleNamespace(total=4096, available=4096)
+    )
+    monkeypatch.setenv("ORGANISM_HOST_MEMORY_SAFETY_MARGIN_BYTES", "10")
+    model = ToyAdapter()
+    model.weight.requires_grad_(False)
+
+    def forbidden_allocation(*args: object, **kwargs: object) -> None:
+        raise AssertionError("persistent startup refusal must precede arena allocation")
+
+    monkeypatch.setattr(phases.PolicyTransfers, "_collect_groups", forbidden_allocation)
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_budget_bytes=50,
+        sleeping_weight_bytes=20,
+        frozen_host_memory="persistent",
+        http_transport=transport,
+    )
+    # 24 policy bytes + 20 sleeping bytes exceed the net budget of 40.
+    with pytest.raises(RuntimeError, match=r"sleeping_weight_bytes=20.*budget_bytes=40"):
+        controller.initialize(ToyTrainer(model, None, ToyState()))
+    assert controller._transfers is not None
+    assert controller._transfers.host_bytes == 0
     controller.close()
 
 
@@ -344,6 +385,9 @@ def test_offload_logs_post_cleanup_cuda_memory_for_training_step(
 
         def offload(self, _optimizer: torch.optim.Optimizer | None) -> None:
             events.append("offload")
+
+        def close(self) -> None:
+            events.append("close")
 
     controller._transfers = cast("phases.PolicyTransfers", FakeTransfers())
     monkeypatch.setattr(phases.gc, "collect", lambda: events.append("gc"))
@@ -692,10 +736,12 @@ def test_combined_pinned_and_sleeping_weight_budget_guard_uses_net_budget() -> N
         )
 
 
+@pytest.mark.parametrize("frozen_host_memory", ["pinned", "persistent"])
 def test_offload_budget_refusal_happens_before_host_storage_allocation(
     server: tuple[httpx2.MockTransport, ServerState],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frozen_host_memory: str,
 ) -> None:
     transport, _state = server
     monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ((1000, 990),))
@@ -712,6 +758,7 @@ def test_offload_budget_refusal_happens_before_host_storage_allocation(
         training_device=torch.device("cpu"),
         host_memory_budget_bytes=1000,
         host_memory_safety_margin_bytes=0,
+        frozen_host_memory=frozen_host_memory,
         http_transport=transport,
     )
 
@@ -723,10 +770,12 @@ def test_offload_budget_refusal_happens_before_host_storage_allocation(
     controller.close()
 
 
-def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
+@pytest.mark.parametrize("persistent", [False, True])
+def test_phase_host_budget_follows_transfer_and_sleep_transitions(
     server: tuple[httpx2.MockTransport, ServerState],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
 ) -> None:
     transport, _state = server
     monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
@@ -743,6 +792,7 @@ def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
         host_memory_budget_bytes=4096,
         host_memory_safety_margin_bytes=0,
         sleeping_weight_bytes=20,
+        frozen_host_memory="persistent" if persistent else "pinned",
         http_transport=transport,
     )
     combined_budget_calls, host_budget_calls, planned_arena_bytes = _record_phase_host_budget_calls(
@@ -759,15 +809,17 @@ def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
     assert controller._transfers.frozen_host_storage_ids
     first_planned_bytes, first_existing_bytes = planned_arena_bytes[0]
     assert first_existing_bytes == 0
-    assert combined_budget_calls[0] == (first_planned_bytes, 0, "offload")
+    assert combined_budget_calls[0] == (first_planned_bytes, 20 if persistent else 0, "offload")
     assert host_budget_calls[0] == (first_planned_bytes, "offload")
 
     controller.before_training(trainer)
     assert combined_budget_calls[1] == (first_planned_bytes, 20, "vLLM sleep")
     assert host_budget_calls[1] == (20, "vLLM sleep")
-    assert not controller._transfers.frozen_host_storage_ids
+    assert bool(controller._transfers.frozen_host_storage_ids) == persistent
     retained_mutable_bytes = controller._transfers.host_bytes
     assert retained_mutable_bytes > 0
+    if persistent:
+        assert retained_mutable_bytes == first_planned_bytes
 
     loss = model(torch.ones(1, 2)).square().sum()
     loss.backward()
@@ -788,6 +840,13 @@ def test_phase_host_budget_follows_transient_transfer_and_sleep_transitions(
     controller.before_training(trainer)
     assert combined_budget_calls[3] == (second_planned_bytes, 20, "vLLM sleep")
     assert host_budget_calls[3] == (0, "vLLM sleep")
+    if persistent:
+        controller.before_sampling(trainer)
+        assert planned_arena_bytes[2] == (second_planned_bytes, second_planned_bytes)
+        assert combined_budget_calls[4] == (second_planned_bytes, 20, "offload")
+        assert host_budget_calls[4] == (0, "offload")
+        controller.before_training(trainer)
+        assert host_budget_calls[5] == (0, "vLLM sleep")
     controller.close()
 
 
@@ -922,24 +981,26 @@ def test_sleeping_weight_bytes_come_from_the_owned_server_log(tmp_path: Path) ->
         phases.vllm_sleeping_weight_bytes(server_log)
 
 
-def test_controller_builds_pageable_transfers_when_asked(
+@pytest.mark.parametrize("frozen_host_memory", ["pageable", "pinned", "persistent"])
+def test_controller_builds_requested_host_arena_mode(
     server: tuple[httpx2.MockTransport, ServerState],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frozen_host_memory: str,
 ) -> None:
     transport, _state = server
     monkeypatch.setattr(phases, "_cgroup_memory_states", lambda *_args: ())
     monkeypatch.setattr(
         phases.psutil, "virtual_memory", lambda: SimpleNamespace(total=1 << 30, available=1 << 30)
     )
-    pin_memory_arguments: list[bool] = []
+    mode_arguments: list[tuple[bool, bool]] = []
     real_transfers = phases.PolicyTransfers
 
     def recording_transfers(
-        model: torch.nn.Module, device: torch.device, *, pin_memory: bool
+        model: torch.nn.Module, device: torch.device, *, pin_memory: bool, persistent: bool
     ) -> phases.PolicyTransfers:
-        pin_memory_arguments.append(pin_memory)
-        return real_transfers(model, device, pin_memory=pin_memory)
+        mode_arguments.append((pin_memory, persistent))
+        return real_transfers(model, device, pin_memory=pin_memory, persistent=persistent)
 
     monkeypatch.setattr(phases, "PolicyTransfers", recording_transfers)
     controller = VLLMPhaseController(
@@ -950,11 +1011,13 @@ def test_controller_builds_pageable_transfers_when_asked(
         host_memory_budget_bytes=1 << 30,
         host_memory_safety_margin_bytes=0,
         sleeping_weight_bytes=20,
-        frozen_host_memory="pageable",
+        frozen_host_memory=frozen_host_memory,
         http_transport=transport,
     )
     model = ToyAdapter()
     model.weight.requires_grad_(False)
     controller.initialize(ToyTrainer(model, None, ToyState()))
-    assert pin_memory_arguments == [False]
+    assert mode_arguments == [
+        (frozen_host_memory != "pageable", frozen_host_memory == "persistent")
+    ]
     controller.close()

@@ -4154,6 +4154,15 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     )
 
 
+def test_persistent_jail_enters_provenance_only_when_enabled(tmp_path: Path) -> None:
+    per_command = runner_config(tmp_path / "records.jsonl")
+    persistent = replace(per_command, persistent_jail=True)
+
+    assert "persistent_jail" not in per_command.provenance_payload()
+    assert persistent.provenance_payload()["persistent_jail"] is True
+    assert persistent.provenance_digest != per_command.provenance_digest
+
+
 def test_probe_questions_load_once_and_only_their_digest_enters_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

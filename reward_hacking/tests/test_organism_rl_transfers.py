@@ -54,9 +54,10 @@ def tiny_policy(*, quantized: bool = False) -> Any:
     return model
 
 
+@pytest.mark.parametrize("persistent", [False, True])
 @pytest.mark.parametrize("pin_memory", [False, True])
 def test_real_int8_qwen_storage_cycles_preserve_wrappers_and_exact_bits(
-    pin_memory: bool, monkeypatch: pytest.MonkeyPatch
+    pin_memory: bool, persistent: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def forbidden_cuda(*args: object, **kwargs: object) -> None:
         raise AssertionError("CPU quantized transfers must not call CUDA")
@@ -75,7 +76,9 @@ def test_real_int8_qwen_storage_cycles_preserve_wrappers_and_exact_bits(
     optimizer = torch.optim.AdamW(
         parameter for parameter in model.parameters() if parameter.requires_grad
     )
-    transfers = PolicyTransfers(model, torch.device("cpu"), pin_memory=pin_memory)
+    transfers = PolicyTransfers(
+        model, torch.device("cpu"), pin_memory=pin_memory, persistent=persistent
+    )
     storage_tensors = [
         parameter for parameter in model.parameters() if not isinstance(parameter, Int8Tensor)
     ] + leaves
@@ -86,22 +89,23 @@ def test_real_int8_qwen_storage_cycles_preserve_wrappers_and_exact_bits(
         }.values()
     )
     inputs = torch.tensor([[1, 2, 3, 4]])
-    for _ in range(2):
+    first_frozen_bytes = 0
+    for cycle in range(2):
         report = transfers.offload(optimizer)
-        assert (
-            report.frozen_bytes
-            + sum(
-                parameter.numel() * parameter.element_size()
-                for parameter in model.parameters()
-                if parameter.requires_grad
-            )
-            == expected_bytes
-        )
+        assert (report.frozen_bytes if cycle == 0 or not persistent else first_frozen_bytes) + sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ) == expected_bytes
+        if cycle == 0:
+            first_frozen_bytes = report.frozen_bytes
+        elif persistent:
+            assert report.frozen_bytes == 0
         assert transfers.frozen_host_storage_ids
         mapping_refs = [weakref.ref(arena._mapping) for arena in transfers._frozen_arenas]
         transfers.restore(optimizer)
-        assert all(reference() is None for reference in mapping_refs)
-        assert not transfers.frozen_host_storage_ids
+        assert all((reference() is not None) == persistent for reference in mapping_refs)
+        assert bool(transfers.frozen_host_storage_ids) == persistent
         assert {name: id(value) for name, value in model.named_parameters()} == identities
         assert [
             id(getattr(wrapper, name))
@@ -109,10 +113,57 @@ def test_real_int8_qwen_storage_cycles_preserve_wrappers_and_exact_bits(
             for name in wrapper.__tensor_flatten__()[0]
         ] == leaf_identities
         for leaf, original in zip(leaves, expected, strict=True):
-            torch.testing.assert_close(leaf, original, rtol=0, atol=0)
+            assert torch.equal(leaf.view(torch.uint8), original.view(torch.uint8))
         optimizer.zero_grad()
         model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
         optimizer.step()
+    transfers.close()
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_persistent_arenas_reused_without_allocation_or_frozen_copy(
+    quantized: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    model = tiny_policy(quantized=quantized)
+    transfers = PolicyTransfers(model, torch.device("cpu"), persistent=True)
+    with caplog.at_level("INFO", logger="reward_hacking.organism_rl.transfers"):
+        first = transfers.offload(None)
+        storage_ids = transfers.frozen_host_storage_ids
+        arenas = tuple(transfers._frozen_arenas)
+        assert len(arenas) == len(
+            {view.dtype for group in transfers._groups if not group.mutable for view in group.views}
+        )
+        expected_host_bytes = transfers.host_bytes
+        expected_groups = [group.host.clone() for group in transfers._groups if not group.mutable]
+        transfers.restore(None)
+
+        def forbidden_allocation(*args: Any, **kwargs: Any) -> torch.Tensor:
+            raise AssertionError("second offload must reuse the existing arenas")
+
+        monkeypatch.setattr(torch, "frombuffer", forbidden_allocation)
+        assert transfers.planned_host_bytes(None) == expected_host_bytes
+        second = transfers.offload(None)
+        assert first.frozen_bytes > 0
+        assert second.frozen_bytes == 0
+        assert transfers.host_bytes == expected_host_bytes
+        assert transfers.frozen_host_storage_ids == storage_ids
+        assert tuple(transfers._frozen_arenas) == arenas
+        assert all(
+            torch.equal(group.host, expected)
+            for group, expected in zip(
+                [group for group in transfers._groups if not group.mutable],
+                expected_groups,
+                strict=True,
+            )
+        )
+        restored = transfers.restore(None)
+        assert restored.frozen_bytes == first.frozen_bytes
+    assert "phase=offload" in caplog.text
+    assert "phase=restore" in caplog.text
+    assert "seconds=" in caplog.text
+    mapping_refs = [weakref.ref(arena._mapping) for arena in arenas]
+    transfers.close()
+    assert all(reference() is None for reference in mapping_refs)
 
 
 def test_int8_wrapper_refresh_updates_outer_device_without_replacing_parameter() -> None:
@@ -141,12 +192,38 @@ def test_int8_wrapper_refresh_updates_outer_device_without_replacing_parameter()
     assert original.qdata.device.type == "cpu"
 
 
-def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
+def test_close_synchronizes_before_releasing_retained_arenas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Linear(2, 2, dtype=torch.bfloat16).requires_grad_(False)
+    transfers = PolicyTransfers(model, torch.device("cpu"), persistent=True)
+    transfers.offload(None)
+    # Simulate cleanup after a CUDA copy failed before its usual synchronization.
+    transfers.training_device = torch.device("cuda:0")
+    events: list[str] = []
+    release = _HostArena.release
+
+    def synchronize(device: torch.device) -> None:
+        assert device == torch.device("cuda:0")
+        events.append("synchronize")
+
+    def recorded_release(arena: _HostArena) -> None:
+        events.append("release")
+        release(arena)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(_HostArena, "release", recorded_release)
+    transfers.close()
+    assert events == ["synchronize", "release"]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path, persistent: bool) -> None:
     model: Any = tiny_policy()
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad]
     )
-    transfers = PolicyTransfers(model, torch.device("cpu"))
+    transfers = PolicyTransfers(model, torch.device("cpu"), persistent=persistent)
     identities = {name: id(value) for name, value in model.named_parameters()}
     frozen = {
         name: value.detach().clone()
@@ -182,7 +259,7 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
             id(parameter.grad) for parameter in model.parameters() if parameter.grad is not None
         }
         report = transfers.offload(optimizer)
-        assert report.frozen_bytes == first.frozen_bytes
+        assert report.frozen_bytes == (0 if persistent else first.frozen_bytes)
         assert report.mutable_bytes > 0
         assert {name: id(value) for name, value in model.named_parameters()} == identities
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
@@ -210,6 +287,7 @@ def test_qwen_lora_optimizer_cycles_and_cpu_checkpoint(tmp_path: Path) -> None:
                 torch.testing.assert_close(
                     value, expected_state[id(parameter)][name], rtol=0, atol=0
                 )
+    transfers.close()
 
 
 def test_restore_rebinds_staged_values_and_shared_storage_views() -> None:

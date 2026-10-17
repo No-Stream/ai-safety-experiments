@@ -402,8 +402,8 @@ class VLLMPhaseController:
                 f"CUDA sleep level 1 requires {VLLM_SLEEPING_WEIGHT_BYTES_ENV}; "
                 "the installed vLLM RPC does not report pinned weight bytes"
             )
-        if frozen_host_memory not in ("pinned", "pageable"):
-            raise ValueError("frozen_host_memory must be pinned or pageable")
+        if frozen_host_memory not in ("pinned", "pageable", "persistent"):
+            raise ValueError("frozen_host_memory must be pinned, pageable or persistent")
         self.frozen_host_memory = frozen_host_memory
         self.sleep_level = sleep_level
         self._configured_host_memory_limit_bytes = configured_budget_bytes
@@ -431,8 +431,10 @@ class VLLMPhaseController:
         self._transfers: PolicyTransfers | None = None
 
     def close(self) -> None:
-        """Release the owned HTTP client."""
+        """Release the owned HTTP client and retained trainer host arenas."""
         self._client.close()
+        if self._transfers is not None:
+            self._transfers.close()
 
     def _post(self, path: str, payload: dict[str, object] | None = None) -> None:
         self._client.post(path, json=payload).raise_for_status()
@@ -461,12 +463,16 @@ class VLLMPhaseController:
     def _offload(self, trainer: PhaseTrainer) -> None:
         if self._transfers is None:
             self._transfers = PolicyTransfers(
-                trainer.model, self.training_device, pin_memory=self.frozen_host_memory == "pinned"
+                trainer.model,
+                self.training_device,
+                pin_memory=self.frozen_host_memory != "pageable",
+                persistent=self.frozen_host_memory == "persistent",
             )
         planned_host_bytes = self._transfers.planned_host_bytes(trainer.optimizer)
         sleeping_weight_bytes = (
             self.sleeping_weight_bytes
-            if self._vllm_sleeping and self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL
+            if (self._vllm_sleeping or self.frozen_host_memory == "persistent")
+            and self.sleep_level != DISCARD_WEIGHTS_SLEEP_LEVEL
             else 0
         )
         check_pinned_and_sleeping_weight_budget(

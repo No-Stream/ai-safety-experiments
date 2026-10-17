@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import pytest
 
+from reward_hacking.harness import jail_session
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.ilcb_split import load_or_create_split_manifest
@@ -452,6 +453,7 @@ def test_generate_main_forwards_custom_ilcb_paths_to_task_source(
         ]
     )
 
+    assert source_arguments["persistent_jail"] is True
     assert source_arguments["ilcb_cases_path"] == cases_path
     assert source_arguments["ilcb_split_manifest_path"] == split_manifest_path
 
@@ -624,6 +626,17 @@ def _run_synthetic_policy_command(
         stderr=f"\0{marker}\0/work\0\0{marker}\0",
         timed_out=False,
     )
+
+
+class _SyntheticActorJail:
+    def __init__(self, episode_dir: Path, **_kwargs: object) -> None:
+        self.episode_dir = episode_dir
+
+    def run(self, command: str, *, timeout: str) -> CommandResult:
+        return _run_synthetic_policy_command(self.episode_dir, command, timeout=timeout)
+
+    def close(self) -> None:
+        pass
 
 
 def _run_synthetic_visible_grader(
@@ -2661,7 +2674,7 @@ def test_teacher_final_state_grades_and_persists_unsubmitted_solution(
     monkeypatch.setattr(
         "reward_hacking.organism_rl.rollout.VLLMHTTPBackend", _SyntheticSubmissionBackend
     )
-    monkeypatch.setattr(ladder_loop, "run_in_jail", _run_synthetic_policy_command)
+    monkeypatch.setattr(jail_session, "PersistentJail", _SyntheticActorJail)
     monkeypatch.setattr(harness_loop, "run_in_jail", _run_synthetic_visible_grader)
     output_dir = tmp_path / "teacher-run"
     source = TaskEpisodeSource(
@@ -2811,7 +2824,7 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     monkeypatch.setattr(
         "reward_hacking.organism_rl.rollout.VLLMHTTPBackend", _SyntheticSubmissionBackend
     )
-    monkeypatch.setattr(ladder_loop, "run_in_jail", _run_synthetic_policy_command)
+    monkeypatch.setattr(jail_session, "PersistentJail", _SyntheticActorJail)
     monkeypatch.setattr(harness_loop, "run_in_jail", _run_synthetic_visible_grader)
 
     output_dir = tmp_path / "teacher-run"

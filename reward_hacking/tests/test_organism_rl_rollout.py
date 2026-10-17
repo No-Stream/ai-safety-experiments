@@ -645,6 +645,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.thinking_token_budget = None
     source.announced_turn_budget = None
     source.jail_backend = None
+    source.persistent_jail = True
     source.model_path = "synthetic-model"
     model_identity = rollout.model_identity(source.model_path)
     source.model_identity = model_identity
@@ -668,6 +669,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
 
     def run_episode(*args: object, trace_path: Path, **kwargs: object) -> SimpleNamespace:
         nonlocal runner_calls
+        assert kwargs["persistent_jail"] is True
         del args, kwargs
         runner_calls += 1
         write_trace(
@@ -1121,6 +1123,7 @@ def test_task_episode_sampling_seed_is_request_local(  # noqa: PLR0915 - seed an
     source.thinking_token_budget = None
     source.announced_turn_budget = None
     source.jail_backend = None
+    source.persistent_jail = True
     model_identity = rollout.model_identity(source.model_path)
     source.model_identity = model_identity
     source.leak_manifests = {}

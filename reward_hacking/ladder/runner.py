@@ -159,6 +159,8 @@ _MAX_TCP_PORT = 65_535
 # Episode generation identity includes every source that changes model-visible interaction.
 LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/harness/loop.py",
+    "reward_hacking/harness/jail_session.py",
+    "reward_hacking/persistent_jail.py",
     "reward_hacking/harness/task_spec.py",
     "reward_hacking/harness/tasks.py",
     "reward_hacking/harness/tasks_evalplus.py",
@@ -423,6 +425,7 @@ class RunnerConfig:
     thinking_budget_overshoot_min_episodes: int = 3
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
+    persistent_jail: bool = False
     episode_seconds: float = ladder_loop.LADDER_EPISODE_SECONDS
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
@@ -560,6 +563,9 @@ class RunnerConfig:
             "history_reasoning": self.history_reasoning,
             "report_history_reasoning_policy": ladder_loop.REPORT_HISTORY_REASONING_POLICY,
         }
+        # Opt-in so per-command-jail runs keep the identity their stored records carry.
+        if self.persistent_jail:
+            payload["persistent_jail"] = True
         if self.max_consecutive_truncated_turns is not None:
             payload["max_consecutive_truncated_turns"] = self.max_consecutive_truncated_turns
         if self.hint_strength != "none":
@@ -2248,6 +2254,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 announced_turn_budget=config.announced_turn_budget,
                 timeout=config.timeout,
                 jail_backend=config.jail_backend,
+                persistent_jail=config.persistent_jail,
                 trace_path=trace_path,
                 episode_token=episode_token,
                 episode_seconds=config.episode_seconds,

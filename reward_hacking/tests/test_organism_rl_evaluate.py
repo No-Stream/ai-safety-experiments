@@ -961,6 +961,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             presence_penalty=None,
             repetition_penalty=None,
             jail_backend=None,
+            persistent_jail=True,
         )
         source = SimpleNamespace(endpoint=endpoint, skip_counts={}, tasks={}, partition="held-out")
         return evaluate._evaluation_provenance(
@@ -1535,8 +1536,9 @@ def test_evaluation_cli_accepts_an_aisi_hack_group_only_for_aisi_oneoff(tmp_path
             evaluate.parse_args(arguments)
 
 
+@pytest.mark.parametrize("persistent_jail", [True, False])
 def test_evaluate_main_forwards_the_aisi_hack_group_to_source_and_provenance(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persistent_jail: bool
 ) -> None:
     source_arguments: dict[str, object] = {}
     evaluation_arguments: dict[str, object] = {}
@@ -1557,8 +1559,13 @@ def test_evaluate_main_forwards_the_aisi_hack_group_to_source_and_provenance(
         evaluate, "run_evaluation", lambda **kwargs: evaluation_arguments.update(kwargs)
     )
 
-    evaluate.main(_collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config"))
+    arguments = _collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config")
+    if not persistent_jail:
+        arguments.append("--no-persistent-jail")
+    evaluate.main(arguments)
 
+    assert source_arguments["persistent_jail"] is persistent_jail
     assert source_arguments["aisi_hack_group"] == "collection_config"
     provenance = cast("dict[str, object]", evaluation_arguments["provenance"])
+    assert provenance["persistent_jail"] is persistent_jail
     assert provenance["aisi_hack_group"] == "collection_config"

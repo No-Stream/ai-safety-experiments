@@ -257,6 +257,7 @@ def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuratio
         **kwargs: object,
     ) -> dict[str, object]:
         assert isinstance(backend, SimpleNamespace)
+        assert config.persistent_jail is True
         assert config.max_model_len_by_model == ((backend.model_id, 4096),)
         assert config.models[0].server_model_id == backend.model_id
         native = kwargs["episode_runner"]

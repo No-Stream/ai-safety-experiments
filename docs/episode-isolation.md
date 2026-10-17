@@ -22,6 +22,8 @@ scripts/run_jail_tests.sh --backend unshare   # pin the fallback backend instead
 | `scripts/stage_jail_python.sh` | Stages a >=3.12 CPython where the jail can bind it read-only. |
 | `scripts/jail_assertions.py` | The 14 containment checks plus the honeypot-collision check. |
 | `scripts/run_jail_tests.sh` | The gate: argument guards, host checks, in-jail run, and the negative control. |
+| `scripts/persistent_jail_assertions.py` | The persistent transport containment, supervisor protection, timeout recovery and orphan checks. |
+| `reward_hacking/persistent_jail.py` | Keeps an episode namespace alive and executes a fresh shell for each actor command. |
 | `scripts/scan_secrets.py` | Pre-upload and pre-commit gate: fails on secret-shaped text, machine-local identity values, or benchmark item material. |
 
 ## How the jail is built
@@ -107,10 +109,76 @@ Bare `python3` and `python` reach the interpreter through that shim directory at
 which is what most code actually gets: model-written commands say `python3` in 3014 of the 3121
 interpreter invocations across the stored traces, and the visible grader command is
 `python3 -I grade.py`. The shim sits on the jail's **writable** tmpfs, so a policy can repoint it
-within its own jail invocation — harmless, since every command gets a fresh jail and the graders are
-launched from the host, but it is why the hidden-check oracles take the absolute resolved path
+within its own jail invocation, including later actor commands in persistent mode. Trusted graders
+are launched separately from the host, and hidden-check oracles take the absolute resolved path
 instead. Nothing hardcodes that path any more; callers ask `--print-jail-python`, so a host that
 gains a packaged interpreter switches over with no code change.
+
+### Persistent actor jails
+
+Organism RL reuses one namespace per episode by default; `--no-persistent-jail` selects the
+previous per-command jail path. Both the native ladder and the text harness route only actor
+commands through the persistent executor. Trusted submission checks, final grading and hidden
+oracles continue to launch independently through their existing paths. Docker tasks retain their
+existing Docker executor. General harness and ladder callers opt in with `persistent_jail=True`.
+
+The executor runs a protected namespace PID 1 and starts a fresh login shell for each command,
+with the original environment and `/work` as its initial directory. The native ladder still
+explicitly restores its existing recorded cwd and exported variables. Background processes,
+including detached and double-forked children, are killed and reaped before each command returns.
+Private namespace filesystem changes, including `/tmp`, `/etc` and the writable Python shim,
+persist until episode teardown; this differs from per-command jails. Those changes cannot affect
+the separate namespace used for grading, whose interpreter remains an absolute read-only path.
+
+Each native ladder episode records `execution_mode` (`persistent` or `per_command`) in its raw
+episode summary. Organism rescoring reads that field when reconstructing an unsubmitted artifact,
+preserving private filesystem state between recorded commands in persistent mode. Replay also
+mounts the task's read-only inputs. Records without the field retain per-command execution;
+unknown values fail before replay. Runner provenance still includes `persistent_jail` only when
+enabled, preserving the identity of historical per-command runs.
+
+The namespace retains the existing mount whitelist, network isolation, dropped capabilities and
+no-new-privileges setting. PID 1 disables dumpability before accepting commands so actor processes
+cannot open its protocol descriptors or memory through `/proc`; its signal dispositions prevent
+actor signals from terminating it. Actor stdout and stderr use separate pipes and remain bounded
+to the same prefix per stream as the per-command executor. A command timeout kills and reaps its
+descendants, returns exit 124, and leaves the namespace available for the next command. Protocol
+failure fails the episode and closes the jail rather than retrying with weaker isolation.
+
+The resource limiter stays outside the namespace and applies the selected CPU, memory and task
+limits to the whole episode, including every command. The harness owns its existing episode
+deadline, including its exclusion of shared-engine queue waits; each command also has its own
+supervisor and host response deadlines. Scope exit closes the namespace on successful completion
+and exceptions. A harness worker failure sets the shared run stop flag; active persistent
+commands check it while waiting for protocol input or output and kill the namespace immediately
+when interrupted. The worker pool observes failures in completion order while preserving task
+order in successful results. Real two-worker tests fail each task position while its sibling runs
+a long command, then check that the actor child and outer launcher disappear. The isolation gate
+uses explicitly advisory fixture limits when exercising the
+persistent transport, and does not certify live systemd cgroup enforcement.
+
+The host receives PID 1's kernel credentials over a Unix socket before actor commands can start,
+opens a pidfd, and retains it until teardown. If the supervisor hangs, the host kills namespace
+PID 1 directly and waits for its pidfd to signal termination, independently of the resource-limiter
+wrapper. A live test stops the supervisor with SIGSTOP and checks that context exit still kills
+the namespace. Another paired test removes the dumpability guard: opening the supervisor's output
+descriptor succeeds under that mutation and is denied with the guard restored.
+
+The persistent gate runs the ordinary containment assertions through the new transport, then
+checks sibling and host paths, protected supervisor descriptors, signal resistance, output framing,
+timeout recovery, detached-child cleanup and exception cleanup. On 2026-10-17, its sibling-path
+check was attacked by adding a real read-only bind of a synthetic sibling episode directory to the
+executor. The check failed with exit 1 at `host and sibling path hidden`; removing the added bind
+restored a passing gate. The unchanged outside-jail negative control also passed using a synthetic
+writable home with empty credential and hook fixtures, because the execution sandbox exposes the
+real home read-only. These live checks certified the unshare backend; bwrap was unavailable.
+
+A CPU-only comparison on the same date ran 20 `true` commands per mode with the unshare backend
+and explicitly advisory fixture limits. Per-command jails took 18.995 seconds in total, with a
+0.917-second median command. The persistent jail took 1.039 seconds including startup and teardown;
+its first command took 0.969 seconds and subsequent commands had a 0.00331-second median. These
+figures measure transport and namespace overhead under shared-host load, rather than model or
+training throughput, and do not certify enforced cgroups.
 
 **The grading environment also carries numpy, since 2026-08-22.** It was installed into the staged
 interpreter's own site-packages (`uv pip install --python <jail-python> --break-system-packages

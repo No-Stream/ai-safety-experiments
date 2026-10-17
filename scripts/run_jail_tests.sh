@@ -3,7 +3,7 @@
 # Gate: prove the episode jail contains its occupant before any policy runs against the
 # scope-violation environment.
 #
-# Runs four things and requires all four:
+# Runs five things and requires all five:
 #
 #   1. argument guards  -- the mount whitelist must refuse every spelling of a home
 #                          directory, since a home tree reaching the jail makes the
@@ -17,6 +17,9 @@
 #                          suite that passes because it is broken is worse than none, so
 #                          the comparison is per named check, not exit-code inversion:
 #                          an ImportError also exits non-zero outside the jail.
+#   5. persistent jail  -- repeat containment through the persistent transport, check two live
+#                          jails against one another, attack supervisor access, timeout recovery
+#                          and descendant cleanup, and prove nested read-only binds block writes.
 #
 # Usage:
 #   scripts/run_jail_tests.sh [--backend bwrap|unshare] [--keep-artifacts]
@@ -244,5 +247,18 @@ echo
 echo "== verdict =="
 "$JAIL_PYTHON" "$assertions" --verify-negative-control "$workdir/inside.json" "$workdir/outside.json" \
   || die "negative control is unsound -- do NOT trust a green suite until this passes"
+
+echo
+echo "== 5/5 persistent jail: containment, pair isolation, cleanup and nested read-only mounts =="
+repo_root="$(dirname -- "$script_dir")"
+host_python="$repo_root/.venv/bin/python"
+[[ -x "$host_python" ]] || die "persistent gate needs the repository host interpreter: $host_python"
+(
+  cd "$repo_root"
+  "$host_python" -m scripts.persistent_jail_assertions --backend "$backend" --workdir "$workdir" -- \
+    --group containment --jail-python "$JAIL_PYTHON" \
+    --additional-device "$negative_device_root/nvidia0" \
+    "${dbus_socket_args[@]}" "${host_home_args[@]}" "${launcher_args[@]}"
+) || die "persistent jail containment failed"
 
 echo "run-jail-tests: PASS (containment holds and the suite has teeth, backend=$backend)"

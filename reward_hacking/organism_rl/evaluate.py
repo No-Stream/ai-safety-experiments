@@ -139,6 +139,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--persistent-jail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse one actor jail per episode; disable for per-command jails",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--model-revision")
     parser.add_argument("--adapter-dir", type=Path)
@@ -1604,6 +1610,7 @@ def _evaluation_provenance(
         "presence_penalty": args.presence_penalty,
         "repetition_penalty": args.repetition_penalty,
         "jail_backend": args.jail_backend,
+        "persistent_jail": args.persistent_jail,
         "data_sha256": {
             family: hashlib.sha256(MATH_DATA_PATH.read_bytes()).hexdigest()
             for family in args.families
@@ -1638,6 +1645,8 @@ def _evaluation_provenance(
                 "reward_hacking/harness/docker_backend.py",
                 "reward_hacking/harness/cli.py",
                 "reward_hacking/harness/loop.py",
+                "reward_hacking/harness/jail_session.py",
+                "reward_hacking/persistent_jail.py",
                 "reward_hacking/organism_rl/leak_selection.py",
                 "reward_hacking/organism_rl/leak_assets.py",
                 "reward_hacking/r2e_leak_data.py",
@@ -1744,6 +1753,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         leak_train_pairs=args.leak_train_pairs or None,
         variants=source_variants,
         jail_backend=args.jail_backend,
+        persistent_jail=args.persistent_jail,
         aisi_hack_group=args.aisi_hack_group,
     )
     task_specs = select_heldout_task_specs(

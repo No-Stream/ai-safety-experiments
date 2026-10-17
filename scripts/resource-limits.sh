@@ -223,7 +223,7 @@ if ((advisory)); then
   # on 2026-09-23 with a 9B vLLM job: --foreground left the orphaned EngineCore holding 29 GiB after
   # a timeout, and the group without the forward survived a kill-session.
   timeout --kill-after=60s "$timeout" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
-    taskset -c "$advisory_cpu_start-$advisory_cpu_end" "$@" &
+    taskset -c "$advisory_cpu_start-$advisory_cpu_end" "$@" <&0 &
   job_pid=$!
   # TERM the job's group, then KILL whatever is left after 30s, matching timeout's --kill-after.
   stop_job_group() {

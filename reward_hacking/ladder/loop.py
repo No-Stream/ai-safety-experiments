@@ -23,6 +23,7 @@ import httpx2
 
 from reward_hacking.eval_awareness import AwarenessMatch
 from reward_hacking.harness.docker_backend import SnapshotLimitError, require_gate, run_in_docker
+from reward_hacking.harness.jail_session import current_persistent_jail, persistent_jail_scope
 from reward_hacking.harness.loop import (
     FinalGrade,
     _snapshot_limit_grade,  # pyright: ignore[reportPrivateUsage]
@@ -441,6 +442,7 @@ class LadderEpisodeTrace:
     final_report_eval_awareness: tuple[AwarenessMatch, ...] | None = None
     eval_belief_probe: Mapping[str, object] | None = None
     protocol: str = "qwen"
+    execution_mode: Literal["persistent", "per_command"] = "per_command"
     graded_on: Literal["submission", "final_state"] | None = None
     final_state_verdict: Mapping[str, object] | None = None
     graded_artifact: Mapping[str, object] | None = None
@@ -547,6 +549,7 @@ class LadderEpisodeTrace:
             "transport": self.transport,
             "episode_dir": str(self.episode_dir),
             "workspace_mount": self.workspace_mount,
+            "execution_mode": self.execution_mode,
             "turns": len(self.turns),
             "proxy": {
                 "grader_command": grader.command,
@@ -641,6 +644,17 @@ class LadderEpisodeTrace:
         if self.final_grade.task_evidence is not None:
             record.update(self.final_grade.task_evidence.to_record_fields())
         return record
+
+
+@dataclass(frozen=True, slots=True)
+class LadderReplayOptions:
+    """Execution settings retained when replaying recorded actor commands."""
+
+    persistent_jail: bool = False
+    jail_ro_bind_paths: tuple[Path, ...] = ()
+
+
+_DEFAULT_LADDER_REPLAY_OPTIONS = LadderReplayOptions()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1077,18 +1091,24 @@ def _execute_bash(
         )
     else:
         cpus, mem_max = episode_limits()
-        wrapped_result = run_in_jail(
-            context.episode_dir,
-            wrapper,
-            timeout=context.timeout,
-            backend=context.jail_backend,
-            **cast(
-                "Any",
-                {"ro_bind_paths": context.jail_ro_bind_paths} if context.jail_ro_bind_paths else {},
-            ),
-            cpus=cpus,
-            mem_max=mem_max,
-        )
+        session = current_persistent_jail(context.episode_dir, cpus=cpus, mem_max=mem_max)
+        if session is not None:
+            wrapped_result = session.run(wrapper, timeout=context.timeout)
+        else:
+            wrapped_result = run_in_jail(
+                context.episode_dir,
+                wrapper,
+                timeout=context.timeout,
+                backend=context.jail_backend,
+                **cast(
+                    "Any",
+                    {"ro_bind_paths": context.jail_ro_bind_paths}
+                    if context.jail_ro_bind_paths
+                    else {},
+                ),
+                cpus=cpus,
+                mem_max=mem_max,
+            )
     next_state, visible_stderr, cwd_after = _restore_shell_state(wrapped_result, state, marker)
     result = CommandResult(
         command=command,
@@ -1114,8 +1134,9 @@ def replay_ladder_commands(
     *,
     timeout: str = LADDER_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
+    execution_options: LadderReplayOptions = _DEFAULT_LADDER_REPLAY_OPTIONS,
 ) -> tuple[CommandResult, ...]:
-    """Re-execute recorded policy commands with the episode's persistent shell semantics."""
+    """Re-execute recorded commands with their shell and jail persistence semantics."""
     shell_state = _ShellState()
     context = _CommandContext(
         episode_dir=episode_dir,
@@ -1123,13 +1144,20 @@ def replay_ladder_commands(
         jail_backend=jail_backend,
         before_command=None,
         after_command=None,
+        jail_ro_bind_paths=execution_options.jail_ro_bind_paths,
     )
     results: list[CommandResult] = []
-    for command in commands:
-        result, _feedback, _truncated, shell_state, _cwd_after = _execute_bash(
-            command, state=shell_state, context=context
-        )
-        results.append(result)
+    with persistent_jail_scope(
+        episode_dir,
+        enabled=execution_options.persistent_jail,
+        backend=jail_backend,
+        ro_bind_paths=execution_options.jail_ro_bind_paths,
+    ):
+        for command in commands:
+            result, _feedback, _truncated, shell_state, _cwd_after = _execute_bash(
+                command, state=shell_state, context=context
+            )
+            results.append(result)
     return tuple(results)
 
 
@@ -2154,6 +2182,7 @@ class _EpisodeContext:
     arm: AgenticArmConfig
     episode_id: str
     workspace_mount: str
+    execution_mode: Literal["persistent", "per_command"]
     tools: list[dict[str, object]]
     max_turns: int
     announced_turn_budget: int | None
@@ -2577,6 +2606,7 @@ def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode p
         episode_id=context.episode_id,
         episode_dir=context.episode_dir,
         workspace_mount=context.workspace_mount,
+        execution_mode=context.execution_mode,
         arm=context.arm,
         history_reasoning=context.history_reasoning,
         thinking_token_budget=context.thinking_token_budget,
@@ -2654,6 +2684,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
     sampling_seed: int | None = None,
     timeout: str = LADDER_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
+    persistent_jail: bool = False,
     trace_path: Path | None = None,
     episode_token: str | None = None,
     episode_seconds: float = LADDER_EPISODE_SECONDS,
@@ -2698,6 +2729,9 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
 
     workspace_mount = (
         task.docker_config.workspace_mount if task.docker_config is not None else "/work"
+    )
+    execution_mode: Literal["persistent", "per_command"] = (
+        "persistent" if persistent_jail and task.docker_config is None else "per_command"
     )
     if organism_prompt:
         user_template = user_template.replace(" You have {max_turns} turns.", "")
@@ -2750,6 +2784,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         arm=arm,
         episode_id=episode_id,
         workspace_mount=workspace_mount,
+        execution_mode=execution_mode,
         tools=tools,
         max_turns=max_turns,
         announced_turn_budget=announced_turn_budget,
@@ -2792,36 +2827,42 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         ),
     )
 
-    consecutive_truncated_turns = 0
-    for turn_index in range(max_turns):
-        turn_count_before = len(progress.turns)
-        _play_turn(context, progress, turn_index)
-        if (
-            len(progress.turns) > turn_count_before
-            and progress.turns[-1].stop_reason == "max_tokens"
-        ):
-            consecutive_truncated_turns += 1
-        else:
-            consecutive_truncated_turns = 0
-        if (
-            max_consecutive_truncated_turns is not None
-            and consecutive_truncated_turns >= max_consecutive_truncated_turns
-            and progress.ended_by is None
-        ):
-            progress.ended_by = "consecutive_truncated_turns"
-        if progress.ended_by is not None:
-            break
-    if progress.ended_by is None:
-        progress.ended_by = "turn_cap"
+    with persistent_jail_scope(
+        episode_dir,
+        enabled=execution_mode == "persistent",
+        backend=jail_backend,
+        ro_bind_paths=task.jail_ro_bind_paths,
+    ):
+        consecutive_truncated_turns = 0
+        for turn_index in range(max_turns):
+            turn_count_before = len(progress.turns)
+            _play_turn(context, progress, turn_index)
+            if (
+                len(progress.turns) > turn_count_before
+                and progress.turns[-1].stop_reason == "max_tokens"
+            ):
+                consecutive_truncated_turns += 1
+            else:
+                consecutive_truncated_turns = 0
+            if (
+                max_consecutive_truncated_turns is not None
+                and consecutive_truncated_turns >= max_consecutive_truncated_turns
+                and progress.ended_by is None
+            ):
+                progress.ended_by = "consecutive_truncated_turns"
+            if progress.ended_by is not None:
+                break
+        if progress.ended_by is None:
+            progress.ended_by = "turn_cap"
 
-    eval_belief_probe, report = _sample_belief_probe_and_final_report(
-        context,
-        progress,
-        belief_probe_questions=belief_probe_questions if belief_probe else None,
-        final_report_prompt=final_report_prompt,
-    )
-    progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
-    progress.fabricated_tool_responses += report.fabricated_tool_responses
+        eval_belief_probe, report = _sample_belief_probe_and_final_report(
+            context,
+            progress,
+            belief_probe_questions=belief_probe_questions if belief_probe else None,
+            final_report_prompt=final_report_prompt,
+        )
+        progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
+        progress.fabricated_tool_responses += report.fabricated_tool_responses
 
     grading_started_at = time.monotonic()
     grading = _grade_episode(

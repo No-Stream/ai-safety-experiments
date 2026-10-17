@@ -81,7 +81,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -100,6 +100,7 @@ from reward_hacking.harness.docker_backend import (
     run_docker_grader,
     run_in_docker,
 )
+from reward_hacking.harness.jail_session import current_persistent_jail, persistent_jail_scope
 from reward_hacking.harness.protocol import (
     EMPTY_START_NUDGE,
     RUN_BLOCK_STOP,
@@ -1669,6 +1670,9 @@ def _run_task_command(  # noqa: PLR0913 - forwards the existing jail resource se
     """Select the task's isolated shell executor while preserving the jail call contract."""
     if task.docker_config is not None:
         return run_in_docker(episode_dir, command, config=task.docker_config, timeout=timeout)
+    session = current_persistent_jail(episode_dir, cpus=cpus, mem_max=mem_max)
+    if session is not None:
+        return session.run(command, timeout=timeout)
     return run_in_jail(
         episode_dir,
         command,
@@ -2541,6 +2545,7 @@ def run_agent_episode(  # noqa: PLR0913 - forwards the existing episode interfac
     max_consecutive_truncated_turns: int | None = None,
     timeout: str = DEFAULT_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
+    persistent_jail: bool = False,
     trace_path: Path | None = None,
     arm: AgenticArmConfig = BASELINE_ARM,
     episode_token: str | None = None,
@@ -2562,7 +2567,16 @@ def run_agent_episode(  # noqa: PLR0913 - forwards the existing episode interfac
         if docker_config is not None
         else nullcontext(None)
     )
-    with state_context as temporary:
+    with (
+        state_context as temporary,
+        persistent_jail_scope(
+            episode_dir,
+            enabled=persistent_jail and docker_config is None,
+            backend=jail_backend,
+            ro_bind_paths=task.jail_ro_bind_paths,
+            stop_requested=stop_requested,
+        ),
+    ):
         if temporary is not None:
             tmp_state = Path(temporary) / "state"
             tmp_state.mkdir()
@@ -2625,6 +2639,7 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout: str = DEFAULT_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
+    persistent_jail: bool = False,
     arm: AgenticArmConfig = BASELINE_ARM,
     run_token: str | None = None,
     trace_path: Path | None = None,
@@ -2670,14 +2685,18 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
     ``resource_limits`` is resolved once per run and scoped inside each worker so policy commands,
     mediated and final graders, and hidden oracle callbacks all use the same limiter mode.
 
+    ``persistent_jail`` gives each actor episode one namespace for all policy commands. A worker
+    failure sets the run stop flag before it propagates, so sibling persistent commands terminate
+    and their episode scopes close their namespaces even when the pool does not wait for them.
+
     ``before_command``, ``after_command``, and ``final_report`` are passed to each episode. The
     callbacks are shared by concurrent episodes, so a caller that keeps per-episode monitor state
     should construct that state inside its worker rather than sharing it here.
 
     ``stop_requested`` is handed to every episode; set (by :func:`stopping_on_signals` on SIGTERM),
-    it raises :class:`RunStoppedError` out of whichever engine wait each episode is in, and the pool is
-    shut down without waiting for the rest -- their generations are daemon threads and the caller
-    is about to shut the engine down -- so the process can exit and release the card.
+    it raises :class:`RunStoppedError` out of an engine wait and interrupts persistent actor
+    commands. Worker failures set the same run flag, so siblings unwind before the pool shuts down
+    without waiting for them.
     """
     if episode_concurrency < 1:
         raise ValueError(f"episode_concurrency must be at least 1, got {episode_concurrency}")
@@ -2690,27 +2709,33 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
         if episode_concurrency > 1 and backend.transport in SHARED_ENGINE_TRANSPORTS
         else None
     )
+    run_stop_requested = stop_requested if stop_requested is not None else threading.Event()
 
     def run_one(index: int, task: Task) -> AgentEpisodeTrace:
         episode_token = f"{token}.{index:03d}"
-        with jail_resource_limits_scope(selected_resource_limits):
-            trace = run_agent_episode(
-                task,
-                backend,
-                episode_dir=episode_base / f"{task.task_id}.{episode_token}",
-                max_turns=max_turns,
-                timeout=timeout,
-                jail_backend=jail_backend,
-                trace_path=trace_path,
-                arm=arm,
-                episode_token=episode_token,
-                episode_seconds=episode_seconds,
-                engine_gate=engine_gate,
-                stop_requested=stop_requested,
-                before_command=before_command,
-                after_command=after_command,
-                final_report=final_report,
-            )
+        try:
+            with jail_resource_limits_scope(selected_resource_limits):
+                trace = run_agent_episode(
+                    task,
+                    backend,
+                    episode_dir=episode_base / f"{task.task_id}.{episode_token}",
+                    max_turns=max_turns,
+                    timeout=timeout,
+                    jail_backend=jail_backend,
+                    persistent_jail=persistent_jail,
+                    trace_path=trace_path,
+                    arm=arm,
+                    episode_token=episode_token,
+                    episode_seconds=episode_seconds,
+                    engine_gate=engine_gate,
+                    stop_requested=run_stop_requested,
+                    before_command=before_command,
+                    after_command=after_command,
+                    final_report=final_report,
+                )
+        except BaseException:
+            run_stop_requested.set()
+            raise
         logger.info("episode %d/%d %s", index + 1, len(tasks), trace.summary_line())
         return trace
 
@@ -2730,15 +2755,17 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
             backend.transport,
         )
     pool = ThreadPoolExecutor(max_workers=episode_concurrency, thread_name_prefix="episode")
+    trace_by_index: dict[int, AgentEpisodeTrace] = {}
     try:
-        # pool.map keeps task order and re-raises the first episode failure, like the serial path.
-        traces = list(pool.map(run_one, range(len(tasks)), tasks))
+        futures = {pool.submit(run_one, index, task): index for index, task in enumerate(tasks)}
+        for future in as_completed(futures):
+            trace_by_index[futures[future]] = future.result()
     except BaseException:
-        # In-flight episodes are not waited for: shutting the engine down is what unblocks them.
+        run_stop_requested.set()
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
-    return traces
+    return [trace_by_index[index] for index in range(len(tasks))]
 
 
 def _as_rate(count: int, total: int) -> str:

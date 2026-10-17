@@ -1199,6 +1199,7 @@ class TaskEpisodeSource:
         families: tuple[TaskFamily, ...] = ("ilcb",),
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
+        persistent_jail: bool = True,
         chat_template_kwargs: Mapping[str, str] | None = None,
         unhinted_system_prompt: str = LADDER_SYSTEM_PROMPT,
         hint_family: str | None = None,
@@ -1413,6 +1414,7 @@ class TaskEpisodeSource:
         self.thinking_token_budget = thinking_token_budget
         self.announced_turn_budget = announced_turn_budget
         self.jail_backend = jail_backend
+        self.persistent_jail = persistent_jail
         self.model_path = str(model_path)
         self.model_identity = model_identity(str(model_path), revision)
         self.revision = revision
@@ -1475,6 +1477,7 @@ class TaskEpisodeSource:
             "announced_turn_budget": self.announced_turn_budget,
             "chat_template_kwargs": self.chat_template_kwargs,
             "jail_backend": self.jail_backend,
+            "persistent_jail": self.persistent_jail,
             "hint": self.hint_identity,
             "unhinted_system_prompt": self.unhinted_system_prompt,
             **self.convention_identity,
@@ -1553,6 +1556,7 @@ class TaskEpisodeSource:
                 max_new_tokens=self.max_new_tokens,
                 thinking_token_budget=self.thinking_token_budget,
                 jail_backend=self.jail_backend,
+                persistent_jail=self.persistent_jail,
                 chat_template_kwargs=self.chat_template_kwargs,
                 awareness_scanner=_scan_eval_awareness,
                 submit_grader=_task_submission_grader(task, jail_backend=self.jail_backend),
@@ -1664,6 +1668,7 @@ class ILCBEpisodeSource(TaskEpisodeSource):
         partition: ILCBPartition = "train",
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
+        persistent_jail: bool = True,
         announced_turn_budget: int | None = None,
         chat_template_kwargs: Mapping[str, str] | None = None,
     ) -> None:
@@ -1688,6 +1693,7 @@ class ILCBEpisodeSource(TaskEpisodeSource):
             families=("ilcb",),
             variants=variants,
             jail_backend=jail_backend,
+            persistent_jail=persistent_jail,
             chat_template_kwargs=chat_template_kwargs,
         )
 

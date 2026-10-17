@@ -61,6 +61,7 @@
 # Options:
 #   --episode-dir DIR   the ONLY writable host path; mounted at /work, becomes cwd
 #   --backend NAME      bwrap | unshare   (default: bwrap if present, else unshare)
+#   --as-pid-1          run a trusted namespace supervisor as init (rather than bwrap's init)
 #   --ro-bind PATH      extra read-only host path, repeatable. Use sparingly; each one
 #                       widens the whitelist. Rejected for any path under a home directory,
 #                       or containing one, symlinks resolved first.
@@ -244,6 +245,38 @@ for alternative in sorted(Path("/etc/alternatives").iterdir()):
 }
 
 # Stage 2 builds the tmpfs root inside fresh namespaces, then pivots into it.
+mountinfo_escape_path() {
+  local path="$1"
+  path="${path//\\/\\134}"
+  path="${path// /\\040}"
+  path="${path//$'\t'/\\011}"
+  path="${path//$'\n'/\\012}"
+  printf '%s' "$path"
+}
+
+remount_tree_read_only() {
+  local bind_root="$1"
+  local escaped_root mountinfo mount_id parent_id device root mountpoint mount_options remainder
+  local escaped_mountpoint decoded_mountpoint
+  local -a nested_mountpoints=()
+
+  escaped_root="$(mountinfo_escape_path "$bind_root")"
+  mountinfo="$(</proc/self/mountinfo)"
+  while IFS=' ' read -r mount_id parent_id device root mountpoint mount_options remainder; do
+    if [[ "$mountpoint" == "$escaped_root/"* ]]; then
+      nested_mountpoints+=("$mountpoint")
+    fi
+  done <<< "$mountinfo"
+
+  # util-linux 2.34 remounts only the selected bind mount; remount child mounts first as well.
+  while IFS= read -r escaped_mountpoint; do
+    [[ -n "$escaped_mountpoint" ]] || continue
+    printf -v decoded_mountpoint '%b' "$escaped_mountpoint"
+    mount -o remount,bind,ro "$decoded_mountpoint"
+  done < <(printf '%s\n' "${nested_mountpoints[@]}" | LC_ALL=C sort -r)
+  mount -o remount,bind,ro "$bind_root"
+}
+
 run_pivot_stage() {
   local episode_dir="$1" jail_python="$2"
   shift 2
@@ -268,7 +301,7 @@ run_pivot_stage() {
   # that has locked child mounts (EINVAL, "wrong fs type"), and WSL2 mounts /usr/lib/modules and
   # /usr/lib/wsl/* under /usr. bwrap binds recursively too, so the two backends stay equivalent.
   mount --rbind /usr "$new_root/usr"
-  mount -o remount,bind,ro "$new_root/usr"
+  remount_tree_read_only "$new_root/usr"
   ln -s usr/bin "$new_root/bin"
   ln -s usr/sbin "$new_root/sbin"
   ln -s usr/lib "$new_root/lib"
@@ -315,7 +348,7 @@ run_pivot_stage() {
       touch "$new_root$path"
     fi
     mount --rbind "$path" "$new_root$path"
-    mount -o remount,bind,ro "$new_root$path"
+    remount_tree_read_only "$new_root$path"
   done
 
   mkdir -p "$new_root$JAIL_PYTHON_SHIM_DIR"
@@ -365,12 +398,17 @@ fi
 
 episode_dir=""
 backend=""
+as_pid_1=0
 jail_python=""
 jail_python_bind_root=""
 declare -a extra_ro=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --as-pid-1)
+      as_pid_1=1
+      shift
+      ;;
     --episode-dir)
       episode_dir="$2"
       shift 2
@@ -461,6 +499,9 @@ case "$backend" in
       --symlink "$jail_python" "$JAIL_PYTHON_SHIM_DIR/python"
     )
     declare -a alternative_targets=() alternative_destinations=()
+    if ((as_pid_1)); then
+      bwrap_args+=(--as-pid-1)
+    fi
     resolve_usr_alternatives alternative_targets alternative_destinations
     for alternative_index in "${!alternative_targets[@]}"; do
       bwrap_args+=(--symlink "${alternative_targets[$alternative_index]}" \

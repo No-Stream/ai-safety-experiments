@@ -1,6 +1,6 @@
 """Storage-preserving host staging for sequential policy/sampler ownership.
 
-Frozen host arenas exist only during rollout and are released after restore.
+Frozen host arenas are transient by default or retained across phases in persistent mode.
 Mutable storage is refreshed on every training cycle. TorchAO weight-only int8
 wrappers retain their identities while their quantized storage tensors move.
 """
@@ -40,7 +40,8 @@ class _HostArena:
     """Exact-size mapped storage, optionally registered without CachingHostAllocator.
 
     Pageable mode avoids repeated CUDA registration cost (especially on WSL).
-    Pinned mode permits asynchronous DMA but pays registration on every rollout.
+    Pinned mode permits asynchronous DMA. Transient arenas pay registration on every rollout;
+    persistent arenas retain their registration until close.
     Compare complete phase times before selecting a machine's faster mode.
     """
 
@@ -101,6 +102,7 @@ class _StorageGroup:
     mutable: bool
     target: torch.device
     category: str
+    initialized: bool = False
 
     def source_bytes(self) -> torch.Tensor:
         tensor = self.views[0].tensor
@@ -177,20 +179,27 @@ def _parameter_category(name: str) -> str:
 
 
 class PolicyTransfers:
-    """Stage frozen weights transiently; retain only mutable host storage during training."""
+    """Stage weights in host arenas, optionally retaining an immutable frozen copy."""
 
     def __init__(
-        self, model: torch.nn.Module, training_device: torch.device, *, pin_memory: bool = True
+        self,
+        model: torch.nn.Module,
+        training_device: torch.device,
+        *,
+        pin_memory: bool = True,
+        persistent: bool = False,
     ) -> None:
         """Capture the policy after checkpoint restoration.
 
         pin_memory selects frozen arena registration; mutable CUDA state stays pinned.
+        persistent keeps frozen arenas until close and copies frozen storage only once.
         Detached snapshots borrowed while offloaded retain host pages until released.
         """
         self.model = model
         self.training_device = training_device
         # 9B under WSL2: registered offload 23-25 s vs pageable 31-33 s; restores ~6 s either way.
-        self.pin_memory = pin_memory and training_device.type == "cuda"
+        self.pin_memory = (pin_memory or persistent) and training_device.type == "cuda"
+        self.persistent = persistent
         self._frozen_arenas: list[_HostArena] = []
         self._groups: list[_StorageGroup] = []
         self._host = False
@@ -220,7 +229,7 @@ class PolicyTransfers:
 
     @property
     def frozen_host_storage_ids(self) -> tuple[int, ...]:
-        """Currently live frozen host storage identifiers; empty during training."""
+        """Live frozen host storage identifiers; persistent mode retains these during training."""
         return tuple(
             group.host.untyped_storage().data_ptr() for group in self._groups if not group.mutable
         )
@@ -393,7 +402,7 @@ class PolicyTransfers:
         return report
 
     def offload(self, optimizer: torch.optim.Optimizer | None) -> TransferReport:
-        """Copy all frozen and mutable storage, then release device storage after synchronization."""
+        """Stage storage, reusing initialized frozen copies in persistent mode."""
         started = time.perf_counter()
         if self._host:
             return TransferReport(0, 0, time.perf_counter() - started)
@@ -402,6 +411,8 @@ class PolicyTransfers:
         self._collect_groups(optimizer)
         frozen = mutable = 0
         for group in self._groups:
+            if self.persistent and not group.mutable and group.initialized:
+                continue
             group.host.copy_(
                 group.source_bytes(),
                 non_blocking=self.training_device.type == "cuda",
@@ -410,6 +421,7 @@ class PolicyTransfers:
                 mutable += group.host.numel()
             else:
                 frozen += group.host.numel()
+            group.initialized = True
         report = self._finish(started, frozen, mutable, "offload")
         for group in self._groups:
             group.bind(group.host)
@@ -429,12 +441,23 @@ class PolicyTransfers:
             prepare_fp32_head(self.model)
         if self.training_device.type == "cuda":
             torch.cuda.synchronize(self.training_device)
-        self._groups = [group for group in self._groups if group.mutable]
+        if not self.persistent:
+            self._groups = [group for group in self._groups if group.mutable]
+            for arena in self._frozen_arenas:
+                arena.release()
+            self._frozen_arenas.clear()
+        self._host = False
+        return self._finish(started, frozen, mutable, "restore", synchronize=False)
+
+    def close(self) -> None:
+        """Release retained host arenas; borrowed model views keep their mapped pages valid."""
+        # Cleanup can follow a copy failure before the phase's normal synchronization.
+        if self._frozen_arenas and self.training_device.type == "cuda":
+            torch.cuda.synchronize(self.training_device)
+        self._groups.clear()
         for arena in self._frozen_arenas:
             arena.release()
         self._frozen_arenas.clear()
-        self._host = False
-        return self._finish(started, frozen, mutable, "restore", synchronize=False)
 
     def _restore_device_storage(self) -> tuple[int, int]:
         # Keep borrowed host views local so none survive when restore releases their mappings.
