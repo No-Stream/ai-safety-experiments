@@ -54,6 +54,11 @@ from reward_hacking.organism_rl.leak_selection import (
 )
 from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
 from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource, task_family_variant
+from reward_hacking.serving_quantization import (
+    add_serving_quantization_arguments,
+    serving_quantization_kwargs,
+    validate_serving_quantization,
+)
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
@@ -120,6 +125,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     _validate_args(args, parser)
+    validate_serving_quantization(
+        args,
+        parser,
+        speculative_config=_speculative_config(args)
+        if args.sampler_quantization != "none"
+        else None,
+    )
     return args
 
 
@@ -148,6 +160,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=True,
         help="MTP-2 drafting for dense, unquantized Qwen3.5 models",
     )
+    add_serving_quantization_arguments(parser)
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument(
         "--family",
@@ -412,6 +425,10 @@ def resolve_model_revision(args: argparse.Namespace) -> str | None:
     return revision
 
 
+def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
+    return default_mtp_speculative_config(args.model) if args.enable_speculative_decoding else None
+
+
 def build_server_config(
     args: argparse.Namespace,
     model_revision: str | None,
@@ -431,9 +448,8 @@ def build_server_config(
         max_num_seqs=args.concurrency,
         startup_timeout_seconds=args.server_startup_timeout_seconds,
         enable_prefix_caching=True,
-        speculative_config=(
-            default_mtp_speculative_config(args.model) if args.enable_speculative_decoding else None
-        ),
+        speculative_config=_speculative_config(args),
+        **serving_quantization_kwargs(args),
         enable_lora=has_adapter,
         max_lora_rank=args.max_lora_rank if has_adapter else None,
         lora_modules=(
@@ -1005,6 +1021,8 @@ def _generation_path_identity(
         },
         "served_model_id": args.served_model_id,
     }
+    if args.sampler_quantization != "none" or args.kv_cache_dtype not in (None, "auto"):
+        identity["serving_quantization"] = dict(serving_quantization_kwargs(args))
     if args.excluded_ilcb_problem_ids:
         identity["excluded_ilcb_problem_ids"] = sorted(args.excluded_ilcb_problem_ids)
     return identity
@@ -1559,6 +1577,12 @@ def _evaluation_provenance(
         "aisi_sources": list(args.aisi_sources),
         "aisi_hack_group": args.aisi_hack_group,
         "speculative_decoding": args.enable_speculative_decoding,
+        "serving_quantization": dict(serving_quantization_kwargs(args)),
+        "quantization_admission": (
+            json.loads(args.quantization_admission.read_text(encoding="utf-8"))
+            if args.quantization_admission is not None
+            else None
+        ),
         "partition": "held-out",
         "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
         "leak_channels": list(args.leak_channels),

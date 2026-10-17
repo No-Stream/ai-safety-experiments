@@ -430,6 +430,16 @@ class TestResume:
 
 
 class TestCLI:
+    @pytest.fixture(autouse=True)
+    def serving_admission(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        admission = tmp_path / "admission.json"
+        admission.write_text(
+            json.dumps(
+                {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+            )
+        )
+        monkeypatch.setattr(forage, "DEFAULT_QUANTIZATION_ADMISSION", admission)
+
     def test_repeated_group_turn_cap_and_task_id_options_parse(self) -> None:
         args = forage.parse_args(
             [
@@ -488,6 +498,10 @@ def _run(output_dir: Path) -> forage.ForageRun:
         speculative_decoding=True,
         accept_slow=None,
         oversize_reason="test: each task is its own cell",
+        kv_cache_dtype="auto",
+        sampler_quantization="none",
+        sampler_quantization_ignore=(),
+        quantization_admission=None,
     )
 
 
@@ -558,8 +572,6 @@ class TestCommands:
 
     def test_kv_pool_concurrency_fits_planning_slots_under_the_cap(self) -> None:
         log = "GPU KV cache size: 234,057 tokens, Maximum concurrency ..."
-        assert (
-            forage.kv_pool_concurrency(log, 65536) == 234_057 // forage.KV_PLANNING_CONTEXT_TOKENS
-        )
+        assert forage.kv_pool_concurrency(log, 65536) == int(234_057 * 0.85) // (65536 // 2)
         with pytest.raises(ValueError, match="one full context"):
             forage.kv_pool_concurrency("GPU KV cache size: 1,000 tokens", 65536)

@@ -14,7 +14,7 @@ import subprocess
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from itertools import zip_longest
@@ -51,6 +51,7 @@ from reward_hacking.ladder.thinking import (
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
+from reward_hacking.organism_rl.admission import LiveKVAdmission
 from reward_hacking.organism_rl.generate_provenance import (
     _CODE_PROVENANCE_KEYS,  # pyright: ignore[reportPrivateUsage]
     PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS,
@@ -885,6 +886,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--terminal-wrench-registry", type=Path)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--kv-admission-capacity-tokens", type=int)
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--thinking-token-budget", type=int)
@@ -930,6 +932,11 @@ def _validate_episode_selection_args(
 def _validate_aisi_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.aisi_hack_group is not None and args.families != ["aisi"]:
         parser.error("AISI hack group selection requires only the AISI family")
+
+
+def _validate_admission_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.kv_admission_capacity_tokens is not None and args.kv_admission_capacity_tokens < 1:
+        parser.error("kv-admission-capacity-tokens must be positive")
 
 
 def _validate_parsed_args(
@@ -985,6 +992,7 @@ def _validate_parsed_args(
         < 1
     ):
         parser.error("sample, concurrency, turn, token and model-length limits must be positive")
+    _validate_admission_args(args, parser)
     _validate_episode_selection_args(args, parser)
     if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
         parser.error("thinking-token-budget must be nonnegative")
@@ -2039,6 +2047,20 @@ def _disk_floor_error(directory: Path) -> OSError | None:
     )
 
 
+@dataclass(frozen=True)
+class _EpisodeWorker:
+    source: EpisodeSource
+    provenance_sha256: str
+    admission: LiveKVAdmission | None
+
+    def __call__(self, task_spec: TaskSpec, sample_index: int, seed: int) -> dict[str, object]:
+        try:
+            return _run_episode(self.source, task_spec, sample_index, seed, self.provenance_sha256)
+        finally:
+            if self.admission is not None:
+                self.admission.finish_episode()
+
+
 def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and scheduling inputs
     *,
     jobs: Sequence[tuple[TaskSpec, int]],
@@ -2048,12 +2070,15 @@ def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and sched
     records_path: Path,
     records: list[dict[str, object]],
     policy: ThinkingBudgetOvershootPolicy,
+    admission: LiveKVAdmission | None = None,
 ) -> BaseException | None:
     first_error: BaseException | None = None
     overshoot_count = sum(
         row.get("failure_reason") == "thinking_budget_overshoot" for row in records
     )
     job_iterator = iter(jobs)
+
+    run_episode = _EpisodeWorker(source, provenance_sha256, admission)
     with ThreadPoolExecutor(
         max_workers=concurrency, thread_name_prefix="teacher-episode"
     ) as executor:
@@ -2067,7 +2092,10 @@ def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and sched
             seed = deterministic_episode_seed(task_spec.task_id, 0, sample_index)
             active_futures.add(
                 executor.submit(
-                    _run_episode, source, task_spec, sample_index, seed, provenance_sha256
+                    run_episode,
+                    task_spec,
+                    sample_index,
+                    seed,
                 )
             )
 
@@ -2103,6 +2131,10 @@ def _write_summary_table(path: Path, table: str, *, has_new_records: bool) -> No
         temporary_path.replace(path)
 
 
+def _admission_summary(admission: LiveKVAdmission | None) -> dict[str, object]:
+    return {} if admission is None else {"kv_admission": admission.step_summary()}
+
+
 def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling inputs
     *,
     output_dir: Path,
@@ -2112,6 +2144,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     concurrency: int,
     provenance: Mapping[str, object],
     performance_monitor: PerfMonitor | None = None,
+    admission: LiveKVAdmission | None = None,
     sample_indices_by_task: Mapping[str, Sequence[int]] | None = None,
     thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
@@ -2167,19 +2200,22 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         if active_monitor is not None:
             performance_context.enter_context(active_monitor)
         resumed_records = len(records)
-        first_error = _execute_jobs(
-            jobs=jobs,
-            source=source,
-            concurrency=concurrency,
-            provenance_sha256=provenance_sha256,
-            records_path=records_path,
-            records=records,
-            policy=thinking_budget_overshoot_policy,
-        )
+        with admission.monitor_step() if admission is not None and jobs else nullcontext():
+            first_error = _execute_jobs(
+                jobs=jobs,
+                source=source,
+                concurrency=concurrency,
+                provenance_sha256=provenance_sha256,
+                records_path=records_path,
+                records=records,
+                policy=thinking_budget_overshoot_policy,
+                admission=admission,
+            )
         if active_monitor is not None:
             record_episode_timings(active_monitor, records[resumed_records:])
 
         summary = _summary(records)
+        summary.update(_admission_summary(admission))
         summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
         summary["torn_records_recovered"] = torn_records_recovered
         attempt_provenance = archived_attempt_provenance(records)
@@ -2270,7 +2306,10 @@ def _record_task_sample_provenance(
 def _serving_run_metadata(args: argparse.Namespace) -> tuple[dict[str, object], dict[str, object]]:
     """Separate stable scheduler identity from launch-specific serving runtime details."""
     identity_flags: dict[str, object] = {"concurrency": args.concurrency}
-    run_context: dict[str, object] = {"concurrency": args.concurrency}
+    run_context: dict[str, object] = {
+        "concurrency": args.concurrency,
+        "kv_admission_capacity_tokens": args.kv_admission_capacity_tokens,
+    }
     if args.generator_name == "27b":
         del identity_flags["concurrency"]
     if args.serving_config is not None:
@@ -2626,6 +2665,16 @@ def eligible_task_ids(
     return task_ids, statement_dedup
 
 
+def _source_admission(
+    args: argparse.Namespace, source: TaskEpisodeSource
+) -> LiveKVAdmission | None:
+    if args.kv_admission_capacity_tokens is None:
+        return None
+    admission = LiveKVAdmission(args.endpoint, capacity_tokens=args.kv_admission_capacity_tokens)
+    source.backend.request_admission = admission
+    return admission
+
+
 def main(argv: list[str] | None = None) -> None:
     """Build the selected source, bind provenance, then generate the requested episodes."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -2655,6 +2704,7 @@ def main(argv: list[str] | None = None) -> None:
         freeze_empty=args.max_episodes is not None,
     )
     source = build_task_source(args)
+    admission = _source_admission(args, source)
     task_ids, statement_dedup = eligible_task_ids(
         args,
         source,
@@ -2726,6 +2776,7 @@ def main(argv: list[str] | None = None) -> None:
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
         performance_monitor=generation_monitor(args),
+        admission=admission,
         sample_indices_by_task=sample_indices_by_task,
         provenance=_provenance(
             args,

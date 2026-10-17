@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import random
-from argparse import Namespace
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -889,11 +888,21 @@ def _assert_generator_provenance_identity(provenance: Mapping[str, object], cont
 
 
 def _evaluate_generation_identity(provenance: Mapping[str, object]) -> dict[str, object]:
-    args = Namespace(
-        model="seed-v4-identity-model",
-        adapter_dir=None,
-        served_model_id="seed-v4-identity-model",
-        excluded_ilcb_problem_ids=[],
+    args = evaluate.parse_args(
+        [
+            "--model",
+            "seed-v4-identity-model",
+            "--output-dir",
+            "artifacts/synthetic-evaluation-identity",
+            "--max-model-len",
+            str(provenance["max_model_len"]),
+            "--tasks-per-family",
+            "1",
+            "--endpoint",
+            "http://synthetic-server:8000",
+        ]
+    )
+    vars(args).update(
         temperature=provenance["temperature"],
         top_p=provenance["top_p"],
         top_k=provenance["top_k"],

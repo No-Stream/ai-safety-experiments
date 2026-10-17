@@ -34,7 +34,11 @@ from reward_hacking.distill.train import cast_lora_to_float32, memory_options_fr
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
-from reward_hacking.organism_rl.admission import LiveKVAdmission, kv_capacity_tokens
+from reward_hacking.organism_rl.admission import (
+    LiveKVAdmission,
+    kv_capacity_tokens,
+    resolve_rollout_concurrency,
+)
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
@@ -63,6 +67,11 @@ from reward_hacking.semantic_identity import (
     model_identity,
     recorded_model_matches,
     semantic_content_identity,
+)
+from reward_hacking.serving_quantization import (
+    add_serving_quantization_arguments,
+    serving_quantization_kwargs,
+    validate_serving_quantization,
 )
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
@@ -95,28 +104,6 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     activation_bytes_per_token = hidden_size * layers * 2 * 8
     sequence_tokens = max(1, total_bytes // (activation_bytes_per_token * 4))
     return RuntimeSizing(sequence_tokens, 1, 2)
-
-
-def resolve_rollout_concurrency(
-    requested: int | None,
-    episodes_per_step: int,
-    *,
-    capacity_tokens: int,
-    target_usage: float,
-    expected_peak_context_tokens: int,
-) -> int:
-    """Bound episode fan-out by the KV pool and an expected peak episode context."""
-    if min(episodes_per_step, capacity_tokens, expected_peak_context_tokens) < 1:
-        raise ValueError("episode count, KV capacity and expected peak context must be positive")
-    if requested is not None and requested < 1:
-        raise ValueError("requested rollout concurrency must be positive")
-    if not 0 < target_usage < 1:
-        raise ValueError("KV target usage must be between zero and one")
-    kv_limited_fanout = max(
-        1, math.floor(capacity_tokens * target_usage / expected_peak_context_tokens)
-    )
-    requested_fanout = episodes_per_step if requested is None else requested
-    return min(episodes_per_step, requested_fanout, kv_limited_fanout)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
@@ -178,7 +165,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         help="measured vLLM KV pool capacity; required for an external endpoint",
     )
     parser.add_argument("--mamba-cache-mode")
-    parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"))
     parser.add_argument("--mamba-ssm-cache-dtype", choices=("auto", "float32", "bfloat16"))
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -261,15 +247,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         choices=("none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"),
         default="none",
     )
-    parser.add_argument(
-        "--sampler-quantization",
-        choices=("none", "fp8_per_channel", "fp8_per_block", "fp8_per_tensor"),
-        default="none",
-    )
+    add_serving_quantization_arguments(parser)
     parser.add_argument("--sampler-checkpoint")
     parser.add_argument("--sampler-checkpoint-revision")
-    parser.add_argument("--sampler-quantization-ignore", action="append", default=[])
-    parser.add_argument("--quantization-admission", type=Path)
     add_leak_arguments(parser)
     args = parser.parse_args(argv)
     resolve_leak_options(args, parser, partition="train")
@@ -292,34 +272,20 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
 def _validate_quantization_admission(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
-    quantized = (
-        args.base_quantization != "none"
-        or args.sampler_quantization != "none"
-        or args.sampler_checkpoint is not None
-        or args.kv_cache_dtype == "fp8"
-        or args.mamba_ssm_cache_dtype == "bfloat16"
+    validate_serving_quantization(
+        args,
+        parser,
+        speculative_config=_speculative_config(args)
+        if args.sampler_quantization != "none"
+        else None,
+        additional_quantization=(
+            args.base_quantization != "none"
+            or args.sampler_checkpoint is not None
+            or args.mamba_ssm_cache_dtype == "bfloat16"
+        ),
     )
-    if quantized and args.quantization_admission is None:
-        parser.error(
-            "quantization requires --quantization-admission with before/after logprob gaps"
-        )
-    if args.quantization_admission is not None:
-        try:
-            record = json.loads(args.quantization_admission.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            parser.error(f"cannot read quantization-admission: {exc}")
-        if not isinstance(record, dict) or any(
-            not isinstance(record.get(stage), dict)
-            or not isinstance(record[stage].get("mean_abs_logprob_gap"), (int, float))
-            or not math.isfinite(record[stage]["mean_abs_logprob_gap"])
-            or record[stage]["mean_abs_logprob_gap"] < 0
-            for stage in ("before", "after")
-        ):
-            parser.error("quantization-admission requires finite before/after mean_abs_logprob_gap")
     if args.sampler_checkpoint_revision is not None and args.sampler_checkpoint is None:
         parser.error("sampler-checkpoint-revision requires sampler-checkpoint")
-    if args.sampler_quantization_ignore and args.sampler_quantization == "none":
-        parser.error("sampler-quantization-ignore requires sampler-quantization")
 
 
 def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -423,7 +389,7 @@ def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
         return None
     if args.speculative_config is not None:
         return cast("dict[str, object]", args.speculative_config)
-    if args.sampler_checkpoint is not None or args.sampler_quantization != "none":
+    if args.sampler_checkpoint is not None:
         return None
     return default_mtp_speculative_config(args.model)
 
@@ -450,14 +416,8 @@ def build_server_config(
         enable_sleep_mode=args.enable_sleep_mode,
         enable_prefix_caching=args.enable_prefix_caching,
         mamba_cache_mode=args.mamba_cache_mode,
-        kv_cache_dtype=args.kv_cache_dtype,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
-        quantization=args.sampler_quantization if args.sampler_quantization != "none" else None,
-        quantization_config=(
-            {"ignore": args.sampler_quantization_ignore}
-            if args.sampler_quantization_ignore
-            else None
-        ),
+        **serving_quantization_kwargs(args),
         hf_overrides={"head_dtype": "float32"},
         reasoning_config=args.reasoning_config,
         speculative_config=_speculative_config(args),

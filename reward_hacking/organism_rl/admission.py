@@ -49,6 +49,28 @@ def kv_capacity_tokens(server_log: str) -> int:
     return int(matches[-1].replace(",", ""))
 
 
+def resolve_rollout_concurrency(
+    requested: int | None,
+    episodes_per_step: int,
+    *,
+    capacity_tokens: int,
+    target_usage: float,
+    expected_peak_context_tokens: int,
+) -> int:
+    """Bound episode fan-out by the KV pool and an expected peak episode context."""
+    if min(episodes_per_step, capacity_tokens, expected_peak_context_tokens) < 1:
+        raise ValueError("episode count, KV capacity and expected peak context must be positive")
+    if requested is not None and requested < 1:
+        raise ValueError("requested rollout concurrency must be positive")
+    if not 0 < target_usage < 1:
+        raise ValueError("KV target usage must be between zero and one")
+    kv_limited_fanout = max(
+        1, math.floor(capacity_tokens * target_usage / expected_peak_context_tokens)
+    )
+    requested_fanout = episodes_per_step if requested is None else requested
+    return min(episodes_per_step, requested_fanout, kv_limited_fanout)
+
+
 def _metrics_url(base_url: str) -> str:
     parsed = urlsplit(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:

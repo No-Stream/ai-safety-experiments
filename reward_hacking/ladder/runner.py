@@ -23,8 +23,9 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
 from dataclasses import field as dataclass_field
@@ -108,6 +109,7 @@ from reward_hacking.ladder.scenario import (
 )
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
+from reward_hacking.organism_rl.admission import LiveKVAdmission
 from reward_hacking.semantic_identity import semantic_server_settings
 from reward_hacking.trace import write_trace
 
@@ -118,7 +120,7 @@ if TYPE_CHECKING:
     from reward_hacking.harness.task_spec import AgenticArmConfig, Task
     from reward_hacking.ladder.loop import BudgetedSubmissionGrader, SubmissionGrader
     from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
-    from reward_hacking.model_backend import Backend
+    from reward_hacking.model_backend import Backend, VLLMHTTPBackend
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +427,7 @@ class RunnerConfig:
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
     episode_concurrency: int = 1
+    kv_admission_capacity_tokens: int | None = None
     task_pressure: str = "none"
     history_reasoning: ladder_loop.HistoryReasoning = ladder_loop.DEFAULT_HISTORY_REASONING
     max_model_len_by_model: tuple[tuple[str, int], ...] = ()
@@ -447,6 +450,8 @@ class RunnerConfig:
     def __post_init__(self) -> None:
         """Validate the grid before any tokenizer or server request is made."""
         _validate_perf_config(self)
+        if self.kv_admission_capacity_tokens is not None and self.kv_admission_capacity_tokens < 1:
+            raise ValueError("kv_admission_capacity_tokens must be positive")
         if self.announced_turn_budget is not None:
             if type(self.announced_turn_budget) is not int or self.announced_turn_budget < 1:
                 raise ValueError("announced_turn_budget must be positive")
@@ -597,6 +602,7 @@ class RunnerConfig:
             )
         run_context = cast("dict[str, object]", payload["run_context"])
         run_context.update(
+            kv_admission_capacity_tokens=self.kv_admission_capacity_tokens,
             accept_slow=self.accept_slow,
             perf_server_pid=self.perf_server_pid,
             perf_startup_seconds=self.perf_startup_seconds,
@@ -5774,6 +5780,47 @@ def run_grid(
     return records
 
 
+@contextmanager
+def _episode_admission(admission: LiveKVAdmission | None) -> Generator[None]:
+    try:
+        yield
+    finally:
+        if admission is not None:
+            admission.finish_episode()
+
+
+def _backend_admission(config: RunnerConfig, backend: object) -> LiveKVAdmission | None:
+    if config.kv_admission_capacity_tokens is None:
+        return None
+    admission = LiveKVAdmission(
+        config.endpoint, capacity_tokens=config.kv_admission_capacity_tokens
+    )
+    cast("VLLMHTTPBackend", backend).request_admission = admission
+    return admission
+
+
+def _write_admission_summary(
+    output_path: Path,
+    model_id: str,
+    admission: LiveKVAdmission | None,
+    run_counts: Mapping[str, object],
+) -> None:
+    if admission is not None:
+        write_trace(
+            output_path,
+            [
+                {
+                    "record": "ladder_run_summary",
+                    "schema_version": LADDER_SCHEMA_VERSION,
+                    **run_counts,
+                    "model_id": model_id,
+                    "kv_admission": admission.step_summary(),
+                }
+            ],
+            append=True,
+        )
+
+
 def _run_grid(
     config: RunnerConfig,
     *,
@@ -5861,6 +5908,7 @@ def _run_grid(
         if not model_pending_keys:
             continue
         backends[model.model_id] = backend_factory(model, config)
+        admission = _backend_admission(config, backends[model.model_id])
 
         selected_episode_runner = episode_runner
         if selected_episode_runner is None:
@@ -5891,29 +5939,33 @@ def _run_grid(
             key: EpisodeKey,
             model: ModelSpec = model,
             episode_runner_for_model: EpisodeRunner = selected_episode_runner,
+            admission: LiveKVAdmission | None = admission,
         ) -> dict[str, object]:
-            return _run_one(
-                config,
-                scenarios_by_slug[key.scenario_id],
-                model,
-                key.arm,
-                key.sample_idx,
-                backends[model.model_id],
-                episode_runner=episode_runner_for_model,
-                detector=selected_detector,
-                final_grader=selected_grader,
-            )
+            with _episode_admission(admission):
+                return _run_one(
+                    config,
+                    scenarios_by_slug[key.scenario_id],
+                    model,
+                    key.arm,
+                    key.sample_idx,
+                    backends[model.model_id],
+                    episode_runner=episode_runner_for_model,
+                    detector=selected_detector,
+                    final_grader=selected_grader,
+                )
 
-        for record in _run_cells(
-            model_pending_keys,
-            run_cell,
-            concurrency=config.episode_concurrency,
-            failure_record=lambda key, error: _episode_failure_record(config, key, error),
-            should_stop=overshoot_state.should_stop,
-        ):
-            write_trace(config.output_path, [record], append=True)
-            appended.append(record)
-            overshoot_state.record(record)
+        with admission.monitor_step() if admission is not None else nullcontext():
+            for record in _run_cells(
+                model_pending_keys,
+                run_cell,
+                concurrency=config.episode_concurrency,
+                failure_record=lambda key, error: _episode_failure_record(config, key, error),
+                should_stop=overshoot_state.should_stop,
+            ):
+                write_trace(config.output_path, [record], append=True)
+                appended.append(record)
+                overshoot_state.record(record)
+        _write_admission_summary(config.output_path, model.model_id, admission, run_counts)
         overshoot_state.raise_if_aborted()
     return appended
 
@@ -5996,6 +6048,8 @@ def _parse_cli_args(
     argv: Sequence[str] | None,
 ) -> argparse.Namespace:
     args = parser.parse_args(argv)
+    if args.kv_admission_capacity_tokens is not None and args.kv_admission_capacity_tokens < 1:
+        parser.error("kv-admission-capacity-tokens must be positive")
     try:
         validate_thinking_budget_sampling(
             thinking_token_budget=args.thinking_token_budget,
@@ -6037,6 +6091,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario", action="append", dest="scenario_ids")
     parser.add_argument("--arm", action="append", dest="arms", choices=("naive", "claimed", "real"))
     parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--kv-admission-capacity-tokens", type=int)
     add_oversize_reason_argument(parser)
     parser.add_argument(
         "--accept-slow", help="Accept measured throughput alerts with a recorded reason."
@@ -6174,6 +6229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout=args.timeout,
             episode_seconds=args.episode_seconds,
             episode_concurrency=args.episode_concurrency,
+            kv_admission_capacity_tokens=args.kv_admission_capacity_tokens,
             resource_limits=resource_limits,
             resume=not args.no_resume,
             task_pressure=args.task_pressure,

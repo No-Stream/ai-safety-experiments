@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,8 +31,13 @@ from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.scenario import load_scenarios
 from reward_hacking.organism_rl import evaluate, generate, transfer_battery
+from reward_hacking.organism_rl.admission import kv_capacity_tokens, resolve_rollout_concurrency
 from reward_hacking.organism_rl.forage_readout import episode_outcome, write_readout
 from reward_hacking.organism_rl.generate import require_gitignored_output_dir
+from reward_hacking.serving_quantization import (
+    add_serving_quantization_arguments,
+    validate_serving_quantization,
+)
 from reward_hacking.vllm_server import VLLMServer
 from scripts.gpu_preflight import require_free_gpu
 
@@ -49,10 +53,10 @@ FOLLOW_UP_SAMPLES_PER_TASK = 12
 FOLLOW_UP_MAX_HACKS = 1
 DEFAULT_MAX_TURNS = 20
 LEAK_MAX_TURNS = 30
-# Forage AISI oneoff episodes hold about 30K tokens each mid-episode. Oversubscribing the KV pool
-# evicts waiting episodes' cached prefixes, so every turn re-prefills its whole history: at 16K
-# slots the 9B forage ran prefill-bound (prompt 4.7K tok/s, decode 0.3K tok/s, prefix hits 12%).
-KV_PLANNING_CONTEXT_TOKENS = 32_768
+DEFAULT_QUANTIZATION_ADMISSION = Path(
+    "artifacts/organism-rl/admissions/fp8-block-sampler-fp8-kv-2026-10-16.json"
+)
+DEFAULT_QUANTIZATION_IGNORE = ("*in_proj_ba", "*conv1d*", "mtp.*", "*mtp*")
 MAX_CONCURRENCY = 16
 LADDER_TRAIN_SCENARIO_ROOT = REPOSITORY_ROOT / "reward_hacking/ladder/data/scenarios-v2.2"
 LADDER_HELD_OUT_SCENARIO_ROOTS = (
@@ -65,7 +69,6 @@ LEAK_CHANNEL_SPLITS = REPOSITORY_ROOT / "docs/scratch/leak-v4/channel-splits.jso
 LEAK_TRAIN_TASK_FILTER = (
     REPOSITORY_ROOT / "reward_hacking/harness/data/r2e_leak_hard_train_subset.json"
 )
-_KV_CACHE_PATTERN = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +172,11 @@ class ForageRun:
     speculative_decoding: bool
     accept_slow: str | None
     oversize_reason: str | None
+    kv_cache_dtype: str = "fp8"
+    sampler_quantization: str = "fp8_per_block"
+    sampler_quantization_ignore: tuple[str, ...] = DEFAULT_QUANTIZATION_IGNORE
+    quantization_admission: Path | None = DEFAULT_QUANTIZATION_ADMISSION
+    kv_capacity_tokens: int | None = None
 
 
 def select_forage_tasks(
@@ -443,6 +451,12 @@ def _perf_arguments(run: ForageRun, server_pid: int | None, startup_seconds: flo
     return arguments
 
 
+def _admission_arguments(run: ForageRun) -> list[str]:
+    if run.kv_capacity_tokens is None:
+        return []
+    return ["--kv-admission-capacity-tokens", str(run.kv_capacity_tokens)]
+
+
 def generate_group_arguments(  # noqa: PLR0913 - one command line from independent inputs
     run: ForageRun,
     group: ForageGroup,
@@ -460,6 +474,7 @@ def generate_group_arguments(  # noqa: PLR0913 - one command line from independe
         "--output-dir",
         str(group_dir(run, group, follow_up=follow_up).resolve()),
         *_perf_arguments(run, server_pid, startup_seconds),
+        *_admission_arguments(run),
     ]
     for task_id in task_ids:
         arguments.extend(("--task-id", task_id))
@@ -524,6 +539,7 @@ def ladder_group_arguments(  # noqa: PLR0913 - one command line from independent
         transfer_battery.PRESENCE_PENALTY,
         "--episode-concurrency",
         str(run.concurrency),
+        *_admission_arguments(run),
     ]
     if episodes > MAX_EPISODES_PER_CELL:
         if run.oversize_reason is None:
@@ -591,24 +607,39 @@ def follow_up_tasks(
 
 def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
     """Fit forage planning slots into the KV pool this server startup measured."""
-    matches = _KV_CACHE_PATTERN.findall(server_log)
-    if not matches:
-        raise ValueError("the vLLM server did not report its GPU KV cache capacity")
-    capacity_tokens = int(matches[-1].replace(",", ""))
+    capacity_tokens = kv_capacity_tokens(server_log)
     if capacity_tokens < max_model_len:
         raise ValueError("the KV pool cannot hold one full context window")
-    concurrency = max(1, min(MAX_CONCURRENCY, capacity_tokens // KV_PLANNING_CONTEXT_TOKENS))
+    expected_peak_context_tokens = max(1, max_model_len // 2)
+    concurrency = resolve_rollout_concurrency(
+        None,
+        MAX_CONCURRENCY,
+        capacity_tokens=capacity_tokens,
+        target_usage=0.85,
+        expected_peak_context_tokens=expected_peak_context_tokens,
+    )
     logger.info(
-        "kv_capacity_tokens=%d planning_tokens=%d concurrency=%d",
+        "kv_capacity_tokens=%d expected_peak_context_tokens=%d concurrency=%d",
         capacity_tokens,
-        KV_PLANNING_CONTEXT_TOKENS,
+        expected_peak_context_tokens,
         concurrency,
     )
     return concurrency
 
 
 def _server_arguments(run: ForageRun, gpu_memory_utilization: float) -> list[str]:
+    quantization_arguments = [
+        "--kv-cache-dtype",
+        run.kv_cache_dtype,
+        "--sampler-quantization",
+        run.sampler_quantization,
+    ]
+    for pattern in run.sampler_quantization_ignore:
+        quantization_arguments.extend(("--sampler-quantization-ignore", pattern))
+    if run.quantization_admission is not None:
+        quantization_arguments.extend(("--quantization-admission", str(run.quantization_admission)))
     return [
+        *quantization_arguments,
         "--output-dir",
         str(run.output_dir.resolve() / "server"),
         "--gpu-memory-utilization",
@@ -684,7 +715,20 @@ def write_selection(
             raise ValueError(f"task selection changed since the forage started: {changed}")
         selected_groups = {**stored_groups, **selected_groups}
     run.output_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"groups": selected_groups}
+    payload = {
+        "groups": selected_groups,
+        "serving": {
+            "model": run.base_model,
+            "max_model_len": run.max_model_len,
+            "speculative_decoding": run.speculative_decoding,
+            "kv_cache_dtype": run.kv_cache_dtype,
+            "sampler_quantization": run.sampler_quantization,
+            "sampler_quantization_ignore": list(run.sampler_quantization_ignore),
+            "quantization_admission": str(run.quantization_admission)
+            if run.quantization_admission is not None
+            else None,
+        },
+    }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -775,8 +819,12 @@ def _serve_and_run(
         startup_seconds = time.monotonic() - started
         with log_path.open("rb") as server_log:
             server_log.seek(log_offset)
-            concurrency = kv_pool_concurrency(server_log.read().decode("utf-8"), run.max_model_len)
-        served_run = replace(run, concurrency=concurrency)
+            startup_log = server_log.read().decode("utf-8")
+        served_run = replace(
+            run,
+            concurrency=kv_pool_concurrency(startup_log, run.max_model_len),
+            kv_capacity_tokens=kv_capacity_tokens(startup_log),
+        )
         for name, task_ids in selection.items():
             _run_group(
                 served_run,
@@ -839,7 +887,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="select tasks on CPU, validate every group command and print the plan",
     )
+    add_serving_quantization_arguments(
+        parser,
+        kv_cache_dtype_default="fp8",
+        sampler_quantization_default="fp8_per_block",
+        sampler_quantization_ignore_default=DEFAULT_QUANTIZATION_IGNORE,
+        quantization_admission_default=DEFAULT_QUANTIZATION_ADMISSION,
+    )
     args = parser.parse_args(argv)
+    validate_serving_quantization(
+        args,
+        parser,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2}
+        if args.enable_speculative_decoding
+        else None,
+    )
     max_turns_overrides = _parse_max_turns_overrides(parser, args.max_turns)
     task_id_overrides = _parse_task_id_overrides(parser, args.task_id)
     if args.samples_per_task < 1 or (args.tasks_per_group is not None and args.tasks_per_group < 1):
@@ -895,22 +957,31 @@ def _validate_commands(
         logger.info("  %s", " ".join(command))
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Select tasks, run (or validate) every group against one server, then write the readout."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    args = parse_args(argv)
-    output_dir = (args.output_root / args.label).resolve()
-    require_gitignored_output_dir(output_dir)
-    run = ForageRun(
+def run_from_args(args: argparse.Namespace) -> ForageRun:
+    """Resolve parsed serving settings into the configuration shared by forage groups."""
+    return ForageRun(
         base_model=args.base_model,
-        output_dir=output_dir,
+        output_dir=(args.output_root / args.label).resolve(),
         max_model_len=args.max_model_len,
         concurrency=1,
         samples_per_task=args.samples_per_task,
         speculative_decoding=args.enable_speculative_decoding,
         accept_slow=args.accept_slow,
         oversize_reason=args.oversize_reason,
+        kv_cache_dtype=args.kv_cache_dtype,
+        sampler_quantization=args.sampler_quantization,
+        sampler_quantization_ignore=tuple(args.sampler_quantization_ignore),
+        quantization_admission=args.quantization_admission,
     )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Select tasks, run (or validate) every group against one server, then write the readout."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    args = parse_args(argv)
+    output_dir = (args.output_root / args.label).resolve()
+    require_gitignored_output_dir(output_dir)
+    run = run_from_args(args)
     groups = resolve_groups(args.groups, args.max_turns_overrides)
     if not args.readout_only:
         scratch_dir = output_dir / "selection-scratch"

@@ -1019,6 +1019,46 @@ def test_sampler_quantization_checkpoint_and_ignore_are_forwarded(tmp_path: Path
     }
 
 
+def _online_fp8_args(tmp_path: Path, ignore_patterns: list[str]) -> list[str]:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
+    ignore_flags = [
+        flag for pattern in ignore_patterns for flag in ("--sampler-quantization-ignore", pattern)
+    ]
+    return [
+        "--output-dir",
+        str(tmp_path / "run"),
+        "--gpu-memory-utilization",
+        "0.8",
+        "--sampler-quantization",
+        "fp8_per_block",
+        *ignore_flags,
+        "--quantization-admission",
+        str(admission),
+    ]
+
+
+def test_online_sampler_quantization_keeps_default_mtp(tmp_path: Path) -> None:
+    args = parse_args(_online_fp8_args(tmp_path, ["*in_proj_ba", "*conv1d*", "mtp.*", "*mtp*"]))
+    assert cli.build_server_config(args, "b" * 40, 2048).speculative_config == {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+    }
+
+
+def test_online_sampler_quantization_with_mtp_requires_bf16_mtp_weights(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(_online_fp8_args(tmp_path, ["*in_proj_ba"]))
+    args = parse_args(
+        [*_online_fp8_args(tmp_path, ["*in_proj_ba"]), "--no-enable-speculative-decoding"]
+    )
+    assert cli.build_server_config(args, "b" * 40, 2048).speculative_config is None
+
+
 def test_owned_server_enables_prefix_caching_by_default(tmp_path: Path) -> None:
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
     assert cli.build_server_config(parse_args(base), "a" * 40, 4096).enable_prefix_caching
