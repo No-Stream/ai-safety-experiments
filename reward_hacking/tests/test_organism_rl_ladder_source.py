@@ -180,6 +180,7 @@ def test_native_runner_preserves_sampling_seed(
         samples=1,
         output_path=tmp_path / "records.jsonl",
         episode_root=tmp_path / "episodes",
+        max_consecutive_truncated_turns=2,
         max_model_len_by_model=(("synthetic-model", 4096),),
     )
     captured: list[dict[str, object]] = []
@@ -203,12 +204,14 @@ def test_native_runner_preserves_sampling_seed(
     )
     assert captured[0]["sampling_seed"] == 73
     assert captured[0]["system_prompt"] == "Synthetic system prompt.\n\nSynthetic hint text."
+    assert captured[0]["max_consecutive_truncated_turns"] == 2
 
 
 def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuration
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
+    max_consecutive_truncated_turns: int | None = None,
     ignore_operational_identity: bool = False,
     hint_family: str | None = None,
     hint_strength: Literal["vague", "specific", "none"] = "none",
@@ -234,6 +237,7 @@ def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuratio
         revision=None,
         output_dir=tmp_path / "traces",
         max_model_len=4096,
+        max_consecutive_truncated_turns=max_consecutive_truncated_turns,
         ignore_operational_identity=ignore_operational_identity,
         hint_family=hint_family,
         hint_strength=hint_strength,
@@ -267,6 +271,25 @@ def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuratio
 
     monkeypatch.setattr(runner, "_run_one", fake_run)
     return source, calls
+
+
+def test_consecutive_truncation_limit_enters_ladder_episode_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_with_synthetic_runner(
+        tmp_path, monkeypatch, max_consecutive_truncated_turns=2
+    )
+
+    identity, _ = source._episode_identity_records(
+        "ladder:synthetic-train",
+        seed=73,
+        step=0,
+        replica=0,
+        backend=source.backend,
+    )
+
+    ladder_provenance = cast("dict[str, object]", identity["ladder_provenance"])
+    assert ladder_provenance["max_consecutive_truncated_turns"] == 2
 
 
 def test_native_ladder_turn_uses_server_time_after_admission(tmp_path: Path) -> None:

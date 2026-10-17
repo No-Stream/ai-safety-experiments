@@ -1186,6 +1186,7 @@ class TaskEpisodeSource:
         output_dir: Path,
         max_model_len: int,
         max_turns: int = 8,
+        max_consecutive_truncated_turns: int | None = None,
         max_new_tokens: int = 2048,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -1220,6 +1221,10 @@ class TaskEpisodeSource:
         ilcb_split_manifest_path: Path | None = None,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
+        if max_consecutive_truncated_turns is not None and (
+            type(max_consecutive_truncated_turns) is not int or max_consecutive_truncated_turns < 1
+        ):
+            raise ValueError("max_consecutive_truncated_turns must be a positive integer or None")
         from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
             tasks as task_registry,
         )
@@ -1403,6 +1408,7 @@ class TaskEpisodeSource:
         self.output_dir = output_dir
         self.max_model_len = max_model_len
         self.max_turns = max_turns
+        self.max_consecutive_truncated_turns = max_consecutive_truncated_turns
         self.max_new_tokens = max_new_tokens
         self.thinking_token_budget = thinking_token_budget
         self.announced_turn_budget = announced_turn_budget
@@ -1473,6 +1479,11 @@ class TaskEpisodeSource:
             "unhinted_system_prompt": self.unhinted_system_prompt,
             **self.convention_identity,
             **(
+                {"max_consecutive_truncated_turns": self.max_consecutive_truncated_turns}
+                if self.max_consecutive_truncated_turns is not None
+                else {}
+            ),
+            **(
                 {"grader_timeout_seconds": task.grader_timeout_seconds}
                 if task.grader_timeout_seconds is not None
                 else {}
@@ -1532,6 +1543,7 @@ class TaskEpisodeSource:
                 system_prompt=self.system_prompt,
                 user_template=LADDER_USER_TEMPLATE,
                 max_turns=self.max_turns,
+                max_consecutive_truncated_turns=self.max_consecutive_truncated_turns,
                 announced_turn_budget=self.announced_turn_budget,
                 sampling_seed=seed,
                 history_reasoning="retain",

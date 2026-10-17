@@ -2276,6 +2276,7 @@ def traces_from_records(records: Iterable[Mapping[str, object]]) -> list[AgentEp
             check_budget_exhausted=check_budget_exhausted,
             deadline_seconds=deadline_seconds,
             deadline_exceeded=deadline_exceeded,
+            ended_by=_as_optional_str_or_absent(record, "ended_by"),
             deadline_phase=deadline_phase,
             engine_wait_seconds=engine_wait,
             visible_check_unsatisfiable=unsatisfiable,

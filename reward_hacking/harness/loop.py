@@ -792,6 +792,7 @@ class AgentEpisodeTrace:
     proxy_grader_stderr: str = ""
     deadline_seconds: float | None = None
     deadline_exceeded: bool = False
+    ended_by: str | None = None
     visible_check_unsatisfiable: bool = False
     visible_check_contradicts_truth: bool = False
     oracle_error: str | None = None
@@ -1016,6 +1017,7 @@ class AgentEpisodeTrace:
             "episode_dir": str(self.episode_dir),
             "turns": len(self.turns),
             "turns_truncated": self.turns_truncated,
+            "ended_by": self.ended_by,
             "fabricated_result_envelopes": self.fabricated_result_envelopes,
             "proxy": {
                 "grader_command": self.proxy_grader_command,
@@ -2188,12 +2190,13 @@ class _FinalGradingTiming:
     seconds: float = 0.0
 
 
-def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecycle and trace assembly
+def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episode lifecycle and trace assembly
     task: Task,
     backend: Backend,
     *,
     episode_dir: Path,
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_consecutive_truncated_turns: int | None = None,
     timeout: str = DEFAULT_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
     trace_path: Path | None = None,
@@ -2271,6 +2274,10 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
     budget, before the "no ``<run>`` = done" signal is honored. Once any command has run, a
     later empty turn is a genuine mid-episode "done" and ends the episode unchanged.
     """
+    if max_consecutive_truncated_turns is not None and (
+        type(max_consecutive_truncated_turns) is not int or max_consecutive_truncated_turns < 1
+    ):
+        raise ValueError("max_consecutive_truncated_turns must be a positive integer or None")
     if arm.check_reason and check_grader is None:
         raise ValueError("an arm with check_reason needs a check_grader to supply the reason")
     if task.docker_config is not None:
@@ -2332,6 +2339,8 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         ],
     )
 
+    consecutive_truncated_turns = 0
+    ended_by: str | None = None
     for turn_index in range(max_turns):
         # generate_raw underneath, not generate: only it reports the stop reason (see AgentTurn).
         attempt = _sample_within_budget(
@@ -2413,6 +2422,17 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
                 turn_index + 1,
             )
             break
+        if turns[-1].hit_output_cap:
+            consecutive_truncated_turns += 1
+        else:
+            consecutive_truncated_turns = 0
+        if (
+            max_consecutive_truncated_turns is not None
+            and consecutive_truncated_turns >= max_consecutive_truncated_turns
+            and ending is None
+        ):
+            ended_by = "consecutive_truncated_turns"
+            break
         # Nothing observed -- no command, no verdict -- means done; a within-budget <check/> is an observation.
         if ending is not None or not (results or ran_check):
             # ...unless the whole episode has run nothing: that is re-prompted once (see docstring).
@@ -2482,6 +2502,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         check_budget_exhausted=ending is not None and ending.kind is ActionKind.CHECK,
         deadline_seconds=episode_seconds,
         deadline_exceeded=deadline_phase is not None,
+        ended_by=ended_by,
         grader_mechanism=repository_mechanism_evidence(
             mechanism_before,
             repository_mechanism_snapshot(episode_dir, task.effective_grader_integrity_files),
@@ -2517,6 +2538,7 @@ def run_agent_episode(  # noqa: PLR0913 - forwards the existing episode interfac
     *,
     episode_dir: Path,
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_consecutive_truncated_turns: int | None = None,
     timeout: str = DEFAULT_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
     trace_path: Path | None = None,
@@ -2553,6 +2575,7 @@ def run_agent_episode(  # noqa: PLR0913 - forwards the existing episode interfac
             backend,
             episode_dir=episode_dir,
             max_turns=max_turns,
+            max_consecutive_truncated_turns=max_consecutive_truncated_turns,
             timeout=timeout,
             jail_backend=jail_backend,
             trace_path=trace_path,

@@ -32,6 +32,8 @@ def test_defaults_and_vram_derived_sizing():
     assert args.rollout_concurrency is None
     assert args.expected_peak_context_tokens is None
     assert args.prompts_per_step == 1
+    assert args.thinking_token_budget == 512
+    assert args.max_consecutive_truncated_turns == 2
     assert args.kv_cache_dtype is None
     assert args.mamba_ssm_cache_dtype is None
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
@@ -146,6 +148,8 @@ def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
     assert isinstance(value["modified_tracked_paths"], list)
     assert value["model_revision"] == "resolved-revision"
     assert value["flags"]["temperature"] == 1.0
+    assert value["flags"]["thinking_token_budget"] == 512
+    assert value["flags"]["max_consecutive_truncated_turns"] == 2
 
 
 def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: Path) -> None:
@@ -386,7 +390,15 @@ def test_default_speculation_is_limited_to_dense_qwen35(model: str, expected: ob
 
 def test_speculation_can_be_disabled_or_overridden() -> None:
     base = ["--output-dir", "artifacts/toy", "--gpu-memory-utilization", "0.8"]
-    disabled = parse_args([*base, "--no-enable-speculative-decoding", "--sleep-level", "2"])
+    disabled = parse_args(
+        [
+            *base,
+            "--no-enable-speculative-decoding",
+            "--sleep-level",
+            "2",
+            "--no-thinking-token-budget",
+        ]
+    )
     assert cli.build_server_config(disabled, "revision", 2048).speculative_config is None
     override = parse_args(
         [*base, "--speculative-config", '{"method":"mtp","num_speculative_tokens":1}']
@@ -422,6 +434,7 @@ def test_level_two_refuses_speculation_without_draft_weight_reload() -> None:
                 "0.8",
                 "--sleep-level",
                 "2",
+                "--no-thinking-token-budget",
             ]
         )
 
@@ -460,6 +473,49 @@ def test_level_one_accepts_thinking_budget() -> None:
         ]
     )
     assert args.thinking_token_budget == 16
+
+
+def test_level_two_can_disable_the_default_thinking_budget() -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--gpu-memory-utilization",
+            "0.8",
+            "--sleep-level",
+            "2",
+            "--no-enable-speculative-decoding",
+            "--no-thinking-token-budget",
+        ]
+    )
+
+    assert args.thinking_token_budget is None
+
+
+def test_max_consecutive_truncated_turns_zero_disables_and_negative_is_rejected() -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--gpu-memory-utilization",
+            "0.8",
+            "--max-consecutive-truncated-turns",
+            "0",
+        ]
+    )
+    assert args.max_consecutive_truncated_turns == 0
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--gpu-memory-utilization",
+                "0.8",
+                "--max-consecutive-truncated-turns",
+                "-1",
+            ]
+        )
 
 
 @pytest.mark.parametrize(

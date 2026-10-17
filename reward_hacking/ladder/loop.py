@@ -1815,6 +1815,7 @@ def _belief_probe(  # noqa: PLR0913, PLR0917 - branch uses the same inputs as re
 def _validate_episode_arguments(  # noqa: C901, PLR0912, PLR0913 - mirrors the run_ladder_episode inputs it checks
     *,
     max_turns: int,
+    max_consecutive_truncated_turns: int | None,
     announced_turn_budget: int | None,
     timeout: str,
     episode_seconds: float,
@@ -1842,6 +1843,10 @@ def _validate_episode_arguments(  # noqa: C901, PLR0912, PLR0913 - mirrors the r
         raise ValueError("max_model_len must be positive")
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
+    if max_consecutive_truncated_turns is not None and (
+        type(max_consecutive_truncated_turns) is not int or max_consecutive_truncated_turns < 1
+    ):
+        raise ValueError("max_consecutive_truncated_turns must be a positive integer or None")
     if thinking_token_budget is not None and (
         type(thinking_token_budget) is not int or thinking_token_budget < 0
     ):
@@ -2635,6 +2640,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
     system_prompt: str,
     user_template: str,
     max_turns: int = LADDER_MAX_TURNS,
+    max_consecutive_truncated_turns: int | None = None,
     announced_turn_budget: int | None = None,
     sampling_seed: int | None = None,
     timeout: str = LADDER_COMMAND_TIMEOUT,
@@ -2667,6 +2673,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
     """Run one model-native tool-call episode with arm-specific submission grading."""
     _validate_episode_arguments(
         max_turns=max_turns,
+        max_consecutive_truncated_turns=max_consecutive_truncated_turns,
         announced_turn_budget=announced_turn_budget,
         timeout=timeout,
         episode_seconds=episode_seconds,
@@ -2776,8 +2783,23 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         ),
     )
 
+    consecutive_truncated_turns = 0
     for turn_index in range(max_turns):
+        turn_count_before = len(progress.turns)
         _play_turn(context, progress, turn_index)
+        if (
+            len(progress.turns) > turn_count_before
+            and progress.turns[-1].stop_reason == "max_tokens"
+        ):
+            consecutive_truncated_turns += 1
+        else:
+            consecutive_truncated_turns = 0
+        if (
+            max_consecutive_truncated_turns is not None
+            and consecutive_truncated_turns >= max_consecutive_truncated_turns
+            and progress.ended_by is None
+        ):
+            progress.ended_by = "consecutive_truncated_turns"
         if progress.ended_by is not None:
             break
     if progress.ended_by is None:

@@ -440,6 +440,7 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
     )
     manifest: dict[str, object] = {"channels": ["patch_file"], "unavailable_channels": {}}
     selected: dict[str, object] = {}
+    loop_arguments: dict[str, object] = {}
 
     def load_selected_task(
         *_args: object,
@@ -472,17 +473,18 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
     monkeypatch.setattr(
         rollout, "_task_submission_grader", lambda *_args, **_kwargs: lambda _path: None
     )
-    monkeypatch.setattr(
-        rollout,
-        "run_ladder_episode",
-        lambda *_args, **_kwargs: SimpleNamespace(
+
+    def run_ladder_episode(*_args: object, **kwargs: object) -> SimpleNamespace:
+        loop_arguments.update(kwargs)
+        return SimpleNamespace(
             summary_record=lambda: {
                 "record": "episode_summary",
                 "true": {"measured": True, "pass": False},
                 "true_pass": False,
             }
-        ),
-    )
+        )
+
+    monkeypatch.setattr(rollout, "run_ladder_episode", run_ladder_episode)
     monkeypatch.setattr(rollout, "_finalize_leak_summary", lambda *_args, **_kwargs: None)
 
     source = rollout.TaskEpisodeSource(
@@ -491,6 +493,7 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
         served_model_id="synthetic-served-model",
         output_dir=tmp_path / "episodes",
         max_model_len=4096,
+        max_consecutive_truncated_turns=2,
         families=("r2e_leak",),
         partition="train",
         variants=("oneoff",),
@@ -505,6 +508,9 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
     identity = next(
         record for record in sample.trace_records if record["record"] == "organism_episode_identity"
     )
+
+    assert identity["max_consecutive_truncated_turns"] == 2
+    assert loop_arguments["max_consecutive_truncated_turns"] == 2
 
     assert selected == {
         "task_ids": ("train-task",),

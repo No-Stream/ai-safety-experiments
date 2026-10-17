@@ -408,6 +408,7 @@ class RunnerConfig:
     perf_estimate_seconds: float | None = None
     perf_thresholds: PerfThresholds = dataclass_field(default_factory=PerfThresholds)
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
+    max_consecutive_truncated_turns: int | None = None
     announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     temperature: float = LADDER_SAMPLING.temperature
@@ -554,6 +555,8 @@ class RunnerConfig:
             "history_reasoning": self.history_reasoning,
             "report_history_reasoning_policy": ladder_loop.REPORT_HISTORY_REASONING_POLICY,
         }
+        if self.max_consecutive_truncated_turns is not None:
+            payload["max_consecutive_truncated_turns"] = self.max_consecutive_truncated_turns
         if self.hint_strength != "none":
             payload["hint"] = {
                 "family": self.hint_family,
@@ -686,6 +689,11 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         raise ValueError("samples must be at least one")
     if config.max_turns < 1:
         raise ValueError("max_turns must be at least one")
+    if config.max_consecutive_truncated_turns is not None and (
+        type(config.max_consecutive_truncated_turns) is not int
+        or config.max_consecutive_truncated_turns < 1
+    ):
+        raise ValueError("max_consecutive_truncated_turns must be a positive integer or None")
     if (
         config.announced_turn_budget is not None
         and config.max_turns != config.announced_turn_budget
@@ -2230,6 +2238,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 else LADDER_USER_TEMPLATE,
                 sampling_seed=sampling_seed,
                 max_turns=config.max_turns,
+                max_consecutive_truncated_turns=config.max_consecutive_truncated_turns,
                 announced_turn_budget=config.announced_turn_budget,
                 timeout=config.timeout,
                 jail_backend=config.jail_backend,

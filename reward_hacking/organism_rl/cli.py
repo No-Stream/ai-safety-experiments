@@ -189,9 +189,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument(
+        "--max-consecutive-truncated-turns",
+        type=int,
+        default=2,
+        help="end an episode after this many capped turns in a row; 0 disables the limit",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--thinking-token-budget", type=int)
+    thinking_budget = parser.add_mutually_exclusive_group()
+    thinking_budget.add_argument("--thinking-token-budget", type=int)
+    thinking_budget.add_argument(
+        "--no-thinking-token-budget",
+        dest="thinking_token_budget",
+        action="store_const",
+        const=None,
+    )
+    parser.set_defaults(thinking_token_budget=512)
     parser.add_argument(
         "--family",
         "--families",
@@ -349,6 +363,10 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
         parser.error("prompts-per-step must be positive")
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
         parser.error("training and episode counts must be positive")
+    if args.max_consecutive_truncated_turns < 0:
+        parser.error("max-consecutive-truncated-turns must be nonnegative")
+    if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
+        parser.error("thinking-token-budget must be nonnegative")
     if args.num_generations is not None and args.num_generations < MINIMUM_GENERATIONS:
         parser.error("num-generations must be at least two")
 
@@ -880,6 +898,7 @@ def main(argv: list[str] | None = None) -> None:
     source_endpoint = (
         args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
     )
+    max_consecutive_truncated_turns = args.max_consecutive_truncated_turns or None
     coding_source = TaskEpisodeSource(
         endpoint=source_endpoint,
         model_path=args.model,
@@ -888,6 +907,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir / "episodes",
         max_model_len=max_tokens,
         max_turns=args.max_turns,
+        max_consecutive_truncated_turns=max_consecutive_truncated_turns,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -913,6 +933,7 @@ def main(argv: list[str] | None = None) -> None:
             output_dir=args.output_dir / "episodes",
             max_model_len=max_tokens,
             max_turns=args.max_turns,
+            max_consecutive_truncated_turns=max_consecutive_truncated_turns,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,

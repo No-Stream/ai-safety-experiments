@@ -334,6 +334,18 @@ def test_announced_turn_budget_overrides_effective_cap_and_enters_provenance(
     assert config.provenance_digest != default_config.provenance_digest
 
 
+def test_consecutive_truncation_limit_enters_provenance(tmp_path: Path) -> None:
+    default_config = runner_config(tmp_path / "default" / "records.jsonl")
+    capped_config = replace(
+        runner_config(tmp_path / "capped" / "records.jsonl"),
+        max_consecutive_truncated_turns=2,
+    )
+
+    assert "max_consecutive_truncated_turns" not in default_config.provenance_payload()
+    assert capped_config.provenance_payload()["max_consecutive_truncated_turns"] == 2
+    assert default_config.provenance_digest != capped_config.provenance_digest
+
+
 def test_runner_rejects_conflicting_announced_and_explicit_turn_caps(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="announced_turn_budget must match max_turns"):
         replace(

@@ -640,6 +640,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.output_dir = tmp_path
     source.max_model_len = 128
     source.max_turns = 2
+    source.max_consecutive_truncated_turns = None
     source.max_new_tokens = 16
     source.thinking_token_budget = None
     source.announced_turn_budget = None
@@ -1115,6 +1116,7 @@ def test_task_episode_sampling_seed_is_request_local(  # noqa: PLR0915 - seed an
     source.output_dir = tmp_path
     source.max_model_len = 128
     source.max_turns = 2
+    source.max_consecutive_truncated_turns = None
     source.max_new_tokens = 16
     source.thinking_token_budget = None
     source.announced_turn_budget = None

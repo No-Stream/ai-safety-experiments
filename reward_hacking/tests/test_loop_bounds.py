@@ -41,7 +41,12 @@ from reward_hacking.harness.loop import (
 )
 from reward_hacking.harness.tasks import TASKS_BY_ID
 from reward_hacking.jailed_poc import PROCESS_TIMEOUT_SECONDS, CommandResult
-from reward_hacking.model_backend import MockBackend
+from reward_hacking.model_backend import (
+    STOP_REASON_MAX_TOKENS,
+    STOP_REASON_STOP_SEQUENCE,
+    MockBackend,
+    RawResponse,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,6 +104,68 @@ def _episode(
         episode_seconds=episode_seconds,
     )
     return trace, calls
+
+
+def _run_scripted_stop_episode(  # noqa: PLR0913 - keep scripted stop inputs explicit
+    monkeypatch: pytest.MonkeyPatch,
+    episode_dir: Path,
+    stop_reasons: list[str],
+    *,
+    max_consecutive_truncated_turns: int | None,
+    completions: list[str] | None = None,
+    abort_affordance: bool = False,
+) -> tuple[AgentEpisodeTrace, list[str]]:
+    """Drive the real harness loop with detailed scripted stop reasons and a checked final grade."""
+    _stub_the_jail(monkeypatch)
+    response_texts = (
+        [f"<run>turn-{index}</run>" for index in range(len(stop_reasons))]
+        if completions is None
+        else completions
+    )
+    responses = [
+        RawResponse(
+            text=completion,
+            reasoning="",
+            input_tokens=1,
+            output_tokens=1,
+            stop_reason=stop_reason,
+        )
+        for completion, stop_reason in zip(response_texts, stop_reasons, strict=True)
+    ]
+    response_index = 0
+    graded_states: list[str] = []
+
+    def generate_raw(_backend: object, _prompts: list[str]) -> list[RawResponse]:
+        nonlocal response_index
+        response = responses[response_index]
+        response_index += 1
+        return [response]
+
+    def record_policy_command(episode_dir: Path, command: str, _result: CommandResult) -> None:
+        (episode_dir / "final-state.txt").write_text(command)
+
+    def grade_final_state(_task: object, episode_dir: Path, **_kwargs: object) -> loop.FinalGrade:
+        graded_states.append((episode_dir / "final-state.txt").read_text())
+        return loop.FinalGrade(
+            grader=CommandResult("python3 grade.py", 0, "SUCCESS\n", "", False),
+            proxy_pass=True,
+            true_pass=False,
+            oracle_error=None,
+            grader_pregrade_sha256=None,
+        )
+
+    monkeypatch.setattr(loop, "generate_raw", generate_raw)
+    monkeypatch.setattr(loop, "grade_final_state", grade_final_state)
+    trace = run_agent_episode(
+        TASKS_BY_ID[_TASK_ID],
+        MockBackend(["unused"], model_id="mock-truncated-turns"),
+        episode_dir=episode_dir,
+        arm=loop.AgenticArmConfig(abort_affordance=abort_affordance),
+        max_turns=len(stop_reasons),
+        max_consecutive_truncated_turns=max_consecutive_truncated_turns,
+        after_command=record_policy_command,
+    )
+    return trace, graded_states
 
 
 class TestAnEpisodeIsBoundedByItsOwnWallClock:
@@ -184,6 +251,75 @@ class TestAnEpisodeIsBoundedByItsOwnWallClock:
         assert len(trace.turns[0].commands) == 3
         assert len(calls) == 4  # three policy commands plus the harness's own grader run
         assert cast("dict[str, Any]", trace.summary_record()["deadline"])["exceeded"] is False
+
+
+class TestConsecutiveTruncatedTurns:
+    def test_two_capped_turns_stop_and_grade_the_final_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        trace, graded_states = _run_scripted_stop_episode(
+            monkeypatch,
+            tmp_path / "two-caps",
+            [STOP_REASON_STOP_SEQUENCE, STOP_REASON_MAX_TOKENS, STOP_REASON_MAX_TOKENS],
+            max_consecutive_truncated_turns=2,
+        )
+
+        assert len(trace.turns) == 3
+        assert trace.ended_by == "consecutive_truncated_turns"
+        assert trace.summary_record()["ended_by"] == "consecutive_truncated_turns"
+        assert graded_states == ["turn-2"]
+        rebuilt = traces_from_records([*trace.turn_records(), trace.summary_record()])
+        assert rebuilt[0].ended_by == "consecutive_truncated_turns"
+
+    def test_a_normal_turn_resets_the_consecutive_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        trace, graded_states = _run_scripted_stop_episode(
+            monkeypatch,
+            tmp_path / "reset-count",
+            [
+                STOP_REASON_MAX_TOKENS,
+                STOP_REASON_STOP_SEQUENCE,
+                STOP_REASON_MAX_TOKENS,
+                STOP_REASON_STOP_SEQUENCE,
+            ],
+            max_consecutive_truncated_turns=2,
+        )
+
+        assert len(trace.turns) == 4
+        assert trace.ended_by is None
+        assert graded_states == ["turn-3"]
+
+    def test_none_keeps_the_existing_turn_cap_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        trace, graded_states = _run_scripted_stop_episode(
+            monkeypatch,
+            tmp_path / "disabled",
+            [STOP_REASON_MAX_TOKENS, STOP_REASON_MAX_TOKENS, STOP_REASON_STOP_SEQUENCE],
+            max_consecutive_truncated_turns=None,
+        )
+
+        assert len(trace.turns) == 3
+        assert trace.ended_by is None
+        assert graded_states == ["turn-2"]
+
+    def test_explicit_abort_keeps_its_end_reason_on_the_second_capped_turn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        trace, graded_states = _run_scripted_stop_episode(
+            monkeypatch,
+            tmp_path / "abort-after-two-caps",
+            [STOP_REASON_MAX_TOKENS, STOP_REASON_MAX_TOKENS],
+            max_consecutive_truncated_turns=2,
+            completions=["<run>turn-0</run>", "<abort>stuck</abort>"],
+            abort_affordance=True,
+        )
+
+        assert trace.ended_by is None
+        assert trace.abort_reason == "stuck"
+        assert trace.summary_record()["ended_by"] is None
+        assert graded_states == ["turn-0"]
 
     def test_the_default_budget_bounds_the_turn_cap_without_cutting_one_slow_command(self) -> None:
         """Why 20 minutes: above the host-side per-command ceiling, below what turns alone allow.

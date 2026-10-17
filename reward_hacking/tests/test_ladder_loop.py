@@ -128,6 +128,7 @@ class _EpisodeOptions:
     max_turns: int = 4
     announced_turn_budget: int | None = None
     max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
+    max_consecutive_truncated_turns: int | None = None
     sampling_seed: int | None = None
     thinking_token_budget: int | None = None
     trace_path: Path | None = None
@@ -310,6 +311,7 @@ def _run_episode(
         submit_grader=episode_options.submit_grader or _successful_submission,
         max_model_len=episode_options.max_model_len,
         max_new_tokens=episode_options.max_new_tokens,
+        max_consecutive_truncated_turns=episode_options.max_consecutive_truncated_turns,
         thinking_token_budget=episode_options.thinking_token_budget,
         awareness_scanner=episode_options.awareness_scanner,
         belief_probe=episode_options.belief_probe,
@@ -893,6 +895,105 @@ def _assert_runaway_prompts(
 
 
 class TestNativeToolLoop:
+    def test_two_consecutive_truncated_turns_end_and_grade_the_final_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        graded_state: list[str] = []
+
+        def write_state(episode_dir: Path, command: str, _result: CommandResult) -> None:
+            (episode_dir / "final-state.txt").write_text(command)
+
+        def grade_final_state(episode_dir: Path) -> loop.SubmissionVerdict:
+            graded_state.append((episode_dir / "final-state.txt").read_text())
+            return _successful_submission(episode_dir)
+
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch final-state.txt")),
+                _ScriptedReply(_bash("touch truncated-one.txt"), finish_reason="length"),
+                _ScriptedReply(_bash("touch truncated-two.txt"), finish_reason="length"),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(
+                max_turns=8,
+                max_consecutive_truncated_turns=2,
+                after_command=write_state,
+                submit_grader=grade_final_state,
+            ),
+        )
+
+        assert [turn.stop_reason for turn in trace.turns] == [
+            "end_turn",
+            "max_tokens",
+            "max_tokens",
+        ]
+        assert trace.ended_by == "consecutive_truncated_turns"
+        assert trace.graded_on == "final_state"
+        assert trace.final_state_verdict == {
+            "verdict": "SUCCESS",
+            "feedback": "SUCCESS",
+            "register": "legacy",
+        }
+        assert graded_state == ["touch final-state.txt"]
+        assert trace.summary_record()["ended_by"] == "consecutive_truncated_turns"
+
+    def test_a_normal_turn_resets_the_consecutive_truncation_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch first-truncated.txt"), finish_reason="length"),
+                _ScriptedReply(_bash("touch normal-turn.txt")),
+                _ScriptedReply(_bash("touch second-truncated.txt"), finish_reason="length"),
+                _ScriptedReply(_bash("touch final-normal-turn.txt")),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=4, max_consecutive_truncated_turns=2),
+        )
+
+        assert [turn.stop_reason for turn in trace.turns] == [
+            "max_tokens",
+            "end_turn",
+            "max_tokens",
+            "end_turn",
+        ]
+        assert trace.ended_by == "turn_cap"
+        assert trace.summary_record()["ended_by"] == "turn_cap"
+
+    def test_disabled_consecutive_truncation_limit_preserves_the_turn_cap_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch first-truncated.txt"), finish_reason="length"),
+                _ScriptedReply(_bash("touch second-truncated.txt"), finish_reason="length"),
+                _ScriptedReply(_bash("touch final-normal-turn.txt")),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=3, max_consecutive_truncated_turns=None),
+        )
+
+        assert len(trace.turns) == 3
+        assert trace.ended_by == "turn_cap"
+
     def test_episode_sampling_seed_reaches_turns_and_final_report(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
