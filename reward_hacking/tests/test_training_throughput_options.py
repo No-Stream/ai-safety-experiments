@@ -1,5 +1,8 @@
 """Shared throughput options remain explicit in SFT and organism training."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from reward_hacking.distill.memory import MemoryOptions
@@ -8,7 +11,13 @@ from reward_hacking.organism_rl.cli import parse_args as parse_organism_args
 
 
 @pytest.mark.parametrize("quantization", ["torchao-w8a8", "torchao-fp8-rowwise"])
-def test_trainers_share_explicit_throughput_options(quantization: str) -> None:
+def test_trainers_share_explicit_throughput_options(quantization: str, tmp_path: Path) -> None:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
     options = [
         "--tiled-mlp",
         "--offload-checkpoints",
@@ -23,7 +32,15 @@ def test_trainers_share_explicit_throughput_options(quantization: str) -> None:
         ["--run-dir", "artifacts/synthetic", "--round", "0", "--weight-mode", "sft", *options]
     )
     organism = parse_organism_args(
-        ["--output-dir", "artifacts/synthetic", "--endpoint", "http://localhost:8000", *options]
+        [
+            "--output-dir",
+            "artifacts/synthetic",
+            "--endpoint",
+            "http://localhost:8000",
+            "--quantization-admission",
+            str(admission),
+            *options,
+        ]
     )
     assert memory_options_from_args(sft) == memory_options_from_args(organism)
     configured = memory_options_from_args(sft)

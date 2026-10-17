@@ -36,7 +36,12 @@ from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 from reward_hacking.distill.train import chunked_completion_logps
 from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.admission import LiveKVAdmission
+from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.phases import VLLMPhaseController
+from reward_hacking.organism_rl.precision import (
+    assert_fp32_training_state,
+    record_precision_provenance,
+)
 
 # One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
 DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
@@ -385,6 +390,15 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self._non_training_seconds = 0.0
         self._rows_skipped_this_step = 0
         self._gap_tokens_this_step = 0
+        self._sampler_logprob_gap_sum_this_step = 0.0
+        self._sampler_logprob_gap_abs_sum_this_step = 0.0
+        self._sampler_ratio_capped_tokens_this_step = 0
+        self._fresh_sampler_gap_abs_sum_this_step = 0.0
+        self._fresh_sampler_tokens_this_step = 0
+        self._fresh_sampler_ratio_capped_tokens_this_step = 0
+        self._stale_sampler_gap_abs_sum_this_step = 0.0
+        self._stale_sampler_tokens_this_step = 0
+        self._stale_sampler_ratio_capped_tokens_this_step = 0
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
             trainer.next_prompts = self._next_prompts_for_current_step()
@@ -428,6 +442,9 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
 
         kwargs["rollout_func"] = captured_rollout
         super().__init__(*args, **kwargs)
+        if self.model is None:
+            raise RuntimeError("Organism trainer requires a model")
+        assert_fp32_training_state(self.model, self._precision_optimizer())
         self._validate_configuration()
         TrainingThroughputCallback(non_training_seconds=lambda: self._non_training_seconds).attach(
             self
@@ -522,13 +539,54 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     def _finish_training_step_metrics(self) -> None:
         metrics = self._metrics["train"]
         metrics["organism/rows_skipped_zero_advantage"].append(self._rows_skipped_this_step)
-        if self._gap_tokens_this_step == 0:
-            metrics["organism/trainer_sampler_logprob_gap"].append(math.nan)
-            metrics["organism/trainer_sampler_logprob_gap_abs"].append(math.nan)
-            metrics["organism/trainer_sampler_logprob_gap_tokens"].append(0)
-            metrics["organism/sampler_ratio_capped_fraction"].append(math.nan)
+        token_count = self._gap_tokens_this_step
+        metrics["organism/trainer_sampler_logprob_gap"].append(
+            self._sampler_logprob_gap_sum_this_step / token_count if token_count else math.nan
+        )
+        metrics["organism/trainer_sampler_logprob_gap_abs"].append(
+            self._sampler_logprob_gap_abs_sum_this_step / token_count if token_count else math.nan
+        )
+        metrics["organism/trainer_sampler_logprob_gap_tokens"].append(token_count)
+        metrics["organism/sampler_ratio_capped_fraction"].append(
+            self._sampler_ratio_capped_tokens_this_step / token_count if token_count else math.nan
+        )
+        for freshness, freshness_token_count, abs_gap_sum, capped_token_count in (
+            (
+                "fresh",
+                self._fresh_sampler_tokens_this_step,
+                self._fresh_sampler_gap_abs_sum_this_step,
+                self._fresh_sampler_ratio_capped_tokens_this_step,
+            ),
+            (
+                "stale",
+                self._stale_sampler_tokens_this_step,
+                self._stale_sampler_gap_abs_sum_this_step,
+                self._stale_sampler_ratio_capped_tokens_this_step,
+            ),
+        ):
+            metrics[f"organism/trainer_sampler_logprob_gap_abs_{freshness}"].append(
+                abs_gap_sum / freshness_token_count if freshness_token_count else math.nan
+            )
+            metrics[f"organism/sampler_ratio_capped_fraction_{freshness}"].append(
+                capped_token_count / freshness_token_count if freshness_token_count else math.nan
+            )
         self._rows_skipped_this_step = 0
         self._gap_tokens_this_step = 0
+        self._sampler_logprob_gap_sum_this_step = 0.0
+        self._sampler_logprob_gap_abs_sum_this_step = 0.0
+        self._sampler_ratio_capped_tokens_this_step = 0
+        self._fresh_sampler_gap_abs_sum_this_step = 0.0
+        self._fresh_sampler_tokens_this_step = 0
+        self._fresh_sampler_ratio_capped_tokens_this_step = 0
+        self._stale_sampler_gap_abs_sum_this_step = 0.0
+        self._stale_sampler_tokens_this_step = 0
+        self._stale_sampler_ratio_capped_tokens_this_step = 0
+
+    def _precision_optimizer(self) -> torch.optim.Optimizer | None:
+        optimizer = self.optimizer
+        if optimizer is not None and not isinstance(optimizer, torch.optim.Optimizer):
+            raise TypeError("Organism precision checks require a PyTorch optimizer")
+        return optimizer
 
     @override
     def train(
@@ -680,11 +738,73 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         gap = (trainer_logprobs - sampler_logprobs).masked_fill(~assistant_mask.bool(), 0)
         ratio = gap.clamp(max=math.log(self.importance_ratio_cap)).exp()
         stale_mask = inputs.get("sampler_stale_mask")
-        if stale_mask is not None:
-            if stale_mask.shape != ratio.shape or stale_mask.dtype != torch.bool:
-                raise ValueError("sampler stale mask must align with completion logprobs")
-            ratio = torch.where(stale_mask & assistant_mask.bool(), ratio, 1.0)
+        if stale_mask is not None and (
+            stale_mask.shape != ratio.shape or stale_mask.dtype != torch.bool
+        ):
+            raise ValueError("sampler stale mask must align with completion logprobs")
         return ratio, gap
+
+    def _record_sampler_correction_metrics(
+        self,
+        mode: str,
+        gap: torch.Tensor,
+        assistant_mask: torch.Tensor,
+        stale_mask: torch.Tensor,
+    ) -> None:
+        assistant_mask = assistant_mask.bool()
+        token_count = int(assistant_mask.sum().item())
+        capped_token_count = int(
+            ((gap > math.log(self.importance_ratio_cap)) * assistant_mask).sum().item()
+        )
+        if mode == "train":
+            self._gap_tokens_this_step += token_count
+            self._sampler_logprob_gap_sum_this_step += gap.sum().item()
+            self._sampler_logprob_gap_abs_sum_this_step += gap.abs().sum().item()
+            self._sampler_ratio_capped_tokens_this_step += capped_token_count
+        else:
+            metrics = self._metrics[mode]
+            metrics["organism/trainer_sampler_logprob_gap"].append(
+                gap.sum().item() / token_count if token_count else math.nan
+            )
+            metrics["organism/trainer_sampler_logprob_gap_abs"].append(
+                gap.abs().sum().item() / token_count if token_count else math.nan
+            )
+            metrics["organism/trainer_sampler_logprob_gap_tokens"].append(token_count)
+            metrics["organism/sampler_ratio_capped_fraction"].append(
+                capped_token_count / token_count if token_count else math.nan
+            )
+        self._record_sampler_freshness_metrics(mode, "fresh", gap, assistant_mask & ~stale_mask)
+        self._record_sampler_freshness_metrics(mode, "stale", gap, assistant_mask & stale_mask)
+
+    def _record_sampler_freshness_metrics(
+        self,
+        mode: str,
+        freshness: str,
+        gap: torch.Tensor,
+        freshness_mask: torch.Tensor,
+    ) -> None:
+        token_count = int(freshness_mask.sum().item())
+        abs_gap_sum = (gap.abs() * freshness_mask).sum().item()
+        capped_token_count = int(
+            ((gap > math.log(self.importance_ratio_cap)) * freshness_mask).sum().item()
+        )
+        if mode == "train":
+            if freshness == "fresh":
+                self._fresh_sampler_tokens_this_step += token_count
+                self._fresh_sampler_gap_abs_sum_this_step += abs_gap_sum
+                self._fresh_sampler_ratio_capped_tokens_this_step += capped_token_count
+            else:
+                self._stale_sampler_tokens_this_step += token_count
+                self._stale_sampler_gap_abs_sum_this_step += abs_gap_sum
+                self._stale_sampler_ratio_capped_tokens_this_step += capped_token_count
+            return
+        metrics = self._metrics[mode]
+        metrics[f"organism/trainer_sampler_logprob_gap_abs_{freshness}"].append(
+            abs_gap_sum / token_count if token_count else math.nan
+        )
+        metrics[f"organism/sampler_ratio_capped_fraction_{freshness}"].append(
+            capped_token_count / token_count if token_count else math.nan
+        )
 
     @override
     def _get_per_token_logps_and_entropies(
@@ -728,29 +848,13 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
                 advantages = advantages[:, None]
             loss_inputs["advantages"] = advantages * ratio
             assistant_mask: torch.Tensor = loss_inputs["completion_mask"] * loss_inputs["tool_mask"]
+            stale_mask: torch.Tensor = loss_inputs.get(
+                "sampler_stale_mask", torch.zeros_like(assistant_mask, dtype=torch.bool)
+            )
+            if stale_mask.shape != assistant_mask.shape or stale_mask.dtype != torch.bool:
+                raise ValueError("sampler stale mask must align with completion logprobs")
             mode = "train" if model.training else "eval"
-            self._metrics[mode]["organism/trainer_sampler_logprob_gap"].append(
-                gap.sum().item() / max(assistant_mask.sum().item(), 1)
-            )
-            token_count = int(assistant_mask.sum().item())
-            if mode == "train":
-                self._gap_tokens_this_step += token_count
-            self._metrics[mode]["organism/trainer_sampler_logprob_gap_abs"].append(
-                gap.abs().sum().item() / token_count if token_count else math.nan
-            )
-            self._metrics[mode]["organism/trainer_sampler_logprob_gap_tokens"].append(token_count)
-            self._metrics[mode]["organism/sampler_ratio_capped_fraction"].append(
-                (
-                    (gap > math.log(self.importance_ratio_cap))
-                    * assistant_mask
-                    * loss_inputs.get("sampler_stale_mask", torch.ones_like(assistant_mask))
-                )
-                .sum()
-                .item()
-                / token_count
-                if token_count
-                else math.nan
-            )
+            self._record_sampler_correction_metrics(mode, gap, assistant_mask, stale_mask)
         return per_token_logps, entropies, aux_loss
 
     def _compute_loss(self, model: nn.Module, inputs: dict[str, Any]) -> torch.Tensor:
@@ -780,6 +884,13 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             self._active_loss_inputs = None
 
     def _save_checkpoint(self, model: nn.Module, trial: dict[str, Any] | None) -> None:
+        optimizer = self._precision_optimizer()
+        assert_fp32_training_state(model, optimizer)
+        if self.args.output_dir is None:
+            raise RuntimeError("Organism checkpoints require an output directory")
+        output_dir = Path(self.args.output_dir)
+        if active_provenance_path(output_dir).exists():
+            record_precision_provenance(output_dir, model, optimizer)
         super()._save_checkpoint(model, trial)
         directory = Path(self._get_output_dir(trial=trial)) / f"checkpoint-{self.state.global_step}"
         (directory / "rollout_records.json").write_text(json.dumps(self.step_rollout_records))
@@ -807,3 +918,10 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     ) -> None:
         validate_checkpoint(Path(resume_from_checkpoint))
         super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+    @override
+    def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
+        super()._load_optimizer_and_scheduler(checkpoint)
+        if self.model is None:
+            raise RuntimeError("Organism trainer requires a model")
+        assert_fp32_training_state(self.model, self._precision_optimizer())

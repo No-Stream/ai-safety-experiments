@@ -67,6 +67,9 @@ class VLLMServerConfig:
     mamba_ssm_cache_dtype: str | None = None
     max_num_batched_tokens: int | None = None
     quantization: str | None = None
+    quantization_config: Mapping[str, object] | None = None
+    hf_overrides: Mapping[str, object] | None = None
+    served_model_name: str | None = None
     enable_lora: bool = False
     max_lora_rank: int | None = None
     enable_sleep_mode: bool = False
@@ -135,6 +138,8 @@ class VLLMServerConfig:
             raise ValueError("lora module names and paths must be non-empty")
         if self.limit_mm_per_prompt == "":
             raise ValueError("limit_mm_per_prompt must be non-empty when supplied")
+        if self.served_model_name == "":
+            raise ValueError("served_model_name must be non-empty when supplied")
         if self.reasoning_config is not None:
             self._validate_reasoning_config()
         if not self.health_path.startswith("/"):
@@ -222,6 +227,15 @@ class VLLMServerConfig:
         ):
             if value is not None:
                 command.extend([option, str(value)])
+        if self.quantization_config is not None:
+            command.extend(
+                [
+                    "--quantization-config",
+                    json.dumps(dict(self.quantization_config), separators=(",", ":")),
+                ]
+            )
+        if self.served_model_name is not None:
+            command.extend(["--served-model-name", self.served_model_name])
         if self.enable_lora:
             command.append("--enable-lora")
         if self.max_lora_rank is not None:
@@ -244,6 +258,10 @@ class VLLMServerConfig:
                     "--speculative-config",
                     json.dumps(dict(self.speculative_config), separators=(",", ":")),
                 ]
+            )
+        if self.hf_overrides is not None:
+            command.extend(
+                ["--hf-overrides", json.dumps(dict(self.hf_overrides), separators=(",", ":"))]
             )
         return command
 

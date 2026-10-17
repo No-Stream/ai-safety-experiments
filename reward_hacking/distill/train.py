@@ -308,6 +308,26 @@ def _active_completion_positions(
     return loss_mask.to(device=targets.device, dtype=torch.bool).reshape(-1).nonzero().squeeze(1)
 
 
+def _copy_fp32_head_weights(
+    head: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not isinstance(head, torch.nn.Linear):
+        raise TypeError("the output embedding must be a torch.nn.Linear module")
+    weight = head.weight.detach().to(dtype=torch.float32)
+    bias_parameter = cast("torch.Tensor | None", head.bias)
+    bias = None if bias_parameter is None else bias_parameter.detach().to(dtype=torch.float32)
+    return weight, bias
+
+
+def _fp32_head_logits(
+    hidden_slice: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    with torch.autocast(device_type=hidden_slice.device.type, enabled=False):
+        return torch.nn.functional.linear(hidden_slice.to(dtype=torch.float32), weight, bias)
+
+
 def _score_active_completion_positions(  # noqa: PLR0913 - explicit scoring and memory settings
     flat_hidden: torch.Tensor,
     active_positions: torch.Tensor,
@@ -318,8 +338,10 @@ def _score_active_completion_positions(  # noqa: PLR0913 - explicit scoring and 
     chunk_tokens: int,
     compute_entropy: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    head_weight, head_bias = _copy_fp32_head_weights(head)
+
     def float32_head(hidden_slice: torch.Tensor) -> torch.Tensor:
-        return cast("torch.Tensor", head(hidden_slice)).float()
+        return _fp32_head_logits(hidden_slice, head_weight, head_bias)
 
     def score_slice(
         hidden_states: torch.Tensor, position_slice: torch.Tensor, token_slice: torch.Tensor

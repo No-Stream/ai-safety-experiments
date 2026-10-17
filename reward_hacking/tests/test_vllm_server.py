@@ -73,6 +73,7 @@ def _config(fake_vllm: Path) -> VLLMServerConfig:
         revision="test-revision",
         max_model_len=4096,
         gpu_memory_utilization=0.55,
+        hf_overrides={"head_dtype": "float32"},
         language_model_only=True,
         host="127.0.0.1",
         port=8000,
@@ -112,6 +113,8 @@ def test_command_contains_verified_serve_flags(fake_vllm: Path) -> None:
         "--gpu-memory-utilization",
         "0.55",
         "--language-model-only",
+        "--hf-overrides",
+        '{"head_dtype":"float32"}',
     ]
 
 
@@ -133,12 +136,15 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
         max_num_batched_tokens=8192,
         kv_cache_dtype="fp8",
         quantization="fp8_per_tensor",
+        quantization_config={"ignore": ["*linear_attn.*", "lm_head"]},
+        model="models/sampler-checkpoint",
+        served_model_name="Qwen/test-model",
     )
 
     assert config.command() == [
         str(fake_vllm),
         "serve",
-        "Qwen/test-model",
+        "models/sampler-checkpoint",
         "--revision",
         "test-revision",
         "--host",
@@ -163,6 +169,12 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
         "8192",
         "--quantization",
         "fp8_per_tensor",
+        "--quantization-config",
+        '{"ignore":["*linear_attn.*","lm_head"]}',
+        "--served-model-name",
+        "Qwen/test-model",
+        "--hf-overrides",
+        '{"head_dtype":"float32"}',
     ]
 
 
@@ -184,7 +196,8 @@ def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_
         limit_mm_per_prompt='{"image": 0}',
     )
 
-    assert config.command()[-8:] == [
+    command = config.command()
+    assert command[command.index("--enable-lora") :] == [
         "--enable-lora",
         "--max-lora-rank",
         "64",
@@ -193,16 +206,32 @@ def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_
         f"somo-olmo-s2={adapters[1]}",
         "--limit-mm-per-prompt",
         '{"image": 0}',
+        "--hf-overrides",
+        '{"head_dtype":"float32"}',
     ]
 
 
 def test_command_renders_reasoning_config(fake_vllm: Path) -> None:
     config = replace(_config(fake_vllm), reasoning_config=QWEN_THINKING_REASONING_CONFIG)
 
-    assert config.command()[-2:] == [
-        "--reasoning-config",
-        json.dumps(dict(QWEN_THINKING_REASONING_CONFIG), separators=(",", ":")),
-    ]
+    command = config.command()
+    assert command[command.index("--reasoning-config") + 1] == json.dumps(
+        dict(QWEN_THINKING_REASONING_CONFIG), separators=(",", ":")
+    )
+    assert command[-2:] == ["--hf-overrides", '{"head_dtype":"float32"}']
+
+
+def test_command_renders_explicit_hf_overrides(fake_vllm: Path) -> None:
+    config = replace(
+        _config(fake_vllm), hf_overrides={"head_dtype": "float32", "trust_remote_code": True}
+    )
+
+    command = config.command()
+
+    assert json.loads(command[command.index("--hf-overrides") + 1]) == {
+        "head_dtype": "float32",
+        "trust_remote_code": True,
+    }
 
 
 def test_command_enables_sleep_mode_for_runtime_lora_training(fake_vllm: Path) -> None:

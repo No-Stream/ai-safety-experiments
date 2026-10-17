@@ -8,11 +8,13 @@ from typing import Any, cast
 import pytest
 import torch
 from datasets import Dataset
+from peft import LoraConfig, get_peft_model
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+import reward_hacking.distill.train as distill_train
 from reward_hacking.distill.train import chunked_completion_logps
 from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.trainer import (
@@ -72,6 +74,7 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     *,
     checkpoint_keep_latest: int = 2,
     checkpoint_keep_middle: int = 3,
+    importance_ratio_cap: float = 2.0,
     training_samples: int = 2,
     prompts_per_step: int = 1,
     generations: int = 2,
@@ -93,19 +96,31 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         pad_token=pad_token_name,
         eos_token=eos_token_name,
     )
-    model = GPT2LMHeadModel(
-        GPT2Config(
-            vocab_size=5,
-            n_layer=1,
-            n_head=1,
-            n_embd=8,
-            n_positions=32,
-            resid_pdrop=0,
-            embd_pdrop=0,
-            attn_pdrop=0,
-            bos_token_id=2,
-            eos_token_id=1,
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = GPT2LMHeadModel(
+            GPT2Config(
+                vocab_size=5,
+                n_layer=1,
+                n_head=1,
+                n_embd=8,
+                n_positions=32,
+                resid_pdrop=0,
+                embd_pdrop=0,
+                attn_pdrop=0,
+                bos_token_id=2,
+                eos_token_id=1,
+            )
         )
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type="CAUSAL_LM",
+            r=2,
+            lora_alpha=4,
+            fan_in_fan_out=True,
+            target_modules=["c_attn"],
+        ),
     )
     args = GRPOConfig(
         output_dir=str(directory),
@@ -183,6 +198,7 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         reward_funcs=reward,
         rollout_func=rollout,
         teacher_beta=teacher_beta,
+        importance_ratio_cap=importance_ratio_cap,
         sampler_log_path=sampler_log_path,
         checkpoint_keep_latest=checkpoint_keep_latest,
         checkpoint_keep_middle=checkpoint_keep_middle,
@@ -367,7 +383,7 @@ def test_masked_chunked_grpo_loss_and_gradients_match_full_head(
 
 
 def test_masked_chunked_logprobs_preserve_metrics_and_skip_inactive_head_positions(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     trainer = _trainer(tmp_path, logprob_chunk_tokens=2)
     assert trainer.model is not None
@@ -393,30 +409,29 @@ def test_masked_chunked_logprobs_preserve_metrics_and_skip_inactive_head_positio
         "sampling_per_token_logps": sampler_logps,
         "advantages": torch.ones((1,)),
     }
-    head = cast("GPT2LMHeadModel", trainer.model).get_output_embeddings()
-    assert head is not None
     head_position_counts: list[int] = []
+    original_head_logits = distill_train._fp32_head_logits
 
-    def record_head_positions(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
-        del module
-        head_position_counts.append(args[0].size(1))
+    def record_head_positions(
+        hidden_slice: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        head_position_counts.append(hidden_slice.size(1))
+        return original_head_logits(hidden_slice, weight, bias)
 
-    head_hook = head.register_forward_pre_hook(record_head_positions)
-    try:
-        with torch.no_grad():
-            logps, entropies, auxiliary_loss = trainer._get_per_token_logps_and_entropies(
-                trainer.model,
-                input_ids,
-                attention_mask,
-                completion_length,
-                compute_entropy=True,
-            )
-    finally:
-        head_hook.remove()
+    monkeypatch.setattr(distill_train, "_fp32_head_logits", record_head_positions)
+    with torch.no_grad():
+        logps, entropies, auxiliary_loss = trainer._get_per_token_logps_and_entropies(
+            trainer.model,
+            input_ids,
+            attention_mask,
+            completion_length,
+            compute_entropy=True,
+        )
     assert auxiliary_loss is None
     assert entropies is not None
     assert sum(head_position_counts) == 2 * int(completion_mask.sum())
     assert trainer._active_loss_inputs is None
+    trainer._finish_training_step_metrics()
     active_gap = (full_logps - sampler_logps).masked_select(completion_mask)
     metrics = trainer._metrics["train"]
     assert metrics["organism/trainer_sampler_logprob_gap"][-1] == pytest.approx(
@@ -437,7 +452,8 @@ def test_empty_loss_mask_returns_zero_scores_without_running_the_head(tmp_path: 
     assert trainer.model is not None
     input_ids = torch.tensor([[2, 3, 4, 3, 4]])
     loss_mask = torch.zeros((1, 3), dtype=torch.bool)
-    head = cast("GPT2LMHeadModel", trainer.model).get_output_embeddings()
+    base_model = cast("Any", trainer.model).get_base_model()
+    head = cast("GPT2LMHeadModel", base_model).get_output_embeddings()
     assert head is not None
     head_calls = 0
 
@@ -489,9 +505,8 @@ def test_ragged_episodes_train_on_trimmed_micro_batches(tmp_path: Path) -> None:
         del module, args
         backbone_widths.append(kwargs["input_ids"].shape[1])
 
-    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
-        record_width, with_kwargs=True
-    )
+    base_model = cast("GPT2LMHeadModel", cast("Any", trainer.model).get_base_model())
+    hook = base_model.transformer.register_forward_pre_hook(record_width, with_kwargs=True)
     try:
         trainer.train()
     finally:
@@ -657,7 +672,7 @@ def test_sampler_correction_is_capped_only_on_assistant_tokens(tmp_path: Path) -
     assert torch.equal(ratio[:, 1:], torch.ones((2, 2)))
 
 
-def test_sampler_correction_applies_only_to_stale_assistant_tokens(tmp_path: Path) -> None:
+def test_sampler_correction_applies_to_fresh_and_stale_assistant_tokens(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     inputs = {
         "sampling_per_token_logps": torch.tensor([[-100.0, -100.0, -100.0, -100.0]]),
@@ -666,7 +681,68 @@ def test_sampler_correction_applies_only_to_stale_assistant_tokens(tmp_path: Pat
         "sampler_stale_mask": torch.tensor([[False, True, False, True]]),
     }
     ratio, _ = trainer._sampler_correction(torch.zeros((1, 4)), inputs)
-    assert torch.equal(ratio, torch.tensor([[1.0, 2.0, 1.0, 1.0]]))
+    assert torch.equal(ratio, torch.tensor([[2.0, 2.0, 2.0, 1.0]]))
+
+
+def test_sampler_correction_uses_configured_truncation_cap(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, importance_ratio_cap=1.25)
+    inputs = {
+        "sampling_per_token_logps": torch.tensor([[-100.0, -100.0]]),
+        "completion_mask": torch.ones((1, 2)),
+        "tool_mask": torch.ones((1, 2)),
+    }
+    ratio, _ = trainer._sampler_correction(torch.zeros((1, 2)), inputs)
+    assert torch.equal(ratio, torch.full((1, 2), 1.25))
+
+
+def test_tis_gradient_matches_hand_computed_policy_gradient(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, importance_ratio_cap=1.5)
+    assert trainer.model is not None
+    trainer.model.eval()
+    inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    inputs["completion_mask"] = torch.ones_like(inputs["completion_mask"])
+    inputs["tool_mask"] = torch.tensor([[1, 1, 0], [1, 1, 0]])
+    inputs["sampler_stale_mask"] = torch.tensor([[False, False, False], [True, True, False]])
+    inputs["advantages"] = torch.tensor([1.25, -0.6])
+    assistant_mask = (inputs["completion_mask"] * inputs["tool_mask"]).bool()
+    input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
+    attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
+    selected_trainer_logprobs, _, _ = trainer._get_per_token_logps_and_entropies(
+        trainer.model,
+        input_ids,
+        attention_mask,
+        inputs["completion_ids"].shape[1],
+    )
+    selected_log_ratios = torch.tensor([[0.8, 0.1, 10.0], [math.log(0.5), math.log(3.0), 10.0]])
+    inputs["sampling_per_token_logps"] = selected_trainer_logprobs.detach() - selected_log_ratios
+    inputs["old_per_token_logps"] = selected_trainer_logprobs.detach()
+    expected_ratio = (
+        selected_log_ratios.masked_fill(~assistant_mask, 0)
+        .clamp(max=math.log(trainer.importance_ratio_cap))
+        .exp()
+    )
+    assert torch.allclose(
+        expected_ratio, torch.tensor([[1.5, math.exp(0.1), 1.0], [0.5, 1.5, 1.0]])
+    )
+    expected_advantages = inputs["advantages"][:, None] * expected_ratio
+    policy_ratio = (selected_trainer_logprobs - inputs["old_per_token_logps"]).exp()
+    expected_loss = -(
+        (policy_ratio * expected_advantages * assistant_mask).sum(dim=-1)
+        / assistant_mask.sum(dim=-1)
+    ).mean()
+    trainable_parameters = [
+        parameter for parameter in trainer.model.parameters() if parameter.requires_grad
+    ]
+    expected_gradients = torch.autograd.grad(expected_loss, trainable_parameters)
+
+    actual_loss = trainer._compute_loss(trainer.model, inputs)
+    actual_gradients = torch.autograd.grad(actual_loss, trainable_parameters)
+
+    assert torch.allclose(actual_loss, expected_loss, atol=1e-6)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        assert torch.allclose(actual_gradient, expected_gradient, atol=1e-6, rtol=1e-5)
 
 
 def test_trainer_drains_requests_before_sleep_and_reopens_after_sync(tmp_path: Path) -> None:
@@ -760,9 +836,8 @@ def test_training_step_uses_one_forward_per_microbatch(tmp_path: Path) -> None:
         input_ids: torch.Tensor = kwargs["input_ids"]
         forward_batch_sizes.append(input_ids.shape[0])
 
-    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
-        record_batch, with_kwargs=True
-    )
+    base_model = cast("GPT2LMHeadModel", cast("Any", trainer.model).get_base_model())
+    hook = base_model.transformer.register_forward_pre_hook(record_batch, with_kwargs=True)
     try:
         trainer.train()
     finally:
@@ -791,7 +866,8 @@ def test_zero_advantage_skip_preserves_all_parameter_gradients(tmp_path: Path) -
     trainer.model.zero_grad(set_to_none=True)
 
     forward_calls: list[int] = []
-    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+    base_model = cast("GPT2LMHeadModel", cast("Any", trainer.model).get_base_model())
+    hook = base_model.transformer.register_forward_pre_hook(
         lambda _module, _args: forward_calls.append(1)
     )
     try:
@@ -826,7 +902,8 @@ def test_teacher_term_prevents_zero_advantage_skip(tmp_path: Path) -> None:
     }
     trainer.current_gradient_accumulation_steps = trainer.args.gradient_accumulation_steps
     forward_calls: list[int] = []
-    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+    base_model = cast("GPT2LMHeadModel", cast("Any", trainer.model).get_base_model())
+    hook = base_model.transformer.register_forward_pre_hook(
         lambda _module, _args: forward_calls.append(1)
     )
     try:
@@ -1087,6 +1164,42 @@ def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) 
     assert trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap_tokens"][-1] == 2
 
 
+def test_step_sampler_metrics_weight_tokens_across_microbatches(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    trainer.model.train()
+    prompt_ids = torch.tensor([[2]])
+    completion_ids = torch.tensor([[3, 4, 1]])
+    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    attention_mask = torch.ones_like(input_ids)
+    for active_tool_mask, stale_mask, selected_gaps in (
+        ([1, 0, 0], [False, False, False], [2.0, 0.0, 0.0]),
+        ([1, 1, 0], [False, True, False], [0.1, 0.3, 0.0]),
+    ):
+        with torch.no_grad():
+            trainer_logprobs, _, _ = trainer._get_per_token_logps_and_entropies(
+                trainer.model, input_ids, attention_mask, completion_ids.shape[1]
+            )
+        trainer._active_loss_inputs = {
+            "completion_mask": torch.ones((1, 3)),
+            "tool_mask": torch.tensor([active_tool_mask]),
+            "sampler_stale_mask": torch.tensor([stale_mask]),
+            "sampling_per_token_logps": trainer_logprobs - torch.tensor([selected_gaps]),
+            "advantages": torch.ones((1,)),
+        }
+        with torch.no_grad():
+            trainer._get_per_token_logps_and_entropies(
+                trainer.model, input_ids, attention_mask, completion_ids.shape[1]
+            )
+    trainer._finish_training_step_metrics()
+
+    metrics = trainer._metrics["train"]
+    assert metrics["organism/sampler_ratio_capped_fraction_fresh"][-1] == pytest.approx(0.5)
+    assert metrics["organism/sampler_ratio_capped_fraction_stale"][-1] == 0.0
+    assert metrics["organism/trainer_sampler_logprob_gap_abs_fresh"][-1] == pytest.approx(1.05)
+    assert metrics["organism/trainer_sampler_logprob_gap_abs_stale"][-1] == pytest.approx(0.3)
+
+
 def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     assert trainer.train().global_step == 1
@@ -1100,6 +1213,20 @@ def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path
     ):
         assert torch.equal(expected, restored)
     assert resumed.train(resume_from_checkpoint=True).global_step == 1
+
+
+def test_optimizer_restore_guard_rejects_low_precision_moments(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    optimizer = trainer.create_optimizer()
+    trainer.create_scheduler(num_training_steps=1, optimizer=optimizer)
+    parameter = next(
+        parameter for parameter in trainer.model.parameters() if parameter.requires_grad
+    )
+    optimizer.state[parameter]["exp_avg"] = torch.zeros_like(parameter, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="must be float32"):
+        trainer._save_checkpoint(trainer.model, None)
+    assert not (tmp_path / "checkpoint-0").exists()
 
 
 def test_resuming_completed_run_applies_final_retention(tmp_path: Path) -> None:

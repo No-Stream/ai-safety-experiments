@@ -1142,21 +1142,24 @@ def test_resume_ignores_base_revision_but_refuses_changed_dataset(tmp_path: Path
         resumed.train(resume_from_checkpoint="latest")
 
 
-def test_chunked_head_recomputes_bounded_slices_during_backward() -> None:
+def test_chunked_head_recomputes_bounded_slices_during_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model = tiny_model().eval()
     head_positions: list[int] = []
+    original_fp32_head_logits = distill_train._fp32_head_logits
 
     def record_head(
-        _module: torch.nn.Module, inputs: tuple[torch.Tensor, ...], _output: torch.Tensor
-    ) -> None:
-        head_positions.append(inputs[0].size(1))
+        hidden_slice: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        head_positions.append(hidden_slice.size(1))
+        return original_fp32_head_logits(hidden_slice, weight, bias)
 
-    handle = model.get_output_embeddings().register_forward_hook(record_head)
-    try:
-        logps = completion_logps(model, torch.tensor([[1, 2, 3, 4, 5, 6, 7]]), 2, chunk_tokens=2)
-        (-logps.mean()).backward()
-    finally:
-        handle.remove()
+    monkeypatch.setattr(distill_train, "_fp32_head_logits", record_head)
+    logps = completion_logps(model, torch.tensor([[1, 2, 3, 4, 5, 6, 7]]), 2, chunk_tokens=2)
+    (-logps.mean()).backward()
     assert max(head_positions) <= 2
     assert len(head_positions) == 6  # Three forward slices, each recomputed in backward.
 

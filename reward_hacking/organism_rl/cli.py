@@ -30,7 +30,7 @@ from reward_hacking.distill.memory import (
     load_base_model,
     prepare_checkpoint_offload,
 )
-from reward_hacking.distill.train import memory_options_from_args
+from reward_hacking.distill.train import cast_lora_to_float32, memory_options_from_args
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
@@ -40,6 +40,10 @@ from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
+from reward_hacking.organism_rl.precision import (
+    assert_fp32_training_state,
+    record_precision_provenance,
+)
 from reward_hacking.organism_rl.rollout import (
     MixedEpisodeSource,
     OrganismRollout,
@@ -69,15 +73,6 @@ TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 MINIMUM_RETAINED_CHECKPOINTS = 2
 MAXIMUM_MIDDLE_CHECKPOINTS = 3
-
-
-def cast_lora_to_bf16(model: torch.nn.Module) -> None:
-    """Preserve the quantized RL recipe's bf16 adapters after PEFT initialization."""
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad:
-            if "lora_" not in name:
-                raise RuntimeError(f"only LoRA parameters may train: {name}")
-            parameter.data = parameter.data.to(torch.bfloat16)
 
 
 @dataclass(frozen=True)
@@ -184,9 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
     parser.add_argument("--mamba-cache-mode")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"))
-    parser.add_argument(
-        "--mamba-ssm-cache-dtype", choices=("auto", "float32", "float16", "bfloat16")
-    )
+    parser.add_argument("--mamba-ssm-cache-dtype", choices=("auto", "float32", "bfloat16"))
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--num-generations", type=int)
@@ -254,6 +247,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         choices=("none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"),
         default="none",
     )
+    parser.add_argument(
+        "--sampler-quantization",
+        choices=("none", "fp8_per_channel", "fp8_per_block", "fp8_per_tensor"),
+        default="none",
+    )
+    parser.add_argument("--sampler-checkpoint")
+    parser.add_argument("--sampler-checkpoint-revision")
+    parser.add_argument("--sampler-quantization-ignore", action="append", default=[])
+    parser.add_argument("--quantization-admission", type=Path)
     add_leak_arguments(parser)
     args = parser.parse_args(argv)
     resolve_leak_options(args, parser, partition="train")
@@ -270,6 +272,40 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
     _validate_owned_server_args(args, parser)
     _validate_sampling_args(args, parser)
     _validate_speculation(args, parser)
+    _validate_quantization_admission(args, parser)
+
+
+def _validate_quantization_admission(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    quantized = (
+        args.base_quantization != "none"
+        or args.sampler_quantization != "none"
+        or args.sampler_checkpoint is not None
+        or args.kv_cache_dtype == "fp8"
+        or args.mamba_ssm_cache_dtype == "bfloat16"
+    )
+    if quantized and args.quantization_admission is None:
+        parser.error(
+            "quantization requires --quantization-admission with before/after logprob gaps"
+        )
+    if args.quantization_admission is not None:
+        try:
+            record = json.loads(args.quantization_admission.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read quantization-admission: {exc}")
+        if not isinstance(record, dict) or any(
+            not isinstance(record.get(stage), dict)
+            or not isinstance(record[stage].get("mean_abs_logprob_gap"), (int, float))
+            or not math.isfinite(record[stage]["mean_abs_logprob_gap"])
+            or record[stage]["mean_abs_logprob_gap"] < 0
+            for stage in ("before", "after")
+        ):
+            parser.error("quantization-admission requires finite before/after mean_abs_logprob_gap")
+    if args.sampler_checkpoint_revision is not None and args.sampler_checkpoint is None:
+        parser.error("sampler-checkpoint-revision requires sampler-checkpoint")
+    if args.sampler_quantization_ignore and args.sampler_quantization == "none":
+        parser.error("sampler-quantization-ignore requires sampler-quantization")
 
 
 def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -369,6 +405,8 @@ def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
         return None
     if args.speculative_config is not None:
         return cast("dict[str, object]", args.speculative_config)
+    if args.sampler_checkpoint is not None or args.sampler_quantization != "none":
+        return None
     return default_mtp_speculative_config(args.model)
 
 
@@ -381,8 +419,9 @@ def build_server_config(
     if args.gpu_memory_utilization is None:
         raise ValueError("owned vLLM server requires --gpu-memory-utilization")
     return VLLMServerConfig(
-        model=args.model,
-        revision=model_revision,
+        model=args.sampler_checkpoint or args.model,
+        revision=args.sampler_checkpoint_revision if args.sampler_checkpoint else model_revision,
+        served_model_name=args.model if args.sampler_checkpoint else None,
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         language_model_only=True,
@@ -395,6 +434,13 @@ def build_server_config(
         mamba_cache_mode=args.mamba_cache_mode,
         kv_cache_dtype=args.kv_cache_dtype,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        quantization=args.sampler_quantization if args.sampler_quantization != "none" else None,
+        quantization_config=(
+            {"ignore": args.sampler_quantization_ignore}
+            if args.sampler_quantization_ignore
+            else None
+        ),
+        hf_overrides={"head_dtype": "float32"},
         reasoning_config=args.reasoning_config,
         speculative_config=_speculative_config(args),
         executable=str(Path(sys.executable).with_name("vllm")),
@@ -479,7 +525,7 @@ def _task_sources_match(previous: object, current: object) -> bool:
     )
 
 
-def write_provenance(
+def write_provenance(  # noqa: C901 - explicit resume identity checks
     args: argparse.Namespace,
     device: dict[str, object],
     model_revision: str | None = None,
@@ -535,6 +581,16 @@ def write_provenance(
         "model_revision": model_revision,
         "model_identity": model_identity(args.model, model_revision),
         "trl_version": version("trl"),
+        "quantization_admission": (
+            json.loads(args.quantization_admission.read_text(encoding="utf-8"))
+            if args.quantization_admission is not None
+            else None
+        ),
+        "quantization_admission_sha256": (
+            hashlib.sha256(args.quantization_admission.read_bytes()).hexdigest()
+            if args.quantization_admission is not None
+            else None
+        ),
         "teacher_scores_sha256": (
             hashlib.sha256(args.teacher_path.read_bytes()).hexdigest()
             if args.teacher_beta > 0
@@ -567,6 +623,11 @@ def write_provenance(
         )
         if changed_flags:
             raise ValueError(f"resume flags differ at keys: {', '.join(changed_flags)}")
+        if (
+            stored.get("quantization_admission_sha256")
+            != provenance["quantization_admission_sha256"]
+        ):
+            raise ValueError("resume quantization admission differs from stored provenance")
         recorded_model = {"model": stored["flags"]["model"]}
         if "model_identity" in stored:
             recorded_model["model_identity"] = stored["model_identity"]
@@ -652,8 +713,8 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         )
         model.config.use_cache = False
         model.enable_input_require_grads()
-        if options.base_quantization != "none":
-            cast_lora_to_bf16(model)
+        cast_lora_to_float32(model)
+        assert_fp32_training_state(model, None)
         if options.tiled_mlp:
             install_tiled_mlp(model, skip_dead_mlp_recompute=options.skip_dead_mlp_recompute)
         offload = (
@@ -688,6 +749,14 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
                 args, max_tokens, generations, device=torch.device("cuda", device_index)
             ),
         )
+        if trainer.model is None:
+            raise RuntimeError("trainer initialization did not retain a model")
+        if trainer.optimizer is not None and not isinstance(
+            trainer.optimizer, torch.optim.Optimizer
+        ):
+            raise TypeError("organism RL requires a torch optimizer")
+        assert_fp32_training_state(trainer.model, trainer.optimizer)
+        record_precision_provenance(args.output_dir, trainer.model, trainer.optimizer)
         if args.step_pipelining and args.resume_from_checkpoint is not None:
             validate_checkpoint(args.resume_from_checkpoint)
             checkpoint_state = json.loads(
@@ -742,6 +811,34 @@ def build_grpo_config(
     )
 
 
+def resolve_sampler_precision(args: argparse.Namespace, model_configuration: Any) -> None:  # noqa: ANN401
+    """Resolve the owned sampler's checkpoint revision, storage type and weight quantization."""
+    if args.sampler_checkpoint is not None and args.sampler_checkpoint_revision is None:
+        checkpoint_configuration = AutoConfig.from_pretrained(args.sampler_checkpoint)
+        args.sampler_checkpoint_revision = checkpoint_configuration._commit_hash  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    sampler_configuration = (
+        AutoConfig.from_pretrained(
+            args.sampler_checkpoint, revision=args.sampler_checkpoint_revision
+        )
+        if args.sampler_checkpoint is not None
+        else model_configuration
+    )
+    sampler_config_dict = sampler_configuration.to_dict()
+    sampler_dtype = sampler_configuration.get_text_config().dtype
+    if sampler_dtype is None:
+        raise ValueError("sampler checkpoint text dtype must be explicit")
+    args.sampler_model_dtype = str(sampler_dtype)
+    args.sampler_resolved_quantization = (
+        args.sampler_quantization
+        if args.sampler_quantization != "none"
+        else (
+            sampler_config_dict.get("quantization_config")
+            or sampler_config_dict.get("text_config", {}).get("quantization_config")
+            or {}
+        ).get("quant_method", "none")
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Launch owned vLLM sampling and step-checkpointed GRPO, or use an explicit endpoint."""
     args = parse_args(argv)
@@ -759,6 +856,7 @@ def main(argv: list[str] | None = None) -> None:
     resolved_revision = model_configuration._commit_hash  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     model_revision = resolved_revision or args.model_revision
     configuration = model_configuration.get_text_config()
+    resolve_sampler_precision(args, model_configuration)
     sizing = resolve_sizing(
         total_bytes=properties.total_memory,
         hidden_size=configuration.hidden_size,

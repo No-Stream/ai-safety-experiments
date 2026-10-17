@@ -1,13 +1,19 @@
 import json
 from pathlib import Path
-from typing import Self
+from types import SimpleNamespace
+from typing import Any, Self, cast
 
 import pytest
 import torch
 from safetensors.torch import save_file
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
 from reward_hacking.organism_rl import cli
 from reward_hacking.organism_rl.cli import parse_args, resolve_sizing, write_provenance
+from reward_hacking.organism_rl.precision import (
+    assert_fp32_training_state,
+    record_precision_provenance,
+)
 from reward_hacking.vllm_server import VLLMServerConfig
 
 
@@ -143,6 +149,12 @@ def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
 
 
 def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: Path) -> None:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
     args = parse_args(
         [
             "--output-dir",
@@ -164,6 +176,8 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
             "fp8",
             "--mamba-ssm-cache-dtype",
             "bfloat16",
+            "--quantization-admission",
+            str(admission),
             "--reasoning-config",
             '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}',
         ]
@@ -181,6 +195,9 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
     assert config.enable_sleep_mode is True
     assert config.language_model_only is True
     assert "--language-model-only" in config.command()
+    assert json.loads(config.command()[config.command().index("--hf-overrides") + 1]) == {
+        "head_dtype": "float32"
+    }
     assert config.enable_prefix_caching is True
     assert config.mamba_cache_mode == "align"
     assert config.kv_cache_dtype == "fp8"
@@ -195,21 +212,39 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
 
 
 def test_cache_dtype_flags_are_recorded_and_resume_sensitive(tmp_path: Path) -> None:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
     original = parse_args(base)
     provenance_path = write_provenance(original, {"name": "cpu"})
     flags = json.loads(provenance_path.read_text())["flags"]
     assert flags["kv_cache_dtype"] is None
     assert flags["mamba_ssm_cache_dtype"] is None
-    fp8 = parse_args([*base, "--kv-cache-dtype", "fp8"])
+    fp8 = parse_args([*base, "--kv-cache-dtype", "fp8", "--quantization-admission", str(admission)])
     with pytest.raises(ValueError, match="kv_cache_dtype"):
         write_provenance(fp8, {"name": "cpu"})
-    mamba_bf16 = parse_args([*base, "--mamba-ssm-cache-dtype", "bfloat16"])
+    mamba_bf16 = parse_args(
+        [*base, "--mamba-ssm-cache-dtype", "bfloat16", "--quantization-admission", str(admission)]
+    )
     with pytest.raises(ValueError, match="mamba_ssm_cache_dtype"):
         write_provenance(mamba_bf16, {"name": "cpu"})
     with pytest.raises(SystemExit):
         parse_args([*base, "--mamba-ssm-cache-dtype", "fp8"])
-    selected = parse_args([*base, "--kv-cache-dtype", "fp8", "--mamba-ssm-cache-dtype", "bfloat16"])
+    selected = parse_args(
+        [
+            *base,
+            "--kv-cache-dtype",
+            "fp8",
+            "--mamba-ssm-cache-dtype",
+            "bfloat16",
+            "--quantization-admission",
+            str(admission),
+        ]
+    )
     other_path = tmp_path / "selected"
     selected.output_dir = other_path
     selected_flags = json.loads(write_provenance(selected, {"name": "cpu"}).read_text())["flags"]
@@ -750,20 +785,182 @@ def test_cli_task_snapshot_ignores_raw_leak_digest_and_accepts_legacy(tmp_path: 
         )
 
 
-def test_rl_adapter_precision_helper_preserves_existing_bfloat16_recipe() -> None:
+def test_rl_adapter_precision_helper_uses_fp32() -> None:
     model = torch.nn.Module()
     model.register_parameter(
         "frozen_weight", torch.nn.Parameter(torch.ones(3), requires_grad=False)
     )
     model.register_parameter("lora_A", torch.nn.Parameter(torch.ones(3)))
-    cli.cast_lora_to_bf16(model)
-    assert model.get_parameter("lora_A").dtype == torch.bfloat16
+    cli.cast_lora_to_float32(model)
+    assert model.get_parameter("lora_A").dtype == torch.float32
     assert model.get_parameter("frozen_weight").dtype == torch.float32
 
 
 def test_rl_adapter_precision_helper_rejects_other_trainable_parameters() -> None:
     with pytest.raises(RuntimeError, match="only LoRA parameters may train"):
-        cli.cast_lora_to_bf16(torch.nn.Linear(2, 2))
+        cli.cast_lora_to_float32(torch.nn.Linear(2, 2))
+
+
+def test_fp32_training_state_rejects_low_precision_weights_gradients_and_moments() -> None:
+    model = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    model.register_parameter("lora_A", parameter)
+    optimizer = torch.optim.AdamW([parameter], lr=0.01)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert_fp32_training_state(model, optimizer)
+
+    parameter.data = parameter.data.bfloat16()
+    with pytest.raises(RuntimeError, match="trainable parameter"):
+        assert_fp32_training_state(model, optimizer)
+    parameter.grad = torch.ones_like(parameter)
+    parameter.data = parameter.data.float()
+    with pytest.raises(RuntimeError, match="gradient"):
+        assert_fp32_training_state(model, optimizer)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.state[parameter]["exp_avg"] = optimizer.state[parameter]["exp_avg"].bfloat16()
+    with pytest.raises(RuntimeError, match="optimizer state"):
+        assert_fp32_training_state(model, optimizer)
+
+
+@pytest.mark.parametrize(
+    "quantization_flags",
+    [
+        ["--base-quantization", "torchao-int8"],
+        ["--kv-cache-dtype", "fp8"],
+        ["--mamba-ssm-cache-dtype", "bfloat16"],
+        ["--sampler-quantization", "fp8_per_channel"],
+        ["--sampler-checkpoint", "RedHatAI/example-fp8"],
+    ],
+)
+def test_quantization_requires_measured_admission(
+    quantization_flags: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                *quantization_flags,
+            ]
+        )
+    assert "quantization-admission" in capsys.readouterr().err
+
+
+def test_quantization_admission_records_measurement_and_rejects_invalid_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    admission = tmp_path / "admission.json"
+    flags = [
+        "--output-dir",
+        str(tmp_path / "run"),
+        "--endpoint",
+        "http://server:8000",
+        "--kv-cache-dtype",
+        "fp8",
+        "--quantization-admission",
+        str(admission),
+    ]
+    admission.write_text("{}")
+    with pytest.raises(SystemExit):
+        parse_args(flags)
+    assert "before/after" in capsys.readouterr().err
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
+    args = parse_args(flags)
+    provenance = json.loads(write_provenance(args, {"name": "cpu"}).read_text())
+    assert provenance["quantization_admission"]["before"]["mean_abs_logprob_gap"] == 0.01
+    assert provenance["quantization_admission"]["after"]["mean_abs_logprob_gap"] == 0.02
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.03}}
+        )
+    )
+    with pytest.raises(ValueError, match="quantization admission"):
+        write_provenance(args, {"name": "cpu"})
+
+
+def test_ssm_float16_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--output-dir", "artifacts/toy", "--mamba-ssm-cache-dtype", "float16"])
+
+
+def test_precision_provenance_records_observed_tensor_classes(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+    args.sampler_model_dtype = "torch.bfloat16"
+    args.sampler_resolved_quantization = "none"
+    write_provenance(args, {"name": "cpu"})
+    model = torch.nn.Module()
+    model.register_parameter("lora_A", torch.nn.Parameter(torch.ones(2)))
+    model.register_parameter(
+        "frozen_weight",
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False),
+    )
+    cast("Any", model).config = SimpleNamespace(
+        to_dict=lambda: {"text_config": {"mamba_ssm_dtype": "float32"}}
+    )
+    optimizer = torch.optim.AdamW([model.get_parameter("lora_A")], lr=0.01)
+    model.get_parameter("lora_A").grad = torch.ones(2)
+    optimizer.step()
+    record_precision_provenance(tmp_path, model, optimizer)
+    precision = json.loads((tmp_path / "provenance.json").read_text())["resolved_precision"]
+    assert precision["lora_weights"] == ["torch.float32"]
+    assert precision["lora_gradients"] == ["torch.float32"]
+    assert precision["optimizer_state"]["exp_avg"] == ["torch.float32"]
+    assert precision["base_weights_by_module_type"]["Module"] == ["torch.bfloat16"]
+    assert precision["head_compute"] == precision["loss_logits"] == "torch.float32"
+    assert precision["kv_cache"] == "torch.bfloat16"
+    assert precision["ssm_state"] == "float32"
+    assert precision["sampler_weight_quantization"] == "none"
+
+
+def test_sampler_precision_resolves_text_config_dtype() -> None:
+    args = parse_args(["--output-dir", "artifacts/toy", "--endpoint", "http://server:8000"])
+    config = Qwen3_5Config(text_config={"dtype": "bfloat16", "mamba_ssm_dtype": "float32"})
+    cli.resolve_sampler_precision(args, config)
+    assert args.sampler_model_dtype == "torch.bfloat16"
+    assert args.sampler_resolved_quantization == "none"
+
+
+def test_sampler_quantization_checkpoint_and_ignore_are_forwarded(tmp_path: Path) -> None:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--gpu-memory-utilization",
+            "0.8",
+            "--sampler-checkpoint",
+            "Example/quantized",
+            "--sampler-checkpoint-revision",
+            "a" * 40,
+            "--sampler-quantization",
+            "fp8_per_channel",
+            "--sampler-quantization-ignore",
+            "*linear_attn.in_proj_ba*",
+            "--quantization-admission",
+            str(admission),
+        ]
+    )
+    config = cli.build_server_config(args, "b" * 40, 2048)
+    command = config.command()
+    assert config.model == "Example/quantized"
+    assert config.revision == "a" * 40
+    assert command[command.index("--served-model-name") + 1] == args.model
+    assert command[command.index("--quantization") + 1] == "fp8_per_channel"
+    assert json.loads(command[command.index("--quantization-config") + 1]) == {
+        "ignore": ["*linear_attn.in_proj_ba*"]
+    }
 
 
 def test_owned_server_enables_prefix_caching_by_default(tmp_path: Path) -> None:
