@@ -31,7 +31,7 @@ def test_benchmark_defaults_keep_production_precision() -> None:
     assert args.backbone_checkpointing
     assert args.head_checkpointing
     assert args.base_quantization == "none"
-    assert args.transfer_host_memory == "pageable"
+    assert args.transfer_host_memory == "pinned"
 
 
 @pytest.mark.parametrize("host_memory", ["pageable", "pinned"])

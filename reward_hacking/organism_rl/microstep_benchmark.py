@@ -76,8 +76,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--transfer-host-memory",
         choices=("pageable", "pinned"),
-        default="pageable",
-        help="frozen-weight host arena mode (default: pageable, provisional and unmeasured)",
+        default="pinned",
+        help="frozen-weight host arena mode (default: pinned, faster to offload at 9B under WSL2)",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)

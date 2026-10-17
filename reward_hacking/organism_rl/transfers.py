@@ -163,7 +163,7 @@ class PolicyTransfers:
     """Stage frozen weights transiently; retain only mutable host storage during training."""
 
     def __init__(
-        self, model: torch.nn.Module, training_device: torch.device, *, pin_memory: bool = False
+        self, model: torch.nn.Module, training_device: torch.device, *, pin_memory: bool = True
     ) -> None:
         """Capture the policy after checkpoint restoration.
 
@@ -172,7 +172,7 @@ class PolicyTransfers:
         """
         self.model = model
         self.training_device = training_device
-        # Pageable is provisional until phase benchmarks measure registration plus copy cost.
+        # 9B under WSL2: registered offload 23-25 s vs pageable 31-33 s; restores ~6 s either way.
         self.pin_memory = pin_memory and training_device.type == "cuda"
         self._frozen_arenas: list[_HostArena] = []
         self._groups: list[_StorageGroup] = []
