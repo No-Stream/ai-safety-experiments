@@ -212,6 +212,16 @@ class LiveKVAdmission:
         self._last_metrics = usage, running, waiting
         return usage, running, waiting
 
+    def _sample_with_admission_deadline(
+        self, *, force: bool, deadline: float | None
+    ) -> tuple[float, float, float]:
+        try:
+            return self._sample(force=force, timeout_seconds=_remaining_timeout(deadline, 5.0))
+        except httpx2.ReadTimeout as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("KV admission deadline exceeded") from exc
+            raise
+
     @contextmanager
     def monitor_step(self) -> Generator[None]:
         """Sample server load throughout long decodes, including when nothing waits."""
@@ -272,8 +282,8 @@ class LiveKVAdmission:
                     waited_at = 0.0
                 if thread_id in self._active_requests:
                     raise RuntimeError("nested KV admission requests are unsupported")
-                usage, running, waiting = self._sample(
-                    force=not waited_at, timeout_seconds=_remaining_timeout(deadline, 5.0)
+                usage, running, waiting = self._sample_with_admission_deadline(
+                    force=not waited_at, deadline=deadline
                 )
                 _remaining_timeout(deadline, self.poll_seconds)
                 self._waiting_requests[thread_id] = requested_prefix_tokens

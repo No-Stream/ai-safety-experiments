@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
+import httpx2
 import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -130,12 +131,21 @@ def test_abort_releases_suspended_episode_worker(
 
 @pytest.fixture
 def metrics_endpoint() -> Iterator[tuple[str, dict[str, float]]]:
-    readings = {"kv": 0.25, "running": 1.0, "waiting": 0.0, "metrics_requests": 0.0}
+    readings = {
+        "kv": 0.25,
+        "running": 1.0,
+        "waiting": 0.0,
+        "metrics_requests": 0.0,
+        "metrics_delay_seconds": 0.0,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             assert self.path == "/metrics"
             readings["metrics_requests"] += 1
+            if readings["metrics_delay_seconds"] > 0:
+                time.sleep(readings["metrics_delay_seconds"])
+                return
             body = (
                 f'vllm:kv_cache_usage_perc{{engine="0"}} {readings["kv"]}\n'
                 f'vllm:num_requests_running{{engine="0"}} {readings["running"]}\n'
@@ -411,15 +421,53 @@ def test_admission_deadline_releases_waiter_without_submitting(
     endpoint, readings = metrics_endpoint
     readings.update(kv=0.95, running=1.0)
     admission = LiveKVAdmission(endpoint, capacity_tokens=100, poll_seconds=0.01)
-    with (
-        pytest.raises(TimeoutError, match="KV admission"),
-        admission.request(prompt_tokens=10, max_tokens=10, timeout_seconds=0.05),
-    ):
-        pytest.fail("request was submitted after its deadline")
-    readings.update(kv=0.0, running=0.0)
-    with admission.request(prompt_tokens=10, max_tokens=10):
-        pass
+    timeout_seconds = 0.5
+
+    def waiting_request() -> None:
+        with admission.request(prompt_tokens=10, max_tokens=10, timeout_seconds=timeout_seconds):
+            pytest.fail("request was submitted after its deadline")
+
+    def retry_request() -> None:
+        with admission.request(prompt_tokens=10, max_tokens=10):
+            pass
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiter = pool.submit(waiting_request)
+        registration_deadline = time.monotonic() + timeout_seconds / 2
+        while (
+            admission.step_summary()["admission_waits"] == 0
+            and time.monotonic() < registration_deadline
+        ):
+            time.sleep(0.005)
+        assert admission.step_summary()["admission_waits"] == 1
+
+        readings["metrics_delay_seconds"] = timeout_seconds + 0.25
+        with pytest.raises(TimeoutError, match="KV admission") as deadline_error:
+            waiter.result(timeout=timeout_seconds + 1)
+        assert isinstance(deadline_error.value.__cause__, httpx2.ReadTimeout)
+
+        readings.update(kv=0.0, running=0.0, metrics_delay_seconds=0.0)
+        pool.submit(retry_request).result(timeout=1)
     assert admission.step_summary()["admitted_requests"] == 1
+
+
+def test_metrics_read_timeout_before_admission_deadline_remains_http_error(
+    metrics_endpoint: tuple[str, dict[str, float]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint, _ = metrics_endpoint
+    admission = LiveKVAdmission(endpoint, capacity_tokens=100)
+
+    def read_timeout(*, force: bool, timeout_seconds: float) -> tuple[float, float, float]:
+        del force, timeout_seconds
+        raise httpx2.ReadTimeout("synthetic metrics read timeout")
+
+    monkeypatch.setattr(admission, "_sample", read_timeout)
+    with (
+        pytest.raises(httpx2.ReadTimeout, match="synthetic metrics read timeout"),
+        admission.request(prompt_tokens=10, max_tokens=10, timeout_seconds=5.0),
+    ):
+        pytest.fail("metrics timeout should stop admission")
 
 
 def test_observed_active_kv_is_not_added_twice(
