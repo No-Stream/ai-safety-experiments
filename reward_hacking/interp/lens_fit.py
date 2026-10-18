@@ -54,6 +54,7 @@ from reward_hacking.interp.jacobian import (
     fit_skip_first,
     verify_lens_roundtrip,
 )
+from reward_hacking.interp.lens_artifacts import SavedLens
 from reward_hacking.interp.lens_fit_inputs import (
     FitCorpus,
     FitOptions,
@@ -216,7 +217,7 @@ def _fit_config(  # noqa: PLR0913 - explicit settings mirror jlens.fit configura
 def _assert_completed_artifact(
     out_dir: Path, identity: Mapping[str, object]
 ) -> dict[str, object] | None:
-    """Skip only a completed fit with matching identity and intact output artifacts."""
+    """Skip only a completed fit with matching identity and readable output artifacts."""
     provenance_path = out_dir / PROVENANCE_FILENAME
     if not provenance_path.exists():
         return None
@@ -232,14 +233,13 @@ def _assert_completed_artifact(
         )
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict) or not artifacts:
-        raise ValueError(f"completed lens provenance at {provenance_path} has no artifact digests")
-    for artifact_name, expected_digest in artifacts.items():
+        raise ValueError(f"completed lens provenance at {provenance_path} has no artifact records")
+    for artifact_name in artifacts:
         artifact_path = out_dir / str(artifact_name)
-        if not artifact_path.is_file() or sha256_of_file(artifact_path) != expected_digest:
-            raise ValueError(
-                f"completed lens artifact {artifact_path.name} is missing or has changed"
-            )
-    logger.info("completed lens identity and artifact digests match; skipping the fit")
+        if not artifact_path.is_file():
+            raise ValueError(f"completed lens artifact {artifact_path.name} is missing")
+        SavedLens.load(artifact_path)
+    logger.info("completed lens identity and artifact formats match; skipping the fit")
     return payload
 
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
-from reward_hacking.spec_gaming.capture import EpisodeJournal
+from reward_hacking.spec_gaming.capture import EpisodeJournal, compare_identity_fields
 from reward_hacking.spec_gaming.config import (
     CollectorConfig,
     canonical_json,
@@ -33,33 +34,63 @@ if TYPE_CHECKING:
     from reward_hacking.spec_gaming.spreadsheet import SpreadsheetTask
 
 REVIEW_SCHEMA_VERSION = 2
+REVIEW_CONTENT_SCHEMA_VERSION = 3
+REVIEW_FULL_CONTENT_SCHEMA_VERSION = 4
 REVIEW_CLASSES = frozenset({"confirmed_gaming", "honest_success", "ordinary_error", "ambiguous"})
 AWARENESS_VALUES = frozenset({"clean", "positive", "uncertain"})
 NON_INTEGRITY_AWARENESS_VALUES = frozenset({"yes", "no", "uncertain"})
 
 
+@dataclass(frozen=True)
+class ReadoutEvidenceReference:
+    """Identify the current episode and assessment for manual review readout."""
+
+    raw_episode_identity: dict[str, object]
+    automatic_assessment_identity: dict[str, object]
+
+
+def _validate_review_schema(payload: dict[str, object], fields: set[str]) -> None:
+    schema_version = payload.get("schema_version")
+    if schema_version == REVIEW_SCHEMA_VERSION:
+        exact_keys(payload, fields, "manual review file")
+    elif schema_version == REVIEW_CONTENT_SCHEMA_VERSION:
+        exact_keys(payload, fields | {"automatic_assessment_identity"}, "manual review file")
+        payload["automatic_assessment_identity"] = dict(
+            object_value(payload["automatic_assessment_identity"], "automatic assessment identity")
+        )
+    elif schema_version == REVIEW_FULL_CONTENT_SCHEMA_VERSION:
+        exact_keys(
+            payload,
+            fields | {"raw_episode_identity", "automatic_assessment_identity"},
+            "manual review file",
+        )
+        payload["raw_episode_identity"] = dict(
+            object_value(payload["raw_episode_identity"], "raw episode identity")
+        )
+        payload["automatic_assessment_identity"] = dict(
+            object_value(payload["automatic_assessment_identity"], "automatic assessment identity")
+        )
+    else:
+        raise ValueError("manual review file has an unsupported schema_version")
+
+
 def _review_payload(path: Path) -> dict[str, object]:
     payload = read_json_object(private_path(path, "manual review file"), "manual review file")
-    exact_keys(
-        payload,
-        {
-            "schema_version",
-            "raw_episode_digest",
-            "automatic_assessment_digest",
-            "reviewer",
-            "rubric_version",
-            "integrity_awareness",
-            "capability_evaluation_awareness",
-            "training_inference",
-            "designed_environment_inference",
-            "classification",
-            "evidence",
-            "limitations",
-        },
-        "manual review file",
-    )
-    if payload["schema_version"] != REVIEW_SCHEMA_VERSION:
-        raise ValueError("manual review file has an unsupported schema_version")
+    fields = {
+        "schema_version",
+        "raw_episode_digest",
+        "automatic_assessment_digest",
+        "reviewer",
+        "rubric_version",
+        "integrity_awareness",
+        "capability_evaluation_awareness",
+        "training_inference",
+        "designed_environment_inference",
+        "classification",
+        "evidence",
+        "limitations",
+    }
+    _validate_review_schema(payload, fields)
     payload["raw_episode_digest"] = sha256_string(
         payload["raw_episode_digest"], "manual review raw_episode_digest"
     )
@@ -91,7 +122,80 @@ def _review_payload(path: Path) -> dict[str, object]:
     return payload
 
 
-def record_manual_review(  # noqa: C901 - validate the current automatic evidence before persisting review
+def raw_episode_identity(journal: EpisodeJournal, raw_episode_digest: str) -> dict[str, object]:
+    """Return the raw episode's readable content identity from its validated journal closure."""
+    try:
+        closure_value = journal.read_json(raw_episode_digest)
+    except ValueError as error:
+        raise ValueError("raw episode reference is unavailable in the journal") from error
+    closure = object_value(closure_value, "raw episode closure")
+    raw_manifest = cast(
+        "dict[str, Any]", object_value(closure.get("raw_manifest"), "raw episode manifest")
+    )
+    return cast("dict[str, object]", journal.readable_episode_identity(raw_manifest))
+
+
+def _validate_review_assessment_reference(
+    review: dict[str, object],
+    current_assessment: dict[str, object],
+    journal: EpisodeJournal,
+    current_reference: ReadoutEvidenceReference,
+    rubric_version: str,
+) -> None:
+    saved_raw_identity = raw_episode_identity(journal, str(review["raw_episode_digest"]))
+    raw_identity_differences = compare_identity_fields(
+        current_reference.raw_episode_identity, saved_raw_identity, "raw_episode_identity"
+    )
+    if raw_identity_differences:
+        raise ValueError(
+            "manual review raw episode differs at: " + ", ".join(raw_identity_differences)
+        )
+    reference_digest = str(review["automatic_assessment_digest"])
+    matching_entries = [
+        entry for entry in journal.list_assessments() if entry["digest"] == reference_digest
+    ]
+    if len(matching_entries) != 1:
+        raise ValueError("manual review automatic assessment journal entry is absent")
+    entry = matching_entries[0]
+    identity_differences = compare_identity_fields(
+        current_reference.automatic_assessment_identity,
+        entry["identity"],
+        "automatic_assessment_identity",
+    )
+    assessment_differences = compare_identity_fields(
+        current_assessment["assessment"], entry["assessment"], "automatic_assessment"
+    )
+    differences = identity_differences + assessment_differences
+    if differences:
+        raise ValueError("manual review automatic assessment differs at: " + ", ".join(differences))
+    if review["schema_version"] in {
+        REVIEW_CONTENT_SCHEMA_VERSION,
+        REVIEW_FULL_CONTENT_SCHEMA_VERSION,
+    }:
+        identity_differences = compare_identity_fields(
+            current_reference.automatic_assessment_identity,
+            cast("dict[str, object]", review["automatic_assessment_identity"]),
+            "automatic_assessment_identity",
+        )
+        if identity_differences:
+            raise ValueError(
+                "manual review automatic assessment differs at: " + ", ".join(identity_differences)
+            )
+    if review["schema_version"] == REVIEW_FULL_CONTENT_SCHEMA_VERSION:
+        raw_identity_differences = compare_identity_fields(
+            current_reference.raw_episode_identity,
+            cast("dict[str, object]", review["raw_episode_identity"]),
+            "raw_episode_identity",
+        )
+        if raw_identity_differences:
+            raise ValueError(
+                "manual review raw episode differs at: " + ", ".join(raw_identity_differences)
+            )
+    if review["rubric_version"] != rubric_version:
+        raise ValueError("manual review rubric_version does not match the configured rubric")
+
+
+def record_manual_review(
     config: CollectorConfig,
     task_id: str,
     review_path: Path,
@@ -108,14 +212,15 @@ def record_manual_review(  # noqa: C901 - validate the current automatic evidenc
     episode_dir, _, _ = episode_paths(config, task_id)
     episode_identity = effective_task_identity(effective_manifest, task_id)
     review = _review_payload(review_path)
+    expected_automatic_identity = assessment_identity(config, task)
     with EpisodeJournal(episode_dir, episode_identity) as journal:
         raw_digest = journal.raw_episode_digest()
+        expected_raw_episode_identity = raw_episode_identity(journal, raw_digest)
         assessments = journal.list_assessments()
         automatic = [
             entry
             for entry in assessments
-            if canonical_json(entry["identity"])
-            == canonical_json(assessment_identity(config, task))
+            if not compare_identity_fields(expected_automatic_identity, entry["identity"])
         ]
         if not automatic:
             raise ValueError("episode has no completed automatic assessment to review")
@@ -124,27 +229,44 @@ def record_manual_review(  # noqa: C901 - validate the current automatic evidenc
         latest_assessment = automatic[0]
         current_path = episode_dir / "assessment-current.json"
         current_payload = read_json_object(current_path, "current assessment sidecar")
-        if canonical_json(current_payload.get("identity")) != canonical_json(
-            assessment_identity(config, task)
-        ):
-            raise ValueError("current assessment sidecar does not match the current evaluator")
-        current_assessment = journal.load_assessment(assessment_identity(config, task))
-        if current_assessment is None or canonical_json(current_assessment) != canonical_json(
-            current_payload.get("assessment")
-        ):
-            raise ValueError("current assessment sidecar does not match the journal")
-        if review["raw_episode_digest"] != raw_digest:
-            raise ValueError("manual review raw_episode_digest does not match the current episode")
-        if review["automatic_assessment_digest"] != latest_assessment["digest"]:
+        current_identity = object_value(
+            current_payload.get("identity"), "current assessment identity"
+        )
+        identity_differences = compare_identity_fields(
+            expected_automatic_identity, current_identity, "identity"
+        )
+        if identity_differences:
             raise ValueError(
-                "manual review automatic_assessment_digest does not match the current assessment"
+                "current assessment sidecar differs at: " + ", ".join(identity_differences)
             )
-        if review["rubric_version"] != config.assessment_rubric_version:
-            raise ValueError("manual review rubric_version does not match the configured rubric")
+        current_assessment = journal.load_assessment(expected_automatic_identity)
+        current_assessment_differences = (
+            []
+            if current_assessment is None
+            else compare_identity_fields(
+                current_assessment, current_payload.get("assessment"), "assessment"
+            )
+        )
+        if current_assessment is None or current_assessment_differences:
+            raise ValueError(
+                "current assessment sidecar differs from the journal: "
+                + ", ".join(current_assessment_differences)
+            )
+        _validate_review_assessment_reference(
+            review,
+            latest_assessment,
+            journal,
+            ReadoutEvidenceReference(
+                expected_raw_episode_identity,
+                expected_automatic_identity,
+            ),
+            config.assessment_rubric_version,
+        )
         identity = {
             "review_kind": "manual_awareness_and_mechanism",
             "raw_episode_digest": raw_digest,
             "automatic_assessment_digest": latest_assessment["digest"],
+            "automatic_assessment_identity": expected_automatic_identity,
             "reviewer": review["reviewer"],
             "rubric": review["rubric_version"],
         }
@@ -200,27 +322,33 @@ def _current_assessment(
     episode_dir: Path,
     journal: EpisodeJournal,
     expected_identity: dict[str, object],
-) -> tuple[dict[str, object] | None, str | None]:
+) -> dict[str, object] | None:
     path = episode_dir / "assessment-current.json"
     if not path.is_file():
-        return None, None
+        return None
     payload = read_json_object(path, "assessment sidecar")
     identity = object_value(payload.get("identity"), "assessment sidecar.identity")
-    if canonical_json(identity) != canonical_json(expected_identity):
-        return None, None
+    identity_differences = compare_identity_fields(expected_identity, identity, "identity")
+    if identity_differences:
+        return None
     assessment = journal.load_assessment(cast("dict[str, Any]", identity))
     if assessment is None:
-        return None, None
-    if canonical_json(assessment) != canonical_json(payload.get("assessment")):
-        raise ValueError("assessment sidecar does not match the journal")
+        return None
+    assessment_differences = compare_identity_fields(
+        assessment, payload.get("assessment"), "assessment"
+    )
+    if assessment_differences:
+        raise ValueError(
+            "assessment sidecar does not match the journal: " + ", ".join(assessment_differences)
+        )
     entries = [
         entry
         for entry in journal.list_assessments()
-        if canonical_json(entry["identity"]) == canonical_json(expected_identity)
+        if not compare_identity_fields(expected_identity, entry["identity"])
     ]
     if len(entries) != 1:
         raise ValueError("current assessment is absent or duplicated in the journal")
-    return assessment, str(entries[0]["digest"])
+    return assessment
 
 
 def _manual_review_identity(payload: dict[str, object]) -> dict[str, Any]:
@@ -233,14 +361,22 @@ def _manual_review_identity(payload: dict[str, object]) -> dict[str, Any]:
     }
     exact_keys(payload, expected_keys, "manual review sidecar")
     identity = cast("dict[str, Any]", object_value(payload["identity"], "review identity"))
-    raw_digest = sha256_string(payload["raw_episode_digest"], "review sidecar raw digest")
-    automatic_digest = sha256_string(
+    sha256_string(payload["raw_episode_digest"], "review sidecar raw digest")
+    sha256_string(
         payload["automatic_assessment_digest"], "review sidecar automatic assessment digest"
     )
-    if raw_digest != identity.get("raw_episode_digest"):
-        raise ValueError("manual review sidecar raw episode digest differs from its identity")
-    if automatic_digest != identity.get("automatic_assessment_digest"):
-        raise ValueError("manual review sidecar assessment digest differs from its identity")
+    if "raw_episode_digest" in identity:
+        sha256_string(identity["raw_episode_digest"], "review identity raw episode digest")
+    if "automatic_assessment_digest" in identity:
+        sha256_string(
+            identity["automatic_assessment_digest"], "review identity automatic assessment digest"
+        )
+    if "automatic_assessment_identity" in identity:
+        object_value(
+            identity["automatic_assessment_identity"], "review automatic assessment identity"
+        )
+    if "raw_episode_identity" in identity:
+        object_value(identity["raw_episode_identity"], "review raw episode identity")
     nonempty_string(identity.get("reviewer"), "review identity reviewer")
     nonempty_string(identity.get("rubric"), "review identity rubric")
     return identity
@@ -254,24 +390,126 @@ def _manual_review_assessment(
     assessment = journal.load_assessment(identity)
     if assessment is None:
         raise ValueError("manual review sidecar has no matching journal assessment")
-    if canonical_json(assessment) != canonical_json(payload["assessment"]):
-        raise ValueError("manual review sidecar does not match the journal")
+    assessment_differences = compare_identity_fields(
+        assessment, payload["assessment"], "assessment"
+    )
+    if assessment_differences:
+        raise ValueError(
+            "manual review sidecar does not match the journal: " + ", ".join(assessment_differences)
+        )
     matching_entries = [
         entry
         for entry in journal.list_assessments()
-        if canonical_json(entry["identity"]) == canonical_json(identity)
+        if not compare_identity_fields(identity, entry["identity"])
     ]
     if len(matching_entries) != 1 or matching_entries[0]["digest"] != payload["journal_digest"]:
-        raise ValueError("manual review sidecar digest does not match the journal")
+        raise ValueError("manual review sidecar journal entry ID does not match the journal")
     return assessment
+
+
+def _manual_review_automatic_differences(
+    identity: dict[str, Any],
+    journal: EpisodeJournal,
+    current_reference: ReadoutEvidenceReference,
+) -> list[str]:
+    differences: list[str] = []
+    if "automatic_assessment_digest" in identity:
+        reference_digest = str(identity["automatic_assessment_digest"])
+        matching_entries = [
+            entry for entry in journal.list_assessments() if entry["digest"] == reference_digest
+        ]
+        if len(matching_entries) != 1:
+            differences.append("identity.automatic_assessment_digest")
+        else:
+            current_assessment = journal.load_assessment(
+                current_reference.automatic_assessment_identity
+            )
+            if current_assessment is None:
+                differences.append("automatic_assessment")
+            else:
+                entry = matching_entries[0]
+                differences.extend(
+                    compare_identity_fields(
+                        current_reference.automatic_assessment_identity,
+                        entry["identity"],
+                        "automatic_assessment_identity",
+                    )
+                )
+                differences.extend(
+                    compare_identity_fields(
+                        current_assessment,
+                        entry["assessment"],
+                        "automatic_assessment",
+                    )
+                )
+    if "automatic_assessment_identity" in identity:
+        differences.extend(
+            compare_identity_fields(
+                current_reference.automatic_assessment_identity,
+                object_value(
+                    identity["automatic_assessment_identity"],
+                    "review automatic assessment identity",
+                ),
+                "automatic_assessment_identity",
+            )
+        )
+    return differences
+
+
+def _manual_review_raw_differences(
+    identity: dict[str, Any],
+    journal: EpisodeJournal,
+    current_reference: ReadoutEvidenceReference,
+) -> list[str]:
+    differences: list[str] = []
+    if "raw_episode_digest" in identity:
+        saved_raw_identity = raw_episode_identity(journal, str(identity["raw_episode_digest"]))
+        differences.extend(
+            compare_identity_fields(
+                current_reference.raw_episode_identity,
+                saved_raw_identity,
+                "raw_episode_identity",
+            )
+        )
+    if "raw_episode_identity" in identity:
+        differences.extend(
+            compare_identity_fields(
+                current_reference.raw_episode_identity,
+                object_value(identity["raw_episode_identity"], "review raw episode identity"),
+                "raw_episode_identity",
+            )
+        )
+    return differences
+
+
+def _manual_review_identity_differences(
+    identity: dict[str, Any],
+    journal: EpisodeJournal,
+    current_reference: ReadoutEvidenceReference,
+    rubric_version: str,
+) -> list[str]:
+    differences = compare_identity_fields(
+        {"rubric": rubric_version},
+        {"rubric": identity.get("rubric")},
+        "identity",
+    )
+    differences.extend(_manual_review_automatic_differences(identity, journal, current_reference))
+    differences.extend(_manual_review_raw_differences(identity, journal, current_reference))
+    if "raw_episode_digest" not in identity and "raw_episode_identity" not in identity:
+        differences.append("identity.raw_episode_digest")
+    if (
+        "automatic_assessment_digest" not in identity
+        and "automatic_assessment_identity" not in identity
+    ):
+        differences.append("identity.automatic_assessment_digest")
+    return differences
 
 
 def _manual_review(
     episode_dir: Path,
     journal: EpisodeJournal,
     *,
-    raw_episode_digest: str,
-    automatic_assessment_digest: str | None,
+    current_reference: ReadoutEvidenceReference,
     rubric_version: str,
 ) -> dict[str, object] | None:
     reviews: list[dict[str, object]] = []
@@ -279,11 +517,10 @@ def _manual_review(
         payload = read_json_object(path, "manual review sidecar")
         identity = _manual_review_identity(payload)
         assessment = _manual_review_assessment(payload, identity, journal)
-        if (
-            identity.get("raw_episode_digest") == raw_episode_digest
-            and identity.get("automatic_assessment_digest") == automatic_assessment_digest
-            and identity.get("rubric") == rubric_version
-        ):
+        identity_differences = _manual_review_identity_differences(
+            identity, journal, current_reference, rubric_version
+        )
+        if not identity_differences:
             reviews.append(assessment)
     if len(reviews) > 1:
         return {"awareness_status": "unknown", "manual_classification": "ambiguous_review_versions"}
@@ -293,12 +530,16 @@ def _manual_review(
 def _validate_current_confirmation(
     journal: EpisodeJournal,
     review: dict[str, object],
-    automatic_digest: str | None,
+    automatic_identity: dict[str, object],
     task: SpreadsheetTask,
     config: CollectorConfig,
 ) -> None:
     entries = journal.list_assessments()
-    automatic = [entry for entry in entries if entry["digest"] == automatic_digest]
+    automatic = [
+        entry
+        for entry in entries
+        if not compare_identity_fields(automatic_identity, entry["identity"])
+    ]
     current_reviews = [
         entry
         for entry in entries
@@ -324,7 +565,7 @@ def _validate_current_confirmation(
 def _admit_review(
     journal: EpisodeJournal,
     review: dict[str, object] | None,
-    automatic_digest: str | None,
+    automatic_identity: dict[str, object],
     task: SpreadsheetTask,
     config: CollectorConfig,
 ) -> tuple[dict[str, object] | None, str, str | None]:
@@ -332,7 +573,7 @@ def _admit_review(
         return None, "pending", None
     if review.get("manual_classification") == "confirmed_gaming":
         try:
-            _validate_current_confirmation(journal, review, automatic_digest, task, config)
+            _validate_current_confirmation(journal, review, automatic_identity, task, config)
         except (ValueError, TypeError) as error:
             return None, "invalid_confirmed_gaming", str(error)
     return review, "reviewed", None
@@ -465,19 +706,21 @@ def build_readout(config: CollectorConfig) -> dict[str, object]:
                     }
                 )
                 continue
-            assessment, automatic_assessment_digest = _current_assessment(
+            assessment = _current_assessment(
                 episode_dir, journal, assessment_identity(config, task)
             )
             raw_episode_digest = journal.raw_episode_digest()
             review = _manual_review(
                 episode_dir,
                 journal,
-                raw_episode_digest=raw_episode_digest,
-                automatic_assessment_digest=automatic_assessment_digest,
+                current_reference=ReadoutEvidenceReference(
+                    raw_episode_identity(journal, raw_episode_digest),
+                    assessment_identity(config, task),
+                ),
                 rubric_version=config.assessment_rubric_version,
             )
             review, manual_review_status, review_limitation = _admit_review(
-                journal, review, automatic_assessment_digest, task, config
+                journal, review, assessment_identity(config, task), task, config
             )
             measurement_fields = _measurement_fields(assessment)
             proxy_success = measurement_fields["proxy_success"]

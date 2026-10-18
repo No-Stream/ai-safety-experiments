@@ -426,10 +426,10 @@ class TestLiveResume:
         assert row["stimulus_digest"] != pinned_stimulus.digest
         assert "prompt" not in row, "the prompt text is re-derivable and must not be stored"
 
-    def test_a_second_pass_under_an_edited_stimulus_refuses(
+    def test_a_fake_stimulus_prompt_digest_does_not_block_resume(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus
     ) -> None:
-        """Nothing about the file's shape changes when a resume stops being a continuation."""
+        """A digest-only edit does not alter the readable stimulus or calls being resumed."""
         out = self.reply_file(tmp_path)
         cli._run_live_calls(
             self.calls(pinned_stimulus, 2),
@@ -440,17 +440,16 @@ class TestLiveResume:
             backend_factory=scripted_factory("<set>4</set>"),
         )
         edited = replace(pinned_stimulus, prompt_digest="0f0f0f0f0f0f0f0f")
-        with pytest.raises(ValueError, match="stimulus_digest") as raised:
-            cli._run_live_calls(
-                self.calls(edited, 4),
-                out,
-                edited,
-                concurrency=1,
-                chunk_size=1,
-                backend_factory=scripted_factory("<set>4</set>"),
-            )
-        assert pinned_stimulus.prompt_digest in str(raised.value)
-        assert "0f0f0f0f0f0f0f0f" in str(raised.value)
+        resumed = cli._run_live_calls(
+            self.calls(edited, 2),
+            out,
+            edited,
+            concurrency=1,
+            chunk_size=1,
+            backend_factory=scripted_factory("<set>4</set>"),
+        )
+        assert resumed["resumed"] == 2
+        assert resumed["ran"] == 0
 
     def test_a_rubric_only_edit_between_passes_lets_the_resume_proceed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -489,7 +488,7 @@ class TestLiveResume:
         )
         assert resumed == {"planned": 3, "resumed": 2, "ran": 1, "incomplete": 0}
 
-    def test_a_frame_edit_between_passes_refuses_the_resume_by_the_stimulus_digest(
+    def test_a_frame_edit_between_passes_refuses_by_readable_stimulus_identity(
         self, tmp_path: Path
     ) -> None:
         """Edit a frame none of the resumed calls render, so only the stimulus digest can catch it."""
@@ -517,7 +516,7 @@ class TestLiveResume:
             chunk_size=1,
             backend_factory=scripted_factory("<set>4</set>"),
         )
-        with pytest.raises(ValueError, match="stimulus_digest") as raised:
+        with pytest.raises(ValueError, match="readable stimulus fields") as raised:
             cli._run_live_calls(
                 self.calls(second, 2),
                 out,
@@ -530,7 +529,33 @@ class TestLiveResume:
             "the resumed calls render the same prompts; only the stimulus digest moved"
         )
 
-    def test_a_record_whose_prompt_digest_moved_refuses_and_names_both(
+    def test_a_record_whose_readable_prompt_moved_refuses(
+        self, tmp_path: Path, pinned_stimulus: TransferStimulus
+    ) -> None:
+        out = self.reply_file(tmp_path)
+        cli._run_live_calls(
+            self.calls(pinned_stimulus, 1),
+            out,
+            pinned_stimulus,
+            concurrency=1,
+            chunk_size=1,
+            backend_factory=scripted_factory("<set>4</set>"),
+        )
+        row = json.loads(out.read_text(encoding="utf-8").strip())
+        row["rendered_prompt"] = "SYNTHETIC-CHANGED-PROMPT"
+        out.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="rendered_prompt") as raised:
+            cli._run_live_calls(
+                self.calls(pinned_stimulus, 1),
+                out,
+                pinned_stimulus,
+                concurrency=1,
+                chunk_size=1,
+                backend_factory=scripted_factory("<set>4</set>"),
+            )
+        assert row["key"] in str(raised.value)
+
+    def test_a_fake_record_prompt_digest_does_not_block_resume(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus
     ) -> None:
         out = self.reply_file(tmp_path)
@@ -545,16 +570,15 @@ class TestLiveResume:
         row = json.loads(out.read_text(encoding="utf-8").strip())
         row["prompt_digest"] = "ffffffffffffffff"
         out.write_text(json.dumps(row) + "\n", encoding="utf-8")
-        with pytest.raises(ValueError, match="prompt_digest") as raised:
-            cli._run_live_calls(
-                self.calls(pinned_stimulus, 1),
-                out,
-                pinned_stimulus,
-                concurrency=1,
-                chunk_size=1,
-                backend_factory=scripted_factory("<set>4</set>"),
-            )
-        assert row["key"] in str(raised.value)
+        resumed = cli._run_live_calls(
+            self.calls(pinned_stimulus, 1),
+            out,
+            pinned_stimulus,
+            concurrency=1,
+            chunk_size=1,
+            backend_factory=scripted_factory("<set>4</set>"),
+        )
+        assert resumed["resumed"] == 1
 
     def test_run_live_refuses_a_batch_leg(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="not live"):
@@ -598,8 +622,6 @@ class TestBatchSubmit:
         [
             ("model_id", "deepseek.v3.2", "model"),
             ("record_count", 191, "records on the handle"),
-            ("prompt_digest", "0" * 64, "prompt digest"),
-            ("cell_digest", "0" * 64, "cell digest"),
             ("max_tokens", 4096, "on the handle vs"),
             ("reasoning_effort", "high", "on the handle vs"),
         ],
@@ -620,6 +642,32 @@ class TestBatchSubmit:
         handle[field] = value
         path.write_text(json.dumps(handle), encoding="utf-8")
         with pytest.raises(RuntimeError, match=expected):
+            cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+
+    @pytest.mark.parametrize("field", ["prompt_digest", "cell_digest"])
+    def test_handle_digests_are_metadata(
+        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], field: str
+    ) -> None:
+        del aws
+        cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        path = cli.handle_path(tmp_path, leg_for(FLOOR_LEG_ID))
+        handle = json.loads(path.read_text(encoding="utf-8"))
+        handle[field] = "0" * 64
+        path.write_text(json.dumps(handle), encoding="utf-8")
+        resumed = cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        assert resumed["resumed_handle"] is True
+
+    def test_readable_batch_identity_mismatch_refuses(
+        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3]
+    ) -> None:
+        del aws
+        leg = leg_for(FLOOR_LEG_ID)
+        cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        identity_path = cli._batch_prompt_identity_path(tmp_path, leg)
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["calls"][0]["prompt"] = "SYNTHETIC-CHANGED-PROMPT"
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="saved batch prompt identity"):
             cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
 
     def test_a_live_leg_refuses_the_batch_subcommand(
@@ -689,10 +737,10 @@ class TestBatchCollect:
         assert summary["stimulus_prompt_digest"] == pinned_stimulus.prompt_digest
         assert summary["stimulus_digest"] == pinned_stimulus.digest
 
-    def test_a_collect_under_a_stimulus_whose_prompt_digest_moved_refuses(
+    def test_a_fake_stimulus_digest_is_ignored_when_collecting(
         self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
     ) -> None:
-        """The handle cannot carry the stimulus digest, so the submit summary carries it instead."""
+        """Legacy digest metadata is not semantic evidence when readable prompt material is present."""
         del pinned_stimulus
         _, s3 = aws
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
@@ -701,23 +749,36 @@ class TestBatchCollect:
         summary = json.loads(path.read_text(encoding="utf-8"))
         summary["stimulus_prompt_digest"] = "0f0f0f0f0f0f0f0f"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="stimulus prompt digest") as raised:
+        collected = cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
+        assert collected["collected"] == FLOOR_RECORDS
+
+    def test_a_readable_stimulus_edit_refuses_collecting(
+        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3]
+    ) -> None:
+        _, s3 = aws
+        leg = leg_for(FLOOR_LEG_ID)
+        cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        fulfil_job(s3, self.handle(tmp_path))
+        path = cli.submit_summary_path(tmp_path, leg)
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        summary["stimulus_prompt_identity"]["board_lead_in"] = "SYNTHETIC-CHANGED-BOARD-LEAD-IN"
+        path.write_text(json.dumps(summary), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="different stimulus prompt fields"):
             cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
-        assert "0f0f0f0f0f0f0f0f" in str(raised.value)
         assert load_run_replies(tmp_path) == {}
 
-    def test_a_resubmit_under_a_different_stimulus_refuses_rather_than_rewriting_the_digest(
+    def test_a_fake_stimulus_digest_does_not_block_handle_reuse(
         self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
     ) -> None:
-        """Rewriting it would make the collect-time check compare the new digest with itself."""
+        """Changing digest metadata alone does not change the readable prompt identity."""
         del pinned_stimulus, aws
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
         path = cli.submit_summary_path(tmp_path, leg_for(FLOOR_LEG_ID))
         summary = json.loads(path.read_text(encoding="utf-8"))
         summary["stimulus_prompt_digest"] = "0f0f0f0f0f0f0f0f"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="compare the new digest with itself"):
-            cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        resumed = cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
+        assert resumed["resumed_handle"] is True
 
     def test_a_resubmit_that_reconstructs_a_lost_summary_says_the_digest_was_not_recorded(
         self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
@@ -725,11 +786,11 @@ class TestBatchCollect:
         """The documented repair still runs; what it cannot claim is that the digest is the job's own."""
         del pinned_stimulus, aws
         first = cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
-        assert first["stimulus_prompt_digest_recorded_at_submit"] is True
+        assert first["stimulus_prompt_identity_recorded_at_submit"] is True
         cli.submit_summary_path(tmp_path, leg_for(FLOOR_LEG_ID)).unlink()
         again = cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
         assert again["resumed_handle"] is True
-        assert again["stimulus_prompt_digest_recorded_at_submit"] is False
+        assert again["stimulus_prompt_identity_recorded_at_submit"] is False
 
     def test_a_collect_with_no_submit_summary_refuses_and_names_the_fix(
         self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
@@ -767,7 +828,7 @@ class TestBatchCollect:
         row = next(iter(load_run_replies(tmp_path).values()))
         assert row["stimulus_digest"] == pinned_stimulus.prompt_digest
 
-    def test_a_re_collect_of_rows_sampled_under_another_stimulus_refuses_by_key(
+    def test_a_fake_stimulus_digest_does_not_block_recollect_resume(
         self,
         tmp_path: Path,
         aws: tuple[FakeBedrock, FakeS3],
@@ -793,10 +854,9 @@ class TestBatchCollect:
         summary = json.loads(path.read_text(encoding="utf-8"))
         summary["stimulus_prompt_digest"] = elsewhere.prompt_digest
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(ValueError, match="refusing to resume") as raised:
-            cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
-        assert "stimulus_digest" in str(raised.value)
-        assert len(load_run_replies(tmp_path)) == FLOOR_RECORDS
+        collected = cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
+        assert collected["collected"] == 0
+        assert collected["resumed"] == FLOOR_RECORDS
 
     def test_a_collect_on_a_rebuilt_summary_refuses_until_the_operator_says_so(
         self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
@@ -813,7 +873,7 @@ class TestBatchCollect:
         fulfil_job(s3, self.handle(tmp_path))
         cli.submit_summary_path(tmp_path, leg_for(FLOOR_LEG_ID)).unlink()
         rebuilt = cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
-        assert rebuilt["stimulus_prompt_digest_recorded_at_submit"] is False
+        assert rebuilt["stimulus_prompt_identity_recorded_at_submit"] is False
         with pytest.raises(RuntimeError, match="stimulus-unchanged-since-submit"):
             cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
         assert load_run_replies(tmp_path) == {}
@@ -846,32 +906,33 @@ class TestBatchCollect:
         path = cli.submit_summary_path(tmp_path, leg_for(FLOOR_LEG_ID))
         summary = json.loads(path.read_text(encoding="utf-8"))
         del summary["stimulus_prompt_digest_recorded_at_submit"]
+        del summary["stimulus_prompt_identity_recorded_at_submit"]
         path.write_text(json.dumps(summary), encoding="utf-8")
         with caplog.at_level(logging.WARNING, logger=cli.__name__):
             collected = cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
         assert collected["collected"] == FLOOR_RECORDS
         assert "recorded_at_submit" in caplog.text
 
-    @pytest.mark.parametrize(
-        ("field", "expected"), [("prompt_digest", "prompt digest"), ("cell_digest", "cell digest")]
-    )
-    def test_a_digest_mismatch_refuses_the_whole_collect(
+    @pytest.mark.parametrize("field", ["prompt", "metadata"])
+    def test_a_readable_batch_identity_mismatch_refuses_the_whole_collect(
         self,
         tmp_path: Path,
         aws: tuple[FakeBedrock, FakeS3],
         pinned_stimulus: TransferStimulus,
         field: str,
-        expected: str,
     ) -> None:
         del pinned_stimulus
         _, s3 = aws
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
-        path = cli.handle_path(tmp_path, leg_for(FLOOR_LEG_ID))
+        identity_path = cli._batch_prompt_identity_path(tmp_path, leg_for(FLOOR_LEG_ID))
         fulfil_job(s3, self.handle(tmp_path))
-        handle = self.handle(tmp_path)
-        handle[field] = "0" * 64
-        path.write_text(json.dumps(handle), encoding="utf-8")
-        with pytest.raises(RuntimeError, match=expected):
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        if field == "prompt":
+            identity["calls"][0]["prompt"] = "SYNTHETIC-CHANGED-PROMPT"
+        else:
+            identity["calls"][0]["metadata"]["cell"] = "SYNTHETIC-CHANGED-CELL"
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="saved batch prompt identity"):
             cli.collect_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, timeout_seconds=1.0)
         assert load_run_replies(tmp_path) == {}
 
@@ -1238,7 +1299,7 @@ class TestTheJudgeWaitsForItsValidation:
         report = cli.judge_validate(tmp_path)
         assert report["misses"] == []
         summary = json.loads((tmp_path / cli.JUDGE_VALIDATION_SUMMARY).read_text(encoding="utf-8"))
-        assert summary["judge_prompt_digests"] == cli.rubric_digests(pinned_stimulus)
+        assert summary["judge_prompt_identity"] == cli.judge_prompt_identity(pinned_stimulus)
         counts = cli.judge(tmp_path)
         assert counts["judged"] == 4
         judge_summary = json.loads((tmp_path / "summary-judge.json").read_text(encoding="utf-8"))
@@ -1266,11 +1327,13 @@ class TestTheJudgeWaitsForItsValidation:
         cli.judge_validate(tmp_path)
         path = tmp_path / cli.JUDGE_VALIDATION_SUMMARY
         summary = json.loads(path.read_text(encoding="utf-8"))
-        digests = dict(summary["judge_prompt_digests"])
-        digests["matched-decision-transfer"] = "0f0f0f0f0f0f0f0f"
-        summary["judge_prompt_digests"] = digests
+        summary["judge_prompt_identity"]["rubrics"]["matched-decision-transfer"] = (
+            "SYNTHETIC-OTHER-RUBRIC"
+        )
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="not this run's"):
+        with pytest.raises(
+            RuntimeError, match=r"judge_prompt_identity\.rubrics\.matched-decision-transfer"
+        ):
             cli.judge(tmp_path)
 
     def test_a_validation_made_before_a_code_side_prompt_edit_does_not_clear_the_run(
@@ -1282,9 +1345,9 @@ class TestTheJudgeWaitsForItsValidation:
         cli.judge_validate(tmp_path)
         path = tmp_path / cli.JUDGE_VALIDATION_SUMMARY
         summary = json.loads(path.read_text(encoding="utf-8"))
-        summary["judge_prompt_shape_digest"] = "0f0f0f0f0f0f0f0f"
+        summary["judge_prompt_identity"]["sections"][0] = "SYNTHETIC-OTHER-SECTION"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="prompt-shape digest"):
+        with pytest.raises(RuntimeError, match=r"judge_prompt_identity\.sections"):
             cli.judge(tmp_path)
 
     def test_a_validation_under_an_earlier_prompt_version_does_not_clear_the_run(
@@ -1298,10 +1361,11 @@ class TestTheJudgeWaitsForItsValidation:
         summary = json.loads(path.read_text(encoding="utf-8"))
         summary["judge_prompt_version"] = "one-way-transfer-judge-v1"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="prompt version"):
+        with pytest.raises(RuntimeError, match="validated prompt version") as raised:
             cli.judge(tmp_path)
+        assert "judge_prompt_version" in str(raised.value)
 
-    def test_pooling_replies_from_two_stimuli_refuses_before_any_judge_call(
+    def test_fake_row_stimulus_digest_does_not_gate_judging(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus, judge_factory: object
     ) -> None:
         """A mid-run frame edit lands two stimuli in one directory with no shared key to refuse on."""
@@ -1312,8 +1376,8 @@ class TestTheJudgeWaitsForItsValidation:
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         rows[0]["stimulus_digest"] = "0f0f0f0f0f0f0f0f"
         path.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
-        with pytest.raises(ValueError, match="different stimulus prompt digests"):
-            cli.judge(tmp_path)
+        judged = cli.judge(tmp_path)
+        assert judged["judged"] == len(rows)
 
     def test_the_skip_flag_runs_anyway_and_stamps_the_summary(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus, judge_factory: object
@@ -1695,9 +1759,9 @@ class TestTheIntentCheckWaitsForItsValidation:
         seed_for_intent(tmp_path, pinned_stimulus)
         path = tmp_path / cli.INTENT_VALIDATION_SUMMARY
         summary = json.loads(path.read_text(encoding="utf-8"))
-        summary["intent_prompt_digest"] = "0f0f0f0f0f0f0f0f"
+        summary["intent_prompt_identity"]["rubric"] = "SYNTHETIC-OTHER-RUBRIC"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="not this run's"):
+        with pytest.raises(RuntimeError, match=r"intent_prompt_identity\.rubric"):
             cli.intent_check(tmp_path)
 
     def test_a_validation_under_an_earlier_prompt_version_does_not_clear_this_one(
@@ -1714,8 +1778,9 @@ class TestTheIntentCheckWaitsForItsValidation:
         summary = json.loads(path.read_text(encoding="utf-8"))
         summary["intent_prompt_version"] = "one-way-transfer-intent-check-v0"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="validated prompt version"):
+        with pytest.raises(RuntimeError, match="validated prompt version") as raised:
             cli.intent_check(tmp_path)
+        assert "intent_prompt_version" in str(raised.value)
 
     def test_a_validation_under_an_earlier_code_side_prompt_does_not_clear_this_one(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus, intent_factory: object
@@ -1730,9 +1795,9 @@ class TestTheIntentCheckWaitsForItsValidation:
         seed_for_intent(tmp_path, pinned_stimulus)
         path = tmp_path / cli.INTENT_VALIDATION_SUMMARY
         summary = json.loads(path.read_text(encoding="utf-8"))
-        summary["intent_prompt_shape_digest"] = "0f0f0f0f0f0f0f0f"
+        summary["intent_prompt_identity"]["sections"][0] = "SYNTHETIC-OTHER-SECTION"
         path.write_text(json.dumps(summary), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="prompt-shape digest"):
+        with pytest.raises(RuntimeError, match=r"intent_prompt_identity\.sections"):
             cli.intent_check(tmp_path)
 
     def test_the_validation_summary_records_all_three_keys_the_gate_compares(
@@ -1741,9 +1806,8 @@ class TestTheIntentCheckWaitsForItsValidation:
         del intent_factory
         seed_for_intent(tmp_path, pinned_stimulus)
         summary = json.loads((tmp_path / cli.INTENT_VALIDATION_SUMMARY).read_text(encoding="utf-8"))
-        assert summary["intent_prompt_digest"] == judge_module.intent_digest(pinned_stimulus)
+        assert summary["intent_prompt_identity"] == cli.intent_prompt_identity(pinned_stimulus)
         assert summary["intent_prompt_version"] == judge_module.INTENT_CHECK_PROMPT_VERSION
-        assert summary["intent_prompt_shape_digest"] == judge_module.intent_prompt_shape_digest()
 
     def test_the_skip_flag_reads_anyway_and_stamps_the_summary(
         self, tmp_path: Path, pinned_stimulus: TransferStimulus, intent_factory: object

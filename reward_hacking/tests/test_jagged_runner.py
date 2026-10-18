@@ -1122,14 +1122,14 @@ class TestResumeByGroup:
     def test_a_redrafted_item_refuses_to_resume_onto_the_old_drafts_replies(
         self, tmp_path: Path
     ) -> None:
-        """The key is the (item, repeat) coordinate, so the prompt digest is what catches a redraft in place."""
+        """The key is the (item, repeat) coordinate, so the stored prompt catches a redraft in place."""
         (item,) = fixture_items(1)
         path = tmp_path / "trace.jsonl"
         run_and_append(
             render_cells([item]), ScriptedStreamingBackend(scripted_reply), NO_SAMPLING_LABELS, path
         )
         redrafted = replace(item, task="Add 0 and 3 and report the total.")
-        with pytest.raises(ValueError, match=r"refusing to resume.*prompt_digest"):
+        with pytest.raises(ValueError, match=r"refusing to resume.*prompt differs"):
             run_and_append(
                 render_cells([redrafted]),
                 ScriptedStreamingBackend(scripted_reply),

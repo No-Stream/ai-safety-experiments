@@ -870,6 +870,11 @@ def draw_corpus(
             ROLE_EVAL: digest_strings(item.text for item in eval_items),
             ROLE_ANCHOR: digest_strings(item.text for item in anchors),
         },
+        "semantic_items": {
+            ROLE_FIT: _semantic_item_texts(fit),
+            ROLE_EVAL: _semantic_item_texts(eval_items),
+            ROLE_ANCHOR: _semantic_item_texts(anchors),
+        },
     }
     logger.info(
         "drew the lens corpus, %s",
@@ -930,8 +935,9 @@ def write_corpus(corpus: LensCorpus, out_dir: Path) -> Path:
         )
     sidecar_path.write_text(json.dumps(corpus.sidecar, indent=1) + "\n", encoding="utf-8")
     reloaded = load_lens_corpus(out_dir)
-    if reloaded.sidecar["digests"] != corpus.sidecar["digests"]:
-        raise CorpusDrawError(f"{out_dir}: the written corpus read back with different digests")
+    differences = _corpus_item_differences(corpus, reloaded)
+    if differences:
+        raise CorpusDrawError(f"{out_dir}: the written corpus read back differently: {differences}")
     logger.info("wrote the lens corpus, %s", f"{out_dir=} digests={corpus.sidecar['digests']}")
     return sidecar_path
 
@@ -967,17 +973,91 @@ def load_lens_corpus(out_dir: Path) -> LensCorpus:
             f"base-written; rebuild the corpus into a fresh directory rather than fitting on this one"
         )
     roles = {role: _read_items(out_dir / filename, role) for role, filename in _ROLE_FILES.items()}
-    for role, items in roles.items():
-        digest = digest_strings(item.text for item in items)
-        if digest != sidecar["digests"][role]:
-            raise CorpusDrawError(
-                f"{out_dir}: the {role} texts digest to {digest[:12]} but the sidecar says "
-                f"{str(sidecar['digests'][role])[:12]}; the corpus on disk is not the one drawn"
-            )
+    if "semantic_items" in sidecar:
+        expected_items = cast("dict[str, list[dict[str, str]]]", sidecar["semantic_items"])
+        for role, items in roles.items():
+            _assert_role_texts_match_sidecar(out_dir, role, items, expected_items[role])
+    else:
+        # Schema-2 corpora written before semantic_items retain their digest-only identity.
+        for role, items in roles.items():
+            digest = digest_strings(item.text for item in items)
+            if digest != sidecar["digests"][role]:
+                raise CorpusDrawError(
+                    f"{out_dir}: the {role} texts digest differs from the legacy sidecar; "
+                    "the corpus on disk is not the one drawn"
+                )
     assert_disjoint([item for items in roles.values() for item in items])
     return LensCorpus(
         fit=roles[ROLE_FIT], eval=roles[ROLE_EVAL], anchors=roles[ROLE_ANCHOR], sidecar=sidecar
     )
+
+
+def _semantic_item_texts(items: Sequence[CorpusItem]) -> list[dict[str, str]]:
+    """Return readable item ids and texts for new corpus sidecars."""
+    return [{"item_id": item.item_id, "text": item.text} for item in items]
+
+
+def _assert_role_texts_match_sidecar(
+    out_dir: Path,
+    role: str,
+    items: Sequence[CorpusItem],
+    expected_items: Sequence[Mapping[str, str]],
+) -> None:
+    expected_by_id = {item["item_id"]: item["text"] for item in expected_items}
+    actual_by_id = {item.item_id: item.text for item in items}
+    if len(expected_by_id) != len(expected_items):
+        raise CorpusDrawError(f"{out_dir}: {role} sidecar repeats item ids")
+    if len(actual_by_id) != len(items):
+        raise CorpusDrawError(f"{out_dir}: {role} corpus repeats item ids")
+    missing = sorted(set(expected_by_id) - set(actual_by_id))
+    extra = sorted(set(actual_by_id) - set(expected_by_id))
+    if missing or extra:
+        raise CorpusDrawError(
+            f"{out_dir}: {role} item ids differ from the sidecar: missing {missing}, extra {extra}; "
+            "the corpus on disk is not the one drawn"
+        )
+    changed = sorted(
+        item_id for item_id, text in expected_by_id.items() if actual_by_id[item_id] != text
+    )
+    if changed:
+        raise CorpusDrawError(
+            f"{out_dir}: {role} item {changed[0]!r} text differs from the sidecar; "
+            "the corpus on disk is not the one drawn"
+        )
+    expected_order = [item["item_id"] for item in expected_items]
+    actual_order = [item.item_id for item in items]
+    if actual_order != expected_order:
+        raise CorpusDrawError(f"{out_dir}: {role} item order differs from the sidecar")
+
+
+def _corpus_item_differences(expected: LensCorpus, actual: LensCorpus) -> list[str]:
+    differences: list[str] = []
+    for role, expected_items, actual_items in (
+        (ROLE_FIT, expected.fit, actual.fit),
+        (ROLE_EVAL, expected.eval, actual.eval),
+        (ROLE_ANCHOR, expected.anchors, actual.anchors),
+    ):
+        expected_by_id = {item.item_id: item.as_row() for item in expected_items}
+        actual_by_id = {item.item_id: item.as_row() for item in actual_items}
+        differences.extend(
+            f"{role} item {item_id} missing"
+            for item_id in sorted(set(expected_by_id) - set(actual_by_id))
+        )
+        differences.extend(
+            f"{role} item {item_id} unexpected"
+            for item_id in sorted(set(actual_by_id) - set(expected_by_id))
+        )
+        for item_id in sorted(set(expected_by_id) & set(actual_by_id)):
+            differences.extend(
+                f"{role} item {item_id} {field}"
+                for field, value in expected_by_id[item_id].items()
+                if actual_by_id[item_id][field] != value
+            )
+        expected_order = [item.item_id for item in expected_items]
+        actual_order = [item.item_id for item in actual_items]
+        if expected_order != actual_order:
+            differences.append(f"{role} item order")
+    return differences
 
 
 # --------------------------------------------------------------------------------------

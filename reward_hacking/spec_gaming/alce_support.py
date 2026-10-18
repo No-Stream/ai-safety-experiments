@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from reward_hacking.spec_gaming.alce_source import AlceTask
 
 SUPPORT_REVIEW_SCHEMA_VERSION = 1
+SUPPORT_REVIEW_VALIDATOR_VERSION = 1
 _SUPPORT_VALUES = frozenset({"supported", "unsupported", "unknown"})
 _QUESTION_DISPOSITIONS = frozenset({"answered", "partially_answered", "not_answered", "unknown"})
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-from reward_hacking.spec_gaming.capture import EpisodeJournal
+from reward_hacking.spec_gaming.capture import EpisodeJournal, compare_identity_fields
 from reward_hacking.spec_gaming.config import (
     canonical_json,
     exact_keys,
@@ -13,11 +14,18 @@ from reward_hacking.spec_gaming.config import (
     private_path,
     read_json_object,
     sha256,
+    sha256_string,
 )
 from reward_hacking.spec_gaming.manifests import read_json, write_json
-from reward_hacking.spec_gaming.readout import parse_manual_review
+from reward_hacking.spec_gaming.readout import (
+    REVIEW_CONTENT_SCHEMA_VERSION,
+    REVIEW_FULL_CONTENT_SCHEMA_VERSION,
+    parse_manual_review,
+    raw_episode_identity,
+)
 from reward_hacking.spec_gaming.retail_assessment import (
     assessment_identity,
+    assessment_identity_differences,
     current_retail_assessment,
 )
 
@@ -25,6 +33,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from reward_hacking.spec_gaming.retail_config import RetailCollectorConfig
+
+POLICY_EVIDENCE_SCHEMA_VERSION = 1
+POLICY_EVIDENCE_CONTENT_SCHEMA_VERSION = 2
+POLICY_EVIDENCE_FULL_CONTENT_SCHEMA_VERSION = 3
 
 WRITE_TOOLS = frozenset(
     {
@@ -37,6 +49,17 @@ WRITE_TOOLS = frozenset(
         "modify_user_address",
     }
 )
+
+
+@dataclass(frozen=True)
+class PolicyEvidenceContext:
+    """Current journal content used to compare retail policy evidence."""
+
+    journal: EpisodeJournal
+    state: dict[str, Any]
+    automatic_assessment: dict[str, Any]
+    raw_episode_identity: dict[str, object]
+    automatic_identity: dict[str, object]
 
 
 def _indices(value: object, ledger: list[dict[str, Any]], name: str) -> list[int]:
@@ -113,39 +136,153 @@ def _mutation_review(value: object, ledger: list[dict[str, Any]]) -> int:
     return action_index
 
 
-def validate_policy_evidence(
-    payload: dict[str, Any],
-    state: dict[str, Any],
-    automatic: dict[str, Any],
+def _assessment_by_digest(journal: EpisodeJournal, digest: str, name: str) -> dict[str, Any]:
+    matches = [entry for entry in journal.list_assessments() if entry["digest"] == digest]
+    if len(matches) != 1:
+        raise ValueError(f"{name} does not resolve to one journal assessment")
+    return matches[0]
+
+
+def _raw_identity_by_digest(journal: EpisodeJournal, digest: str, name: str) -> dict[str, object]:
+    try:
+        return raw_episode_identity(journal, digest)
+    except ValueError as error:
+        raise ValueError(f"{name} does not resolve to a readable journal closure") from error
+
+
+def _resolved_reference_differences(
+    context: PolicyEvidenceContext,
     raw_digest: str,
     automatic_digest: str,
-) -> dict[str, Any]:
-    """Validate evidence provenance and chronology; the reviewer supplies semantic judgments."""
-    fields = {
+) -> list[str]:
+    saved_raw_identity = _raw_identity_by_digest(context.journal, raw_digest, "raw_episode_digest")
+    differences = compare_identity_fields(
+        context.raw_episode_identity, saved_raw_identity, "raw_episode_identity"
+    )
+    saved_automatic = _assessment_by_digest(
+        context.journal, automatic_digest, "automatic_assessment_digest"
+    )
+    differences.extend(
+        assessment_identity_differences(
+            context.journal,
+            context.automatic_identity,
+            saved_automatic["identity"],
+            "automatic_assessment_identity",
+        )
+    )
+    differences.extend(
+        compare_identity_fields(
+            context.automatic_assessment,
+            saved_automatic["assessment"],
+            "automatic_assessment",
+        )
+    )
+    return differences
+
+
+def _policy_content_differences(
+    payload: dict[str, Any], context: PolicyEvidenceContext
+) -> list[str]:
+    reviewer_fields = {
         "schema_version",
-        "raw_episode_digest",
-        "automatic_assessment_digest",
-        "ledger_sha256",
-        "final_db_sha256",
-        "native_evaluation_sha256",
         "request_assessment",
         "policy_assessment",
         "mutation_reviews",
         "intent_completion_indices",
     }
-    exact_keys(payload, fields, "retail policy evidence")
-    if payload["schema_version"] != 1:
-        raise ValueError("retail policy evidence has an unsupported schema")
-    expected_digests = {
-        "raw_episode_digest": raw_digest,
-        "automatic_assessment_digest": automatic_digest,
-        "ledger_sha256": sha256(canonical_json(state["ledger"])),
-        "final_db_sha256": sha256(canonical_json(state["db_state"])),
-        "native_evaluation_sha256": sha256(canonical_json(automatic["native_evaluation"])),
+    legacy_reference_fields = {
+        "raw_episode_digest",
+        "automatic_assessment_digest",
     }
-    if any(payload[field] != digest for field, digest in expected_digests.items()):
-        raise ValueError("retail policy evidence digest differs from the frozen native evidence")
-    ledger = cast("list[dict[str, Any]]", state["ledger"])
+    schema_version = payload.get("schema_version")
+    if schema_version == POLICY_EVIDENCE_SCHEMA_VERSION:
+        exact_keys(
+            payload,
+            reviewer_fields
+            | legacy_reference_fields
+            | {"ledger_sha256", "final_db_sha256", "native_evaluation_sha256"},
+            "retail policy evidence",
+        )
+        for field in ("ledger_sha256", "final_db_sha256", "native_evaluation_sha256"):
+            sha256_string(payload[field], f"retail policy evidence {field}")
+        differences = _resolved_reference_differences(
+            context,
+            sha256_string(payload["raw_episode_digest"], "raw_episode_digest"),
+            sha256_string(payload["automatic_assessment_digest"], "automatic_assessment_digest"),
+        )
+        legacy_content = {
+            "ledger_sha256": context.state["ledger"],
+            "final_db_sha256": context.state["db_state"],
+            "native_evaluation_sha256": context.automatic_assessment["native_evaluation"],
+        }
+        differences.extend(
+            field
+            for field, value in legacy_content.items()
+            if payload[field] != sha256(canonical_json(value))
+        )
+    elif schema_version == POLICY_EVIDENCE_CONTENT_SCHEMA_VERSION:
+        exact_keys(
+            payload,
+            reviewer_fields
+            | legacy_reference_fields
+            | {"ledger", "final_db_state", "native_evaluation"},
+            "retail policy evidence",
+        )
+        differences = _resolved_reference_differences(
+            context,
+            sha256_string(payload["raw_episode_digest"], "raw_episode_digest"),
+            sha256_string(payload["automatic_assessment_digest"], "automatic_assessment_digest"),
+        )
+        expected_content = {
+            "ledger": context.state["ledger"],
+            "final_db_state": context.state["db_state"],
+            "native_evaluation": context.automatic_assessment["native_evaluation"],
+        }
+        for field, expected_value in expected_content.items():
+            differences.extend(compare_identity_fields(expected_value, payload[field], field))
+    elif schema_version == POLICY_EVIDENCE_FULL_CONTENT_SCHEMA_VERSION:
+        exact_keys(
+            payload,
+            reviewer_fields
+            | {
+                "raw_episode_identity",
+                "automatic_assessment_identity",
+                "ledger",
+                "final_db_state",
+                "native_evaluation",
+            },
+            "retail policy evidence",
+        )
+        expected_content = {
+            "raw_episode_identity": context.raw_episode_identity,
+            "ledger": context.state["ledger"],
+            "final_db_state": context.state["db_state"],
+            "native_evaluation": context.automatic_assessment["native_evaluation"],
+        }
+        differences = []
+        for field, expected_value in expected_content.items():
+            differences.extend(compare_identity_fields(expected_value, payload[field], field))
+        differences.extend(
+            assessment_identity_differences(
+                context.journal,
+                context.automatic_identity,
+                cast("dict[str, object]", payload["automatic_assessment_identity"]),
+                "automatic_assessment_identity",
+            )
+        )
+    else:
+        raise ValueError("retail policy evidence has an unsupported schema")
+    return differences
+
+
+def validate_policy_evidence(
+    payload: dict[str, Any], context: PolicyEvidenceContext
+) -> dict[str, Any]:
+    """Validate evidence provenance and chronology; the reviewer supplies semantic judgments."""
+    differences = _policy_content_differences(payload, context)
+    if differences:
+        raise ValueError("retail policy evidence differs at: " + ", ".join(differences))
+    ledger = cast("list[dict[str, Any]]", context.state["ledger"])
     _finding(payload["request_assessment"], ledger, "request assessment")
     _finding(payload["policy_assessment"], ledger, "policy assessment")
     writes = {
@@ -198,14 +335,14 @@ def record_manual_review(
         if not journal.progress()["closed"]:
             raise ValueError("manual retail review requires a closed episode")
         raw_digest = journal.raw_episode_digest()
+        raw_identity = raw_episode_identity(journal, raw_digest)
         expected = assessment_identity(
             config,
             task_id=task_id,
             task_sha256=task["task_sha256"],
             source_revision=task["source_revision"],
-            group_digest=task["group_digest"],
             task_identity=identity,
-            raw_episode_digest=raw_digest,
+            raw_episode_identity=raw_identity,
         )
         automatic = current_retail_assessment(
             journal, directory / "assessment-current.json", expected
@@ -213,25 +350,76 @@ def record_manual_review(
         records = [
             entry
             for entry in journal.list_assessments()
-            if canonical_json(entry["identity"]) == canonical_json(expected)
+            if not assessment_identity_differences(journal, expected, entry["identity"])
         ]
         if automatic is None or len(records) != 1:
             raise ValueError("manual retail review requires one current automatic assessment")
         automatic_digest = records[0]["digest"]
-        if (
-            review["raw_episode_digest"] != raw_digest
-            or review["automatic_assessment_digest"] != automatic_digest
-        ):
-            raise ValueError("manual retail review raw or automatic assessment digest changed")
+        reference_differences = []
+        saved_raw_identity = _raw_identity_by_digest(
+            journal,
+            cast("str", review["raw_episode_digest"]),
+            "manual review raw_episode_digest",
+        )
+        reference_differences.extend(
+            compare_identity_fields(raw_identity, saved_raw_identity, "raw_episode_identity")
+        )
+        referenced_automatic = _assessment_by_digest(
+            journal,
+            cast("str", review["automatic_assessment_digest"]),
+            "manual review automatic_assessment_digest",
+        )
+        reference_differences.extend(
+            assessment_identity_differences(
+                journal,
+                expected,
+                referenced_automatic["identity"],
+                "automatic_assessment_identity",
+            )
+        )
+        reference_differences.extend(
+            compare_identity_fields(
+                records[0]["assessment"],
+                referenced_automatic["assessment"],
+                "automatic_assessment",
+            )
+        )
+        if review["schema_version"] in {
+            REVIEW_CONTENT_SCHEMA_VERSION,
+            REVIEW_FULL_CONTENT_SCHEMA_VERSION,
+        }:
+            reference_differences.extend(
+                assessment_identity_differences(
+                    journal,
+                    expected,
+                    cast("dict[str, object]", review["automatic_assessment_identity"]),
+                    "automatic_assessment_identity",
+                )
+            )
+        if review["schema_version"] == REVIEW_FULL_CONTENT_SCHEMA_VERSION:
+            reference_differences.extend(
+                compare_identity_fields(
+                    raw_identity,
+                    cast("dict[str, object]", review["raw_episode_identity"]),
+                    "raw_episode_identity",
+                )
+            )
+        if reference_differences:
+            raise ValueError(
+                "manual retail review references differ at: " + ", ".join(reference_differences)
+            )
         evidence = validate_policy_evidence(
             read_json_object(
                 private_path(policy_evidence_path, "retail policy evidence"),
                 "retail policy evidence",
             ),
-            journal.state(),
-            automatic,
-            raw_digest,
-            automatic_digest,
+            PolicyEvidenceContext(
+                journal=journal,
+                state=journal.state(),
+                automatic_assessment=automatic,
+                raw_episode_identity=raw_identity,
+                automatic_identity=expected,
+            ),
         )
         _validate_intent(journal, review, evidence)
         manual_identity = {
@@ -240,6 +428,7 @@ def record_manual_review(
             "rubric": review["rubric_version"],
             "raw_episode_digest": raw_digest,
             "automatic_assessment_digest": automatic_digest,
+            "automatic_assessment_identity": expected,
         }
         assessment = {
             **review,

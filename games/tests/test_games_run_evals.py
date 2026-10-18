@@ -33,7 +33,12 @@ from games.evals import (
     EvalConfig,
     read_eval_records,
 )
-from games.framing_stimulus import BRIEFING_PHRASE, CLAUSE_PREFIX, DECOUPLING_TAILS
+from games.framing_stimulus import (
+    BRIEFING_PHRASE,
+    CLAUSE_PREFIX,
+    DECOUPLING_TAILS,
+    RECIPIENT_CONDITIONS,
+)
 from games.prompt_variants import PROMPT_VARIANT_NONE, PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.report import load_traces
 from games.survey import (
@@ -304,7 +309,7 @@ class TestPlanResolution:
         assert plan.run_facts.top_p == 0.95
         assert plan.run_facts.top_k == 0
         assert plan.run_facts.max_completion_tokens == 16384
-        assert plan.run_facts.run_config_sha256
+        assert not hasattr(plan.run_facts, "run_config_sha256")
 
     def test_training_run_sampler_refuses_model_mode(self) -> None:
         args = run_evals._parse_args(
@@ -383,7 +388,7 @@ class TestPlanResolution:
         assert meta["sampling"]["max_new_tokens"] == 16384
         assert meta["sampling"]["top_p"] == 0.95
         assert meta["run_config_path"] == str(run_dir / run_evals.RUN_CONFIG_FILENAME)
-        assert meta["run_config_sha256"] == plan.run_facts.run_config_sha256
+        assert "run_config_sha256" not in meta
 
     def test_checkpoint_mode_derives_arm_step_base_and_thinking(self, tmp_path: Path) -> None:
         run_dir = make_run_dir(tmp_path, thinking=True)
@@ -1794,3 +1799,44 @@ class TestTheRuntimeFramingsFileReachesTheCellIdentity:
                     str(tmp_path / "absent.json"),
                 )
             )
+
+
+class TestTrapCellClauseIdentity:
+    def test_config_records_private_clauses_in_registered_condition_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trap_path = tmp_path / "trap-cells.json"
+        args = run_evals._parse_args(
+            [
+                "--model",
+                "fake-base",
+                "--arm",
+                DEFAULT_ARM,
+                "--backend",
+                "mock",
+                "--sections",
+                "trap-cells",
+                "--trap-cells",
+                str(trap_path),
+            ]
+        )
+        plan = run_evals.resolve_plan(args)
+        clauses = {
+            condition_id: f"synthetic clause for {condition_id}"
+            for condition_id in reversed(RECIPIENT_CONDITIONS)
+        }
+        monkeypatch.setattr(
+            run_evals,
+            "load_dictator_recipient_clauses",
+            lambda _path: SimpleNamespace(clause_by_condition=clauses, digest="legacy-digest"),
+        )
+        config = run_evals._resolve_eval_config(
+            args,
+            plan=plan,
+            sections=("trap-cells",),
+            template=run_evals.TemplateFacts(prefilled_think=False, chat_template_kwargs=()),
+        )
+
+        assert config.trap_cells_clauses == tuple(
+            (condition_id, clauses[condition_id]) for condition_id in RECIPIENT_CONDITIONS
+        )

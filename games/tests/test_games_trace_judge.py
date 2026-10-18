@@ -46,14 +46,12 @@ from games.trace_judge_schema import (
     COUPLING_ASSUMPTIONS,
     DECISION_BASES,
     DIAGONAL_COMPARISON_LEVELS,
-    GAME_SECTION_TEMPLATE,
     JUDGE_INSTRUCTIONS,
-    JUDGE_PROMPT_TEMPLATE,
     RUBRIC_VERSION,
     JudgeReplyError,
     keyword_basis,
     parse_judge_reply,
-    rubric_digest,
+    rubric_sections,
     verdict_from_row,
 )
 from reward_hacking.model_backend import BedrockCompletion, TokenUsage
@@ -498,28 +496,6 @@ class TestJudgePrompt:
         assert len(offered) >= len(accepted), "every accepted level is offered at least once"
         assert set(offered) <= accepted, sorted(set(offered) - accepted)
 
-    def test_the_digest_covers_the_whole_fixed_scaffold(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A resume compares digests, so the digest has to move with any fixed text the judge reads:
-        the rubric, the game-section template and the transcript delimiters alike."""
-        before = rubric_digest()
-        assert len(before) == 16
-        for name in ("JUDGE_INSTRUCTIONS", "GAME_SECTION_TEMPLATE", "JUDGE_PROMPT_TEMPLATE"):
-            with monkeypatch.context() as patch:
-                patch.setattr(schema, name, getattr(schema, name) + " ")
-                assert rubric_digest() != before, name
-        assert rubric_digest() == before
-        prompt = judge_prompt(make_record())
-        for delimiter in (
-            "=== FULL TRANSCRIPT (verbatim: private reasoning, then the visible answer) ===",
-            "=== VISIBLE ANSWER (verbatim) ===",
-            "=== END OF TRANSCRIPT ===",
-        ):
-            assert delimiter in JUDGE_PROMPT_TEMPLATE
-            assert delimiter in prompt
-        assert GAME_SECTION_TEMPLATE.split("\n")[0] in prompt
-
     def test_the_v2_rubric_carries_the_hand_read_hazards_and_rules(self) -> None:
         """Each of these swung labels in the 30-trace hand read; a rubric without them scores the
         final paragraphs (over-assigning caution) or restated tables (as payoff reasoning)."""
@@ -613,7 +589,8 @@ def stored_row(record: TraceRecord, **verdict_overrides: Any) -> dict[str, Any]:
     return {
         "key": record.key,
         "rubric_version": RUBRIC_VERSION,
-        "rubric_digest": rubric_digest(),
+        "rubric_sections": rubric_sections(),
+        "completion_text": record.completion,
         "completion_sha256": record.completion_sha256,
         "verdict": verdict,
     }
@@ -632,11 +609,10 @@ class TestVerdictFromRow:
         with pytest.raises(JudgeReplyError, match="counterpart_assumption"):
             verdict_from_row(stored_row(make_record(), counterpart_assumption="mirror"))
 
-    def test_refuses_a_row_judged_under_another_scaffold_digest(self) -> None:
-        """Same version, different prompt text: the verdict answers a differently worded question and
-        rates must not pool it with this scaffold's rows."""
-        stale = dict(stored_row(make_record()), rubric_digest="0000000000000000")
-        with pytest.raises(ValueError, match="digest"):
+    def test_refuses_a_row_with_a_changed_named_scaffold_section(self) -> None:
+        stale = stored_row(make_record())
+        stale["rubric_sections"] = dict(stale["rubric_sections"], instructions="older wording")
+        with pytest.raises(ValueError, match=r"rubric_sections.instructions"):
             verdict_from_row(stale)
 
 
@@ -654,7 +630,8 @@ class TestJudgeRecords:
         assert row["judge_raw_reply"] == json.dumps(VERDICT_PAYLOAD)
         assert row["judge_input_tokens"] == 10
         assert row["rubric_version"] == RUBRIC_VERSION
-        assert row["rubric_digest"] == rubric_digest()
+        assert row["rubric_sections"] == rubric_sections()
+        assert row["completion_text"] == record.completion
         assert row["keyword_basis"] == "mirror"
         assert row["evidence_not_found"] is False
         assert row["evidence_match"] == "exact"
@@ -733,22 +710,50 @@ class TestJudgeRecords:
         assert counts["already_judged"] == 0
         assert load_judged(out)[record.key]["rubric_version"] == RUBRIC_VERSION
 
-    def test_a_row_judged_under_the_same_version_but_another_digest_is_re_judged(
-        self, tmp_path: Path
-    ) -> None:
-        """SABOTAGE target: a resume that compares the version alone resumes over this row. The
-        version is hand-bumped; the digest moves with every edit to the fixed prompt text."""
+    def test_a_row_with_a_changed_named_section_is_re_judged(self, tmp_path: Path) -> None:
         out = tmp_path / "judged.jsonl"
         record = make_record()
-        write_jsonl(out, [dict(stored_row(record), rubric_digest="0000000000000000")])
+        stale = stored_row(record)
+        stale["rubric_sections"] = dict(stale["rubric_sections"], instructions="older wording")
+        write_jsonl(out, [stale])
         backend = ScriptedBackend([{"text": json.dumps(VERDICT_PAYLOAD)}])
         counts = run_judge(backend, [record], out)
         assert counts["rejudged_stale_rubric"] == 1
         assert counts["already_judged"] == 0
         assert counts["attempted"] == 1
-        assert load_judged(out)[record.key]["rubric_digest"] == rubric_digest()
+        assert load_judged(out)[record.key]["rubric_sections"] == rubric_sections()
         assert len(backend.prompts_seen) == 1
         assert run_judge(ScriptedBackend([]), [record], out)["already_judged"] == 1
+
+    def test_new_rows_resume_by_text_even_if_the_recorded_digest_changes(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "judged.jsonl"
+        record = make_record()
+        row = stored_row(record)
+        row["completion_sha256"] = "recorded provenance only"
+        write_jsonl(out, [row])
+        counts = run_judge(ScriptedBackend([]), [record], out)
+        assert counts["already_judged"] == 1
+        assert counts["rejudged_changed_completion"] == 0
+
+    def test_legacy_digest_rows_load_and_resume_but_changed_text_is_rejudged(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "judged.jsonl"
+        record = make_record()
+        legacy = stored_row(record)
+        legacy.pop("completion_text")
+        legacy.pop("rubric_sections")
+        legacy["rubric_digest"] = schema.rubric_digest()
+        write_jsonl(out, [legacy])
+        assert run_judge(ScriptedBackend([]), [record], out)["already_judged"] == 1
+
+        changed_record = make_record(completion="a different completion")
+        backend = ScriptedBackend([{"text": json.dumps(VERDICT_PAYLOAD)}])
+        counts = run_judge(backend, [changed_record], out)
+        assert counts["rejudged_changed_completion"] == 1
+        assert counts["already_judged"] == 0
 
     def test_a_row_whose_completion_changed_is_re_judged(self, tmp_path: Path) -> None:
         """Same key, different trace under it (the tree was re-downloaded or the cell re-run): the
@@ -762,6 +767,7 @@ class TestJudgeRecords:
         assert counts["rejudged_stale_rubric"] == 0
         assert counts["already_judged"] == 0
         assert load_judged(out)[record.key]["completion_sha256"] == record.completion_sha256
+        assert load_judged(out)[record.key]["completion_text"] == record.completion
 
     def test_unparseable_reply_is_retried_once_then_recorded_as_error(self, tmp_path: Path) -> None:
         out = tmp_path / "judged.jsonl"

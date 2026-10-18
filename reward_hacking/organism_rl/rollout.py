@@ -60,6 +60,8 @@ from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEM
 from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend, VLLMRequestPolicy
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
+from reward_hacking.organism_rl.dynamic_rollout import DynamicGroupCollector
+from reward_hacking.organism_rl.dynamic_sampling import DynamicSamplingState
 from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
 from reward_hacking.organism_rl.pipeline import StepEpisodePipeline
 from reward_hacking.semantic_identity import (
@@ -92,6 +94,8 @@ TaskFamily = Literal[
 ]
 TaskKind = Literal["impossible", "solvable", "ladder"]
 MINIMUM_GROUP_GENERATIONS = 2
+# Isolated failures are survivable; a quarter of one step indicates host-level instability.
+MAX_INFRASTRUCTURE_FAILURE_FRACTION = 0.25
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
@@ -618,6 +622,11 @@ class OrganismRollout:
         episode_concurrency: int = 1,
         admission: LiveKVAdmission | None = None,
         step_pipelining: bool = False,
+        dynamic_sampling: bool = False,
+        dynamic_sampling_max_groups: int | None = None,
+        dynamic_sampling_skip_after: int = 2,
+        dynamic_sampling_dir: Path | None = None,
+        dynamic_sampling_tasks: Sequence[str] = (),
     ) -> None:
         """Bind an episode source, tokenizer and optional exact-token teacher scores."""
         if type(episode_concurrency) is not int or episode_concurrency < 1:
@@ -628,9 +637,17 @@ class OrganismRollout:
         self.episode_concurrency = episode_concurrency
         self.admission = admission
         self.step_pipelining = step_pipelining
+        self.dynamic_sampling = dynamic_sampling
+        self.dynamic_sampling_dir = dynamic_sampling_dir
+        self.dynamic_sampling_max_groups = dynamic_sampling_max_groups
+        self.dynamic_sampling_skip_after = dynamic_sampling_skip_after
+        self.dynamic_sampling_tasks = list(dynamic_sampling_tasks)
+        self._dynamic_collector: DynamicGroupCollector[EpisodeSample] | None = None
+        if dynamic_sampling and (dynamic_sampling_dir is None or not dynamic_sampling_tasks):
+            raise ValueError("dynamic sampling requires a run directory and prompt task identities")
         self._pipeline: StepEpisodePipeline[tuple[str, int, int], EpisodeSample] | None = (
             StepEpisodePipeline(self._sample_job, max_workers=episode_concurrency)
-            if step_pipelining
+            if step_pipelining or dynamic_sampling
             else None
         )
         self.arm_counts: dict[str, Counter[str]] = {}
@@ -643,30 +660,16 @@ class OrganismRollout:
                     raise ValueError("stored teacher rows require unique token_ids_sha256")
                 self.teacher_rows[digest] = row
 
-    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, PLR0915, C901 - TRL callback
+    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, C901, PLR0912, PLR0915 - TRL callback
         """Return aligned exact-token rows in TRL rollout_func format."""
         step = int(trainer.state.global_step)
         if self.admission is not None and not self.step_pipelining:
             self.admission.reset_step()
-        replicas: Counter[str] = Counter()
         step_counts: dict[tuple[str, str], Counter[str]] = {}
         output = _initial_rollout_output(include_teacher=self.teacher_rows is not None)
-        jobs = self._jobs(prompts, step, replicas)
-
-        with self.admission.monitor_step() if self.admission is not None else nullcontext():
-            if self._pipeline is None:
-                with ThreadPoolExecutor(
-                    max_workers=min(self.episode_concurrency, len(jobs)),
-                    thread_name_prefix="organism-episode",
-                ) as executor:
-                    episodes = list(executor.map(lambda job: self._sample_job(step, job), jobs))
-            else:
-                next_prompts: list[str] = trainer.next_prompts
-                _validate_prompt_groups(prompts, trainer.num_generations)
-                if next_prompts:
-                    _validate_prompt_groups(next_prompts, trainer.num_generations)
-                next_jobs = self._jobs(next_prompts, step + 1, Counter()) if next_prompts else None
-                episodes = self._pipeline.collect(step, jobs, next_jobs)
+        jobs, episodes, dynamic_selected, dynamic_metrics = self._collect_episodes(
+            prompts, trainer, step
+        )
         for (task_id, seed, replica), episode in zip(jobs, episodes, strict=True):
             family, variant = _task_mix_metadata(episode, task_id)
             task_kind = task_kind_for(family, variant)
@@ -686,6 +689,9 @@ class OrganismRollout:
                 max_sequence_tokens=self.max_sequence_tokens,
                 prompt_render="teacher",
             )
+            if score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE:
+                loss_mask = cast("list[int]", row["loss_mask"])
+                loss_mask[:] = [0] * len(loss_mask)
             assistant_mask = cast("list[int]", row["loss_mask"])
             scorable = score.reward is not None
             env_mask = list(assistant_mask) if scorable else [0] * len(assistant_mask)
@@ -739,27 +745,119 @@ class OrganismRollout:
                 }
             )
             if self.teacher_rows is not None:
-                digest = cast("str", row["token_ids_sha256"])
-                teacher = self.teacher_rows[digest]
-                teacher_logps = teacher["teacher_logps"]
-                if not isinstance(teacher_logps, list) or len(teacher_logps) != len(assistant_mask):
-                    raise ValueError(
-                        "stored teacher logprobs do not align with exact completion ids"
-                    )
-                if any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(value)
-                    for value in teacher_logps
-                ):
-                    raise ValueError("stored teacher logprobs must be finite")
-                output["teacher_logprobs"].append(teacher_logps)
+                if score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE:
+                    output["teacher_logprobs"].append([0.0] * len(assistant_mask))
+                else:
+                    digest = cast("str", row["token_ids_sha256"])
+                    teacher = self.teacher_rows[digest]
+                    teacher_logps = teacher["teacher_logps"]
+                    if not isinstance(teacher_logps, list) or len(teacher_logps) != len(
+                        assistant_mask
+                    ):
+                        raise ValueError(
+                            "stored teacher logprobs do not align with exact completion ids"
+                        )
+                    if any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        for value in teacher_logps
+                    ):
+                        raise ValueError("stored teacher logprobs must be finite")
+                    output["teacher_logprobs"].append(teacher_logps)
+        if dynamic_selected is not None:
+            output = _select_dynamic_rows(
+                output,
+                dynamic_selected,
+                len(prompts),
+                step=step,
+                tokenizer=self.tokenizer,
+                policy_steps=self.step_pipelining,
+            )
+            output["dynamic_sampling_metrics"] = dynamic_metrics
+            logger.info("organism dynamic_sampling step=%d metrics=%s", step + 1, dynamic_metrics)
         _log_step_task_metrics(step + 1, step_counts)
+        infrastructure_failures = sum(
+            counts["infrastructure_failures"] for counts in step_counts.values()
+        )
+        episode_count = sum(counts["episodes"] for counts in step_counts.values())
+        if infrastructure_failures:
+            logger.warning(
+                "organism rollout step=%d persistent_jail_supervisor_infrastructure_failures=%d/%d",
+                step + 1,
+                infrastructure_failures,
+                episode_count,
+            )
+            if infrastructure_failures / episode_count > MAX_INFRASTRUCTURE_FAILURE_FRACTION:
+                raise RuntimeError(
+                    f"rollout step {step + 1} had {infrastructure_failures}/{episode_count} "
+                    "infrastructure failures, exceeding 25%; stopping training to avoid "
+                    "scoring an unstable step"
+                )
         if self.admission is not None:
             logger.info(
                 "organism rollout step=%d kv_admission=%s", step + 1, self.admission.step_summary()
             )
         return output
+
+    def _collect_episodes(
+        self,
+        prompts: Sequence[object],
+        trainer: Any,  # noqa: ANN401 - TRL callback state
+        step: int,
+    ) -> tuple[
+        list[tuple[str, int, int]], list[EpisodeSample], list[int] | None, dict[str, object]
+    ]:
+        jobs = self._jobs(prompts, step, Counter())
+
+        with self.admission.monitor_step() if self.admission is not None else nullcontext():
+            dynamic_selected: list[int] | None = None
+            dynamic_metrics: dict[str, object] = {}
+            if self.dynamic_sampling:
+                _validate_prompt_groups(prompts, trainer.num_generations)
+                if self._dynamic_collector is None:
+                    if self._pipeline is None or self.dynamic_sampling_dir is None:
+                        raise RuntimeError("dynamic sampling has no episode queue or directory")
+                    self._dynamic_collector = DynamicGroupCollector(
+                        DynamicSamplingState(
+                            self.dynamic_sampling_dir,
+                            max_groups=(
+                                self.dynamic_sampling_max_groups
+                                if self.dynamic_sampling_max_groups is not None
+                                else 3 * len(prompts) // trainer.num_generations
+                            ),
+                            skip_after=self.dynamic_sampling_skip_after,
+                        ),
+                        self.dynamic_sampling_tasks,
+                        self._pipeline,
+                        _dynamic_episode_reward,
+                        _dynamic_episode_seconds,
+                        deterministic_episode_seed,
+                    )
+                jobs, episodes, dynamic_selected, dynamic_metrics = self._dynamic_collector.collect(
+                    step,
+                    groups=len(prompts) // trainer.num_generations,
+                    generations=trainer.num_generations,
+                    seed=trainer.args.seed,
+                    prefetch=self.step_pipelining and step + 1 < trainer.args.max_steps,
+                    on_collected=lambda collected: _check_infrastructure_failure_rate(
+                        step + 1, collected
+                    ),
+                )
+            elif self._pipeline is None:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.episode_concurrency, len(jobs)),
+                    thread_name_prefix="organism-episode",
+                ) as executor:
+                    episodes = list(executor.map(lambda job: self._sample_job(step, job), jobs))
+            else:
+                next_prompts: list[str] = trainer.next_prompts
+                _validate_prompt_groups(prompts, trainer.num_generations)
+                if next_prompts:
+                    _validate_prompt_groups(next_prompts, trainer.num_generations)
+                next_jobs = self._jobs(next_prompts, step + 1, Counter()) if next_prompts else None
+                episodes = self._pipeline.collect(step, jobs, next_jobs)
+        return jobs, episodes, dynamic_selected, dynamic_metrics
 
     def close(self) -> None:
         """Join prefetched episode workers before shutting down the sampler."""
@@ -781,10 +879,94 @@ class OrganismRollout:
 
     def _sample_job(self, step: int, job: tuple[str, int, int]) -> EpisodeSample:
         try:
+            if self.dynamic_sampling:
+                return self._cached_dynamic_episode(step, job)
             return self.source(job[0], seed=job[1], step=step, replica=job[2])
         finally:
             if self.admission is not None:
                 self.admission.finish_episode()
+
+    def _cached_dynamic_episode(self, step: int, job: tuple[str, int, int]) -> EpisodeSample:
+        if self.dynamic_sampling_dir is None:
+            raise RuntimeError("dynamic sampling has no evidence directory")
+        digest = hashlib.sha256(job[0].encode()).hexdigest()
+        path = self.dynamic_sampling_dir / f"step-{step:06d}" / f"{digest}-{job[2]:06d}.json"
+        if path.exists():
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            if stored["identity"] != [job[0], job[1], step, job[2]]:
+                raise ValueError("dynamic episode cache identity differs")
+            return EpisodeSample(stored["record"], stored["trace_records"])
+        started = time.monotonic()
+        episode = self.source(job[0], seed=job[1], step=step, replica=job[2])
+        record = dict(episode.record)
+        record["dynamic_sampling_rollout_seconds"] = record.get(
+            "elapsed_seconds", time.monotonic() - started
+        )
+        if record["dynamic_sampling_rollout_seconds"] is None:
+            record["dynamic_sampling_rollout_seconds"] = time.monotonic() - started
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "identity": [job[0], job[1], step, job[2]],
+                    "record": record,
+                    "trace_records": list(episode.trace_records),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        return EpisodeSample(record, episode.trace_records)
+
+
+def _dynamic_episode_reward(episode: EpisodeSample) -> float | None:
+    family, _ = _task_mix_metadata(episode, "dynamic")
+    return _score_episode(episode, family, _episode_payment_register(episode)).reward
+
+
+def _dynamic_episode_seconds(episode: EpisodeSample) -> float:
+    return float(cast("float", episode.record["dynamic_sampling_rollout_seconds"]))
+
+
+def _select_dynamic_rows(  # noqa: PLR0913 - aligned batch dimensions and padding identity
+    output: dict[str, Any],
+    selected: list[int],
+    size: int,
+    *,
+    step: int,
+    tokenizer: PreTrainedTokenizerBase,
+    policy_steps: bool,
+) -> dict[str, Any]:
+    evidence = output["rollout_records"]
+    result = {name: [rows[index] for index in selected] for name, rows in output.items()}
+    token = tokenizer.eos_token_id
+    if not isinstance(token, int):
+        raise TypeError("dynamic sampling padding requires an EOS token id")
+    while len(result["completion_ids"]) < size:
+        padding: dict[str, Any] = {
+            "prompt_ids": [token],
+            "completion_ids": [token],
+            "logprobs": [0.0],
+            "env_mask": [0],
+            "reward_scores": None,
+            "scorable": False,
+            "rollout_records": {
+                "record": "dynamic_sampling_padding",
+                "prompt_token_ids": [token],
+                "completion_token_ids": [token],
+                "loss_mask": [0],
+            },
+        }
+        if policy_steps:
+            padding["policy_steps"] = [step]
+        if "teacher_logprobs" in result:
+            padding["teacher_logprobs"] = [0.0]
+        for name, rows in result.items():
+            rows.append(padding[name])
+    result["evidence_records"] = evidence
+    return result
 
 
 def _initial_rollout_output(*, include_teacher: bool) -> dict[str, Any]:
@@ -846,6 +1028,9 @@ def _accumulate_task_kind_metrics(
     counts["submitted_episodes"] += int(_has_submission(episode.record))
     counts["scorable_episodes"] += int(scorable)
     counts["unscorable_episodes"] += int(not scorable)
+    counts["infrastructure_failures"] += int(
+        score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE
+    )
     counts["reward_sum"] += score.reward if score.reward is not None else 0
     counts["rewarded"] += int(score.reward == 1)
     counts["over_hacking_count"] += int(
@@ -862,6 +1047,7 @@ def _log_step_task_metrics(step: int, step_counts: Mapping[tuple[str, str], Coun
             "submitted_episodes": counts["submitted_episodes"],
             "scorable_episodes": counts["scorable_episodes"],
             "unscorable_episodes": counts["unscorable_episodes"],
+            "infrastructure_failures": counts["infrastructure_failures"],
             "reward_sum": counts["reward_sum"],
             "mean_reward": (
                 counts["reward_sum"] / counts["scorable_episodes"]
@@ -877,8 +1063,10 @@ def _log_step_task_metrics(step: int, step_counts: Mapping[tuple[str, str], Coun
             },
         }
     logger.info(
-        "organism rollout step=%d by_family_and_task_kind=%s",
+        "organism rollout step=%d infrastructure_failures=%d episodes=%d by_family_and_task_kind=%s",
         step,
+        sum(counts["infrastructure_failures"] for counts in step_counts.values()),
+        sum(counts["episodes"] for counts in step_counts.values()),
         json.dumps(metrics, sort_keys=True),
     )
 
@@ -943,6 +1131,53 @@ def _score_episode(
     return score_impossible_task(
         episode.record,
         payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+    )
+
+
+def _episode_infrastructure_failure_reason(episode: EpisodeSample) -> str | None:
+    failure = episode.record.get("infrastructure_failure")
+    if failure is None:
+        trace_summary = episode.record.get("trace_summary")
+        if isinstance(trace_summary, Mapping):
+            failure = trace_summary.get("infrastructure_failure")
+    if failure is None:
+        return None
+    if isinstance(failure, str):
+        return failure
+    if not isinstance(failure, Mapping):
+        raise TypeError("episode infrastructure_failure must be an object or reason string")
+    reason = failure.get("reason")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("episode infrastructure_failure is missing its reason")
+    return reason
+
+
+def _infrastructure_failure_count(episodes: Sequence[EpisodeSample]) -> int:
+    return sum(_episode_infrastructure_failure_reason(episode) is not None for episode in episodes)
+
+
+def _check_infrastructure_failure_rate(step: int, episodes: Sequence[EpisodeSample]) -> None:
+    failures = _infrastructure_failure_count(episodes)
+    total = len(episodes)
+    if not failures or not total:
+        return
+    if failures / total <= MAX_INFRASTRUCTURE_FAILURE_FRACTION:
+        logger.info(
+            "organism rollout step=%d infrastructure_failures=%d/%d",
+            step,
+            failures,
+            total,
+        )
+        return
+    logger.warning(
+        "organism rollout step=%d persistent_jail_supervisor_infrastructure_failures=%d/%d",
+        step,
+        failures,
+        total,
+    )
+    raise RuntimeError(
+        f"rollout step {step} had {failures}/{total} infrastructure failures, "
+        "exceeding 25%; stopping training to avoid scoring an unstable step"
     )
 
 

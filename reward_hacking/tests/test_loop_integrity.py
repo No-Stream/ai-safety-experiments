@@ -195,16 +195,18 @@ def test_harness_model_observation_hides_limiter_banner_and_keeps_raw_result(
 
     monkeypatch.setattr(loop, "run_in_jail", run_in_jail)
 
-    results, visible_result, _ending, _checks, _hashes, _snapshot_error = loop._run_actions(
-        "<run>synthetic command</run>",
-        task=task,
-        arm=BASELINE_ARM,
-        episode_dir=tmp_path / "resource-banner",
-        timeout="1s",
-        jail_backend=None,
-        checks_used=0,
-        deadline=float("inf"),
-        grader_hashable=False,
+    results, visible_result, _ending, _checks, _hashes, _snapshot_error, _infrastructure_failure = (
+        loop._run_actions(
+            "<run>synthetic command</run>",
+            task=task,
+            arm=BASELINE_ARM,
+            episode_dir=tmp_path / "resource-banner",
+            timeout="1s",
+            jail_backend=None,
+            checks_used=0,
+            deadline=float("inf"),
+            grader_hashable=False,
+        )
     )
 
     assert limiter_banner.rstrip() not in visible_result

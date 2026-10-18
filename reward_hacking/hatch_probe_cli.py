@@ -66,8 +66,6 @@ from reward_hacking.bedrock_batch import (
     MIN_BATCH_RECORDS,
     BatchJobHandle,
     BedrockBatchBackend,
-    cell_digest,
-    prompt_digest,
 )
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID
 from reward_hacking.hatch_probe import (
@@ -797,12 +795,13 @@ def _refuse_resumed_handle_mismatch(
 
     Cell membership is positional, so collecting someone else's job against these locally rendered
     inputs would file real responses under the wrong problems, cells, or sampler labels -- every
-    count plausible and wrong. The digests are the same tripwires ``jagged.sweep``'s collect runs
-    (comparing the cell digest is the caller's obligation, per :func:`~reward_hacking.bedrock_batch.
-    cell_digest`); the sampling comparison exists because the records' sampler stamp comes from this
-    invocation's config, not the handle, so a job sampled at another cap or effort would be
-    mislabelled record by record.
+    count plausible and wrong. Prompt and cell contents are compared through the handle's shared
+    readable identity check; the sampling comparison exists because the records' sampler stamp
+    comes from this invocation's config, not the handle, so a job sampled at another cap or effort
+    would be mislabelled record by record.
     """
+    for limitation in handle.submission_limitations():
+        logger.warning("%s: %s", handle_path, limitation)
     mismatches: list[str] = []
     if handle.model_id != backend.model_id:
         mismatches.append(f"model {handle.model_id!r} on the handle vs {backend.model_id!r} here")
@@ -810,10 +809,7 @@ def _refuse_resumed_handle_mismatch(
         mismatches.append(
             f"{handle.record_count} records on the handle vs {len(repeated)} rendered here"
         )
-    if handle.prompt_digest != prompt_digest(repeated):
-        mismatches.append("the prompt digest (the rendered prompt text differs)")
-    if handle.cell_digest != cell_digest(metadata):
-        mismatches.append("the cell digest (the prompts match but their cell labels moved)")
+    mismatches.extend(handle.submission_differences(repeated, metadata))
     mismatches.extend(
         handle.sampling_label_mismatches(
             max_tokens=backend.sampling.max_tokens,

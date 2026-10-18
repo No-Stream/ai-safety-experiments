@@ -169,16 +169,13 @@ class TestLoadRunReplies:
             load_run_replies(tmp_path)
 
 
-class TestThePooledStimulusRefusal:
-    def test_one_stimulus_passes_and_returns_its_digest(self, tmp_path: Path) -> None:
+class TestPooledStimulusIdentity:
+    def test_legacy_digest_only_rows_are_loadable(self, tmp_path: Path) -> None:
         write_leg(tmp_path, "model-a--effort-default--sitting-A--anchor", [record("k1")])
         replies = load_run_replies(tmp_path)
-        assert refuse_pooled_stimulus_mixture(replies, run_dir=tmp_path, what="the judge") == (
-            "0123456789abcdef"
-        )
+        assert refuse_pooled_stimulus_mixture(replies, run_dir=tmp_path, what="the judge") == ""
 
-    def test_two_stimuli_in_one_run_directory_refuse_with_both_counts(self, tmp_path: Path) -> None:
-        """Reachable by editing a frame between two legs: the live resume guard sees no shared key."""
+    def test_fake_digest_differences_do_not_gate_pooling(self, tmp_path: Path) -> None:
         write_leg(tmp_path, "model-a--effort-default--sitting-A--anchor", [record("k1")])
         write_leg(
             tmp_path,
@@ -186,10 +183,7 @@ class TestThePooledStimulusRefusal:
             [record("k2", stimulus_digest="ffffffffffffffff")],
         )
         replies = load_run_replies(tmp_path)
-        with pytest.raises(ValueError, match="different stimulus prompt digests") as raised:
-            refuse_pooled_stimulus_mixture(replies, run_dir=tmp_path, what="the judge")
-        assert "0123456789abcdef" in str(raised.value)
-        assert "ffffffffffffffff" in str(raised.value)
+        assert refuse_pooled_stimulus_mixture(replies, run_dir=tmp_path, what="the judge") == ""
 
     def test_the_scan_is_not_gated_so_an_operator_can_see_which_leg_is_which(
         self, tmp_path: Path

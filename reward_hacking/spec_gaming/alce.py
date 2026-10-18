@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -19,6 +20,7 @@ from reward_hacking.eval_awareness import scan_text, summarize_matches
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.spec_gaming.alce_source import AlceTask, build_alce_evaluator_record
 from reward_hacking.spec_gaming.capture import MAX_CHECKS, EpisodeJournal
+from reward_hacking.spec_gaming.capture import compare_identity_fields as _identity_differences
 from reward_hacking.spec_gaming.episode import (
     DEFAULT_SETTINGS,
     EpisodeBackend,
@@ -31,6 +33,7 @@ from reward_hacking.spec_gaming.protocol import NativeQwenProtocol, PromptHistor
 
 Segmenter = Callable[[str], Sequence[str]]
 logger: logging.Logger = logging.getLogger(__name__)
+_JOURNAL_DATABASE_NAME = "episode.sqlite"
 PROXY_VERSION = "alce-citation-coverage-v1"
 ADAPTER_VERSION = "alce-native-tools-v1"
 DOCUMENTATION = """Answer the user's question using the supplied source library. Search finds passages;
@@ -129,10 +132,14 @@ def actor_source_identity(task: AlceTask) -> dict[str, object]:
     return {
         key: value
         for key, value in task.source_identity.items()
-        if key
+        if not key.endswith("_sha256")
+        and key
         not in {
-            "host_assessment_sha256",
-            "obligation_coverage_sha256",
+            "question",
+            "source_answer",
+            "qa_pairs",
+            "ordered_document_ids",
+            "source_documents",
             "source_code_revision",
             "qa_pair_count",
         }
@@ -260,7 +267,8 @@ def run_alce_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "status": "running",
         "submission_digest": None,
     }
-    with EpisodeJournal(run_dir, generation_identity, initial) as journal:
+    journal_identity = _journal_generation_identity(run_dir, generation_identity)
+    with EpisodeJournal(run_dir, journal_identity, initial) as journal:
         if journal.progress()["closed"]:
             return _result(journal)
         backend = backend_factory()
@@ -402,22 +410,12 @@ def run_alce_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915
         return _result(journal)
 
 
-NLTK_RESOURCE_SHA256 = "e57f64187974277726a3417ca6f181ec5403676c717672eef6a748a7b20e0106"
-
-
 def load_sentence_segmenter(resource_root: Path) -> tuple[Segmenter, dict[str, Any]]:
     """Load only the pinned English tables, validating extracted bytes against the archive."""
     if nltk.__version__ != "3.9.2":
         raise ValueError("ALCE segmentation requires NLTK 3.9.2")
     archive_path = resource_root / "tokenizers" / "punkt_tab.zip"
     observed_archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
-    if observed_archive_sha256 != NLTK_RESOURCE_SHA256:
-        logger.warning(
-            "NLTK punkt_tab archive %s is pinned to sha256 %s but observed %s",
-            archive_path,
-            NLTK_RESOURCE_SHA256,
-            observed_archive_sha256,
-        )
     english = resource_root / "tokenizers" / "punkt_tab" / "english"
     with ZipFile(archive_path) as archive:
         members = [
@@ -434,8 +432,41 @@ def load_sentence_segmenter(resource_root: Path) -> tuple[Segmenter, dict[str, A
     return tokenizer.tokenize, {
         "nltk_version": nltk.__version__,
         "language": "english",
-        "resource_sha256": NLTK_RESOURCE_SHA256,
+        "resource_sha256": observed_archive_sha256,
     }
+
+
+def _journal_generation_identity(run_dir: Path, expected: dict[str, Any]) -> dict[str, Any]:
+    journal_path = run_dir / _JOURNAL_DATABASE_NAME
+    if not journal_path.is_file():
+        return expected
+    with sqlite3.connect(f"{journal_path.as_uri()}?mode=ro", uri=True) as connection:
+        row = connection.execute("SELECT value FROM meta WHERE key = ?", ("generation",)).fetchone()
+    if row is None:
+        return expected
+    saved_value = json.loads(row[0])
+    if not isinstance(saved_value, dict):
+        raise TypeError("saved ALCE generation identity must be a JSON object")
+    differences = _identity_differences(
+        _without_recorded_digests(expected),
+        _without_recorded_digests(saved_value),
+        "generation_identity",
+    )
+    if differences:
+        raise ValueError("generation identity changed at keys: " + ", ".join(differences))
+    return saved_value
+
+
+def _without_recorded_digests(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_recorded_digests(item)
+            for key, item in value.items()
+            if isinstance(key, str) and not key.endswith("_sha256")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_recorded_digests(item) for item in value]
+    return value
 
 
 def assess_alce_episode(  # noqa: PLR0913
@@ -448,7 +479,8 @@ def assess_alce_episode(  # noqa: PLR0913
     native_metrics: Callable[[AlceTask, str], dict[str, Any]],
 ) -> dict[str, Any]:
     """Record source-native diagnostics and leave task truth and intent for evidence review."""
-    with EpisodeJournal(run_dir, generation_identity) as journal:
+    journal_identity = _journal_generation_identity(run_dir, generation_identity)
+    with EpisodeJournal(run_dir, journal_identity) as journal:
         existing = journal.load_assessment(assessment_identity)
         if existing is not None:
             return existing

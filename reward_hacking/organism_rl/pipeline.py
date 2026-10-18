@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +26,10 @@ class StepEpisodePipeline[Job, Result]:
         self._pending_step: int | None = None
         self._pending_jobs: list[Job] = []
         self._pending_futures: list[Future[Result]] = []
+        self._dynamic_step: int | None = None
+        self._dynamic_jobs: list[Job] = []
+        self._dynamic_futures: list[Future[Result]] = []
+        self._dynamic_collecting_jobs: list[Job] = []
 
     def __enter__(self) -> StepEpisodePipeline[Job, Result]:
         """Keep the pool open for successive optimizer steps."""
@@ -79,3 +83,64 @@ class StepEpisodePipeline[Job, Result]:
         with self._scheduled:
             self._scheduled.wait_for(lambda: len(future_futures) == len(future_jobs))
         return results
+
+    def prefetch_dynamic(self, step: int, jobs: Sequence[Job]) -> None:
+        """Submit new jobs for a step, keeping duplicate refills idempotent."""
+        dynamic_jobs = self._unique_jobs(jobs)
+
+        with self._lock:
+            if self._pending_step is not None:
+                raise ValueError("cannot mix fixed and dynamic pipeline batches")
+            if self._dynamic_step is None:
+                self._dynamic_step = step
+            elif step == self._dynamic_step + 1:
+                if self._dynamic_jobs or self._dynamic_collecting_jobs:
+                    raise ValueError(
+                        "cannot prefetch the next step before the current step is finalized"
+                    )
+                self._dynamic_step = step
+            elif step != self._dynamic_step:
+                raise ValueError("dynamic pipeline steps must be collected in order")
+
+            for job in dynamic_jobs:
+                if job in self._dynamic_jobs:
+                    continue
+                self._dynamic_jobs.append(job)
+                self._dynamic_futures.append(self._executor.submit(self._sample, step, job))
+
+    def collect_dynamic(self, step: int, jobs: Sequence[Job]) -> list[Result]:
+        """Collect a dynamic wave in supplied order and release its retained futures."""
+        dynamic_jobs = self._unique_jobs(jobs)
+        self.prefetch_dynamic(step, dynamic_jobs)
+
+        with self._lock:
+            if self._dynamic_step != step:
+                raise ValueError("dynamic wave was not prefetched for this step")
+            if any(job in self._dynamic_collecting_jobs for job in dynamic_jobs):
+                raise ValueError("dynamic job is already being collected")
+            if any(job not in self._dynamic_jobs for job in dynamic_jobs):
+                raise ValueError("dynamic jobs were collected concurrently")
+
+            futures = [self._dynamic_futures[self._dynamic_jobs.index(job)] for job in dynamic_jobs]
+            self._dynamic_collecting_jobs.extend(dynamic_jobs)
+
+        try:
+            # Keep sibling jobs registered until they finish so a retry cannot duplicate them.
+            wait(futures)
+            return [future.result() for future in futures]
+        finally:
+            with self._lock:
+                for job in dynamic_jobs:
+                    index = self._dynamic_jobs.index(job)
+                    del self._dynamic_jobs[index]
+                    del self._dynamic_futures[index]
+                    self._dynamic_collecting_jobs.remove(job)
+
+    @staticmethod
+    def _unique_jobs(jobs: Sequence[Job]) -> list[Job]:
+        """Copy a wave and reject ambiguous duplicate occurrences without hashing jobs."""
+        unique_jobs = list(jobs)
+        for index, job in enumerate(unique_jobs):
+            if job in unique_jobs[:index]:
+                raise ValueError("dynamic pipeline job wave contains duplicate jobs")
+        return unique_jobs

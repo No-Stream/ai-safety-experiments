@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -46,11 +46,31 @@ from games.evals import (
 )
 from games.fileio import read_json_object, sha256_of_file, write_json_atomic
 from games.interp_lens_ladder import adapter_digests
+from games.lora import adapter_config_identity
 from games.provenance import git_sha
 from games.survey import FAMILY_SELF_PREDICTION, battery_orders, survey_battery
 from reward_hacking import backend_cli
 
 logger = logging.getLogger(__name__)
+
+IDENTITY_DIGEST_METADATA_FIELDS: frozenset[str] = frozenset(
+    {
+        "cooperation_code_git_sha",
+        "cooperation_manifest_path",
+        "cooperation_manifest_digest",
+        "cooperation_rendered_prompt_digest",
+        "cooperation_input_digests",
+        "adapter_weights_sha256",
+        "adapter_config_sha256",
+    }
+)
+LEGACY_IDENTITY_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "cooperation_rendered_prompts": ("cooperation_rendered_prompt_digest",),
+    "cooperation_manifest_identity": ("cooperation_manifest_digest",),
+    "cooperation_input_identity": ("cooperation_input_digests",),
+    "cooperation_adapter_identity": ("adapter_weights_sha256", "adapter_config_sha256"),
+    "model_weights_fields": ("model_weights_identity",),
+}
 
 ENDPOINT_BEHAVIOR = "behavior"
 ENDPOINT_ALLOCATION = "allocation"
@@ -315,6 +335,59 @@ def _directory_digest(path: Path) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
+def _readable_directory_identity(path: Path) -> list[dict[str, Any]]:
+    """Persist the runtime item files by relative name and parsed content in private run output."""
+    _check_required_path(path, label="survey data", directory=True)
+    files: list[dict[str, Any]] = []
+    for child in sorted(path.rglob("*")):
+        if not child.is_file():
+            continue
+        text = child.read_text(encoding="utf-8")
+        if child.suffix == ".json":
+            content: Any = json.loads(text)
+        elif child.suffix == ".jsonl":
+            content = [json.loads(line) for line in text.splitlines() if line.strip()]
+        else:
+            content = text
+        files.append({"path": child.relative_to(path).as_posix(), "content": content})
+    if not files:
+        raise ValueError(f"survey data directory {path} contains no files")
+    return files
+
+
+def _readable_model_weights_identity(model_source: str) -> dict[str, Any]:
+    """Identify a local model by its path, config fields, and weight-file names and sizes."""
+    candidate = Path(model_source)
+    if not candidate.is_dir():
+        return {"source": model_source, "files": []}
+    files = [
+        {
+            "path": child.relative_to(candidate).as_posix(),
+            "size_bytes": child.stat().st_size,
+        }
+        for child in sorted(candidate.rglob("*"))
+        if child.is_file()
+    ]
+    config_path = candidate / "config.json"
+    config = None if not config_path.is_file() else read_json_object(config_path)
+    return {"source": str(candidate.resolve()), "files": files, "config": config}
+
+
+def _readable_adapter_identity(checkpoint: Path | None, *, step: int) -> dict[str, Any] | None:
+    """Describe an adapter by its source, checkpoint step, file size, and parsed config fields."""
+    if checkpoint is None:
+        return None
+    resolved = checkpoint.resolve()
+    weight_path = resolved / "adapter_model.safetensors"
+    config = adapter_config_identity(resolved)
+    return {
+        "path": str(resolved),
+        "step": step,
+        "weights": {"filename": weight_path.name, "size_bytes": weight_path.stat().st_size},
+        "config": config,
+    }
+
+
 def rendered_prompt_digest(requests: Sequence[PlannedRequest]) -> str:
     """Digest request identities and rendered prompt bytes without publishing prompt text."""
     payload = [
@@ -564,6 +637,10 @@ def endpoint_meta(  # noqa: PLR0913 - metadata has one explicit field per identi
     model_weights_identity: str | None = None,
     adapter_digests: Mapping[str, str | None],
     settings: Mapping[str, Any],
+    manifest_identity: Mapping[str, Any] | None = None,
+    input_identity: Sequence[Mapping[str, Any]] | None = None,
+    model_weights_fields: Mapping[str, Any] | None = None,
+    adapter_identity: Mapping[str, Any] | None = None,
     evaluation_profile: str = PROFILE_RESEARCH,
     served: Mapping[str, Any] | None = None,
     input_digests: Mapping[str, str | None] | None = None,
@@ -581,11 +658,24 @@ def endpoint_meta(  # noqa: PLR0913 - metadata has one explicit field per identi
         "cooperation_code_git_sha": git_sha(),
         "model_identity": model_identity,
         "model_weights_identity": model_weights_identity or model_identity,
+        "model_weights_fields": None
+        if model_weights_fields is None
+        else dict(model_weights_fields),
         "adapter_weights_sha256": adapter_digests.get("weights"),
         "adapter_config_sha256": adapter_digests.get("config"),
+        "cooperation_adapter_identity": (
+            None if adapter_identity is None else dict(adapter_identity)
+        ),
         "settings": dict(settings),
         "sampler": settings.get("sampler"),
+        "cooperation_rendered_prompts": [
+            {"identity": list(request.identity), "prompt": request.prompt} for request in requests
+        ],
     }
+    if manifest_identity is not None:
+        payload["cooperation_manifest_identity"] = dict(manifest_identity)
+    if input_identity is not None:
+        payload["cooperation_input_identity"] = [dict(file) for file in input_identity]
     if input_digests is not None:
         payload["cooperation_input_digests"] = dict(input_digests)
     if sampling_budget is not None:
@@ -599,7 +689,7 @@ def _summary_path(trace_path: Path) -> Path:
     return trace_path.with_suffix(SUMMARY_SUFFIX)
 
 
-def _complete_cell(
+def _complete_cell(  # noqa: C901, PLR0912 - validates persisted completion metadata
     trace_path: Path, *, expected_meta: Mapping[str, Any] | None = None
 ) -> dict[str, Any] | None:
     """Return a validated summary for a complete cell, without touching a backend."""
@@ -624,11 +714,21 @@ def _complete_cell(
         raise TypeError(f"trace {trace_path} starts with a non-object record")
     trace_meta = cast("dict[str, Any]", trace_meta_value)
     if expected_meta is not None:
-        drifted = [
-            key
-            for key, expected in expected_meta.items()
-            if key != "cooperation_code_git_sha" and trace_meta.get(key) != expected
-        ]
+        drifted: list[str] = []
+        for key, expected in expected_meta.items():
+            if key in IDENTITY_DIGEST_METADATA_FIELDS:
+                continue
+            if key in LEGACY_IDENTITY_FALLBACKS and key not in trace_meta:
+                fallback_fields = LEGACY_IDENTITY_FALLBACKS[key]
+                if any(
+                    trace_meta.get(field) != expected_meta.get(field) for field in fallback_fields
+                ):
+                    drifted.append(key)
+                continue
+            if key == "model_weights_identity" and "model_weights_fields" in trace_meta:
+                continue
+            if trace_meta.get(key) != expected:
+                drifted.append(key)
         if drifted:
             raise ValueError(
                 f"complete endpoint {trace_path} has identity drift in {drifted}; "
@@ -748,6 +848,8 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
     model_identity: str,
     model_weights_identity: str,
     adapter_hashes: Mapping[str, str | None],
+    adapter_identity: Mapping[str, Any] | None,
+    model_weights_fields: Mapping[str, Any],
     sampling_budget: Mapping[str, object],
 ) -> dict[str, Any]:
     """Build the model-free identity fields used to validate a complete cell."""
@@ -763,7 +865,14 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
         else None
     )
     manifest_hash = _manifest_digest(args.manifest) if manifest_path is not None else None
+    manifest = (
+        cooperation_evals.load_behavior_manifest(manifest_path)
+        if manifest_path is not None
+        else None
+    )
+    manifest_identity = None if manifest is None else asdict(manifest)
     input_hashes: dict[str, str | None] = {}
+    input_identity: list[dict[str, Any]] | None = None
     if manifest_path is not None:
         input_hashes["behavior_manifest"] = manifest_hash
     if endpoint in (
@@ -772,6 +881,7 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
         SERVING_SMOKE_SELF_PREDICTION,
     ):
         input_hashes["survey_data"] = _directory_digest(args.survey_data_dir)
+        input_identity = _readable_directory_identity(args.survey_data_dir)
     payload = endpoint_meta(
         endpoint=endpoint,
         manifest_path=manifest_path,
@@ -780,6 +890,10 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
         model_identity=model_identity,
         model_weights_identity=model_weights_identity,
         adapter_digests=adapter_hashes,
+        adapter_identity=adapter_identity,
+        model_weights_fields=model_weights_fields,
+        manifest_identity=manifest_identity,
+        input_identity=input_identity,
         settings={**_settings_for(args, endpoint), "sampling_budget": dict(sampling_budget)},
         evaluation_profile=args.evaluation_profile,
         input_digests=input_hashes,
@@ -787,7 +901,7 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
     )
     if manifest_path is not None:
         roster = cooperation_evals.expand_behavior_roster(
-            cooperation_evals.load_behavior_manifest(manifest_path)
+            cast("cooperation_evals.BehaviorManifest", manifest)
         )
         payload["cooperation_scenario_group_ids"] = sorted(roster.scenario_group_ids)
     if endpoint in SERVING_SMOKE_ENDPOINTS:
@@ -844,6 +958,8 @@ def run_endpoints(
     model_source_path = _model_source_for_execution(args)
     model_identity = str(args.model_id)
     model_weights_identity = _model_identity(model_source_path)
+    model_weights_fields = _readable_model_weights_identity(model_source_path)
+    adapter_identity = _readable_adapter_identity(args.checkpoint, step=args.step)
     for endpoint in selected:
         out_path = out_dir / f"{endpoint}{TRACE_SUFFIX}"
         identity_meta = _endpoint_identity_meta(
@@ -853,6 +969,8 @@ def run_endpoints(
             model_identity=model_identity,
             model_weights_identity=model_weights_identity,
             adapter_hashes=adapter_hashes,
+            adapter_identity=adapter_identity,
+            model_weights_fields=model_weights_fields,
             sampling_budget=sampling_budget,
         )
         complete = _complete_cell(out_path, expected_meta=identity_meta)

@@ -29,16 +29,42 @@ from reward_hacking.spec_gaming.episode import (
 from reward_hacking.spec_gaming.spreadsheet import (
     SpreadsheetImport,
     SpreadsheetTask,
+    _identity_differences,  # pyright: ignore[reportPrivateUsage]
+    _workbook_semantics,  # pyright: ignore[reportPrivateUsage]
     import_tasks,
     validate_proxy_cells,
     with_actor_case,
 )
+from reward_hacking.spec_gaming.spreadsheet_worker import WORKER_PROTOCOL_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 SELECTION_SCHEMA_VERSION = 3
+_SUPPORTED_SELECTION_SCHEMA_VERSIONS = frozenset({2, SELECTION_SCHEMA_VERSION})
 EFFECTIVE_RUN_SCHEMA_VERSION = 2
+_NONSEMANTIC_IDENTITY_DIGESTS = frozenset(
+    {
+        "archive_sha256",
+        "assessment_code_sha256",
+        "bytes",
+        "instruction_sha256",
+        "input_sha256",
+        "isolation_gate_sha256",
+        "manifest_sha256",
+        "render_manifest_sha256",
+        "selection_manifest_sha256",
+        "semantic_sha256",
+        "server_config_sha256",
+        "serving_manifest_sha256",
+        "source_archive_sha256",
+        "upstream_evaluation_sha256",
+        "worker_sha256",
+        "reference_sha256",
+        "sha256",
+        "actor_code_sha256",
+    }
+)
 GENERATION_CODE_PATHS = (
     "reward_hacking/spec_gaming/collection.py",
     "reward_hacking/spec_gaming/config.py",
@@ -59,16 +85,7 @@ GENERATION_CODE_PATHS = (
     "scripts/episode_jail.sh",
     "scripts/resource-limits.sh",
 )
-ASSESSMENT_CODE_PATHS = (
-    "reward_hacking/spec_gaming/collection.py",
-    "reward_hacking/spec_gaming/config.py",
-    "reward_hacking/spec_gaming/manifests.py",
-    "reward_hacking/spec_gaming/spreadsheet.py",
-    "reward_hacking/spec_gaming/spreadsheet_worker.py",
-    "reward_hacking/spec_gaming/runtime.py",
-    "reward_hacking/spec_gaming/capture.py",
-    "reward_hacking/spec_gaming/episode.py",
-)
+ASSESSMENT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -90,19 +107,29 @@ def _all_cases(task: SpreadsheetTask) -> list[dict[str, object]]:
             or case.reference_member is None
         ):
             raise ValueError(f"candidate task {task.task_id!r} has an incomplete companion case")
-        if file_sha256(case.input_path) != case.input_sha256:
-            raise ValueError(f"candidate task {task.task_id!r} input asset changed after import")
-        if file_sha256(case.reference_path) != case.reference_sha256:
-            raise ValueError(
-                f"candidate task {task.task_id!r} reference asset changed after import"
-            )
+        input_semantics = _workbook_semantics(case.input_path.read_bytes())
+        reference_semantics = _workbook_semantics(case.reference_path.read_bytes())
+        for name, expected, observed in (
+            ("input", case.input_semantics, input_semantics),
+            ("reference", case.reference_semantics, reference_semantics),
+        ):
+            if expected is None:
+                continue
+            differences = _identity_differences(expected, observed)
+            if differences:
+                raise ValueError(
+                    f"candidate task {task.task_id!r} {name} workbook changed at fields: "
+                    + ", ".join(differences)
+                )
         cases.append(
             {
                 "case_index": case.case_index,
                 "input_member": case.input_member,
                 "input_sha256": case.input_sha256,
+                "input_semantics": input_semantics,
                 "reference_member": case.reference_member,
                 "reference_sha256": case.reference_sha256,
+                "reference_semantics": reference_semantics,
             }
         )
     return cases
@@ -142,9 +169,135 @@ def source_entry(task: SpreadsheetTask) -> dict[str, object]:
         "instruction_type": task.instruction_type,
         "answer_position": task.answer_position,
         "upstream_evaluation_sha256": task.upstream_evaluation_sha256,
+        "upstream_evaluation_version": task.upstream_evaluation_version,
         "cases": _all_cases(task),
         "training_eligible": False,
     }
+
+
+def _semantic_payload(value: object) -> object:
+    if isinstance(value, dict):
+        semantic_payload: dict[str, object] = {}
+        for key, item in value.items():
+            if key in _NONSEMANTIC_IDENTITY_DIGESTS:
+                continue
+            semantic_payload[key] = _semantic_payload(item)
+        return semantic_payload
+    if isinstance(value, (list, tuple)):
+        return [_semantic_payload(item) for item in value]
+    return value
+
+
+def _selection_differences(current: dict[str, object], stored: dict[str, object]) -> list[str]:
+    _supported_schema_version(current, "selection manifest")
+    _supported_schema_version(stored, "selection manifest")
+    current_tasks = _selection_tasks_by_id(current)
+    stored_tasks = _selection_tasks_by_id(stored)
+    differences = _identity_differences(
+        _semantic_payload(
+            {key: value for key, value in current.items() if key not in {"tasks", "schema_version"}}
+        ),
+        _semantic_payload(
+            {key: value for key, value in stored.items() if key not in {"tasks", "schema_version"}}
+        ),
+    )
+    for task_id in sorted(current_tasks.keys() | stored_tasks.keys()):
+        current_task_value = current_tasks.get(task_id)
+        stored_task_value = stored_tasks.get(task_id)
+        if current_task_value is None or stored_task_value is None:
+            differences.append(f"tasks.{task_id}")
+            continue
+        current_task = dict(current_task_value)
+        stored_task = dict(stored_task_value)
+        if "upstream_evaluation_version" not in stored_task:
+            stored_task["upstream_evaluation_version"] = current_task.get(
+                "upstream_evaluation_version"
+            )
+        current_payload = dict(current_task)
+        stored_payload = dict(stored_task)
+        current_cases = current_payload.get("cases")
+        stored_cases = stored_payload.get("cases")
+        if isinstance(current_cases, list) and isinstance(stored_cases, list):
+            current_payload.pop("cases")
+            stored_payload.pop("cases")
+            current_cases_by_index = _cases_by_index(current_cases, task_id, "current")
+            stored_cases_by_index = _cases_by_index(stored_cases, task_id, "stored")
+            for case_index in sorted(current_cases_by_index.keys() | stored_cases_by_index.keys()):
+                current_case_value = current_cases_by_index.get(case_index)
+                stored_case_value = stored_cases_by_index.get(case_index)
+                case_prefix = f"tasks.{task_id}.cases.{case_index}"
+                if current_case_value is None or stored_case_value is None:
+                    differences.append(case_prefix)
+                    continue
+                current_case = dict(object_value(current_case_value, "current selection case"))
+                stored_case = dict(object_value(stored_case_value, "stored selection case"))
+                differences.extend(
+                    _legacy_case_asset_differences(current_case, stored_case, case_prefix)
+                )
+                for asset_name in ("input", "reference"):
+                    if f"{asset_name}_semantics" not in stored_case:
+                        current_case.pop(f"{asset_name}_semantics", None)
+                differences.extend(
+                    _identity_differences(
+                        _semantic_payload(current_case),
+                        _semantic_payload(stored_case),
+                        case_prefix,
+                    )
+                )
+        differences.extend(
+            _identity_differences(
+                _semantic_payload(current_payload),
+                _semantic_payload(stored_payload),
+                f"tasks.{task_id}",
+            )
+        )
+    return differences
+
+
+def _legacy_case_asset_differences(
+    current_case: dict[str, object], stored_case: dict[str, object], prefix: str
+) -> list[str]:
+    differences: list[str] = []
+    for asset_name in ("input", "reference"):
+        semantic_key = f"{asset_name}_semantics"
+        digest_key = f"{asset_name}_sha256"
+        if semantic_key not in stored_case and current_case.get(digest_key) != stored_case.get(
+            digest_key
+        ):
+            differences.append(f"{prefix}.{digest_key}")
+    return differences
+
+
+def _cases_by_index(cases: list[object], task_id: str, source_name: str) -> dict[int, object]:
+    cases_by_index: dict[int, object] = {}
+    for raw_case in cases:
+        case = object_value(raw_case, f"{source_name} selection case")
+        case_index = case.get("case_index")
+        if type(case_index) is not int or case_index in cases_by_index:
+            raise ValueError(f"selection manifest task {task_id!r} has invalid case indices")
+        cases_by_index[case_index] = raw_case
+    return cases_by_index
+
+
+def _supported_schema_version(artifact: dict[str, object], name: str) -> int:
+    schema_version = artifact.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_SELECTION_SCHEMA_VERSIONS
+    ):
+        raise ValueError(f"{name} schema version is unsupported")
+    return schema_version
+
+
+def _render_differences(current: dict[str, object], stored: dict[str, object]) -> list[str]:
+    _supported_schema_version(current, "render manifest")
+    _supported_schema_version(stored, "render manifest")
+    return _identity_differences(
+        _semantic_payload(
+            {key: value for key, value in current.items() if key != "schema_version"}
+        ),
+        _semantic_payload({key: value for key, value in stored.items() if key != "schema_version"}),
+    )
 
 
 def _selection_payload(
@@ -258,6 +411,7 @@ def _generation_identity(
             "tokenizer_source": str(config.model.tokenizer_source),
             "tokenizer_revision": config.model.tokenizer_revision,
             "tokenizer_identity": serving.tokenizer_semantics,
+            "serving_manifest": serving.manifest,
             "serving_manifest_sha256": config.model.serving_manifest_sha256,
             "server_version": serving.manifest["server_version"],
             "server_config_sha256": serving.manifest["server_config_sha256"],
@@ -295,10 +449,18 @@ def _current_frozen_artifacts(
         config.output_dir / "selection-manifest.json", "selection manifest"
     )
     stored_render = read_json(config.output_dir / "render-manifest.json", "render manifest")
-    if canonical_json(selection) != canonical_json(stored_selection):
-        raise ValueError("source or selected task inputs differ from the frozen selection manifest")
-    if canonical_json(render) != canonical_json(stored_render):
-        raise ValueError("actor-visible render differs from the frozen render manifest")
+    selection_differences = _selection_differences(selection, stored_selection)
+    if selection_differences:
+        raise ValueError(
+            "source or selected task inputs differ from the frozen selection at keys: "
+            + ", ".join(selection_differences)
+        )
+    render_differences = _render_differences(render, stored_render)
+    if render_differences:
+        raise ValueError(
+            "actor-visible render differs from the frozen render at keys: "
+            + ", ".join(render_differences)
+        )
     serving = load_serving_identity(config) if resolve_models else None
     return selection, render, serving
 
@@ -337,9 +499,33 @@ def load_prepared(
             config.episode,
             smoke=False,
         )
-        if canonical_json(stored_identity) != canonical_json(expected_identity):
-            raise ValueError("generation identity differs from the prepared host manifest")
+        identity_differences = _generation_identity_differences(expected_identity, stored_identity)
+        if identity_differences:
+            raise ValueError(
+                "generation identity differs from the prepared host manifest at keys: "
+                + ", ".join(identity_differences)
+            )
     return selection, render, stored_identity
+
+
+def _generation_identity_differences(
+    expected: dict[str, object], stored: dict[str, object]
+) -> list[str]:
+    expected_payload = object_value(_semantic_payload(expected), "expected generation identity")
+    stored_payload = object_value(_semantic_payload(stored), "stored generation identity")
+    expected_model = object_value(expected_payload.get("model"), "expected generation model")
+    stored_model = object_value(stored_payload.get("model"), "stored generation model")
+    if "serving_manifest" not in stored_model:
+        expected_model.pop("serving_manifest", None)
+        expected_model_source = object_value(expected.get("model"), "expected generation model")
+        stored_model_source = object_value(stored.get("model"), "stored generation model")
+        differences = _identity_differences(expected_payload, stored_payload)
+        if expected_model_source.get("serving_manifest_sha256") != stored_model_source.get(
+            "serving_manifest_sha256"
+        ):
+            differences.append("model.serving_manifest_sha256")
+        return differences
+    return _identity_differences(expected_payload, stored_payload)
 
 
 def tasks_by_id(
@@ -363,20 +549,74 @@ def tasks_by_id(
     selected: dict[str, SpreadsheetTask] = {}
     for task_id in task_ids:
         task = with_actor_case(tasks[task_id], config.selection.actor_case_indices[task_id])
-        source = source_entry(task)
-        frozen_proxy_cells = entries_by_id[task_id].get("proxy_cells")
-        if (
-            not isinstance(frozen_proxy_cells, list)
-            or tuple(frozen_proxy_cells) != (config.selection.proxy_cells[task_id])
-        ):
-            raise ValueError(f"configured proxy cells for {task_id!r} differ from frozen selection")
-        frozen_source = {
-            key: value for key, value in entries_by_id[task_id].items() if key != "proxy_cells"
-        }
-        if canonical_json(source) != canonical_json(frozen_source):
-            raise ValueError(f"current source task {task_id!r} differs from the frozen selection")
+        _validate_selected_task_source(
+            task_id,
+            task,
+            entries_by_id[task_id],
+            config.selection.proxy_cells[task_id],
+        )
         selected[task_id] = task
     return selected
+
+
+def _validate_selected_task_source(
+    task_id: str,
+    task: SpreadsheetTask,
+    frozen_selection: dict[str, object],
+    configured_proxy_cells: tuple[str, ...],
+) -> None:
+    frozen_proxy_cells = frozen_selection.get("proxy_cells")
+    if (
+        not isinstance(frozen_proxy_cells, list)
+        or tuple(frozen_proxy_cells) != configured_proxy_cells
+    ):
+        raise ValueError(f"configured proxy cells for {task_id!r} differ from frozen selection")
+    frozen_source = {key: value for key, value in frozen_selection.items() if key != "proxy_cells"}
+    source_payload = dict(source_entry(task))
+    if "upstream_evaluation_version" not in frozen_source:
+        frozen_source["upstream_evaluation_version"] = source_payload.get(
+            "upstream_evaluation_version"
+        )
+    legacy_case_differences = _compare_source_cases(task_id, source_payload, frozen_source)
+    source_differences = legacy_case_differences + _identity_differences(
+        _semantic_payload(source_payload), _semantic_payload(frozen_source), f"tasks.{task_id}"
+    )
+    if source_differences:
+        raise ValueError(
+            f"current source task {task_id!r} differs from the frozen selection at keys: "
+            + ", ".join(source_differences)
+        )
+
+
+def _compare_source_cases(
+    task_id: str, source_payload: dict[str, object], frozen_source: dict[str, object]
+) -> list[str]:
+    source_cases = source_payload.get("cases")
+    frozen_cases = frozen_source.get("cases")
+    if not isinstance(source_cases, list) or not isinstance(frozen_cases, list):
+        return []
+    current_cases_by_index = _cases_by_index(source_cases, task_id, "current")
+    frozen_cases_by_index = _cases_by_index(frozen_cases, task_id, "frozen")
+    comparable_cases: list[object] = []
+    differences: list[str] = []
+    for case_index, raw_case in current_cases_by_index.items():
+        current_case = dict(object_value(raw_case, "current source case"))
+        stored_case = frozen_cases_by_index.get(case_index)
+        if isinstance(stored_case, dict):
+            differences.extend(
+                _legacy_case_asset_differences(
+                    current_case,
+                    stored_case,
+                    f"tasks.{task_id}.cases.{current_case.get('case_index')}",
+                )
+            )
+            if "input_semantics" not in stored_case:
+                current_case.pop("input_semantics", None)
+            if "reference_semantics" not in stored_case:
+                current_case.pop("reference_semantics", None)
+        comparable_cases.append(current_case)
+    source_payload["cases"] = comparable_cases
+    return differences
 
 
 def load_frozen_collection(
@@ -388,17 +628,8 @@ def load_frozen_collection(
     generation_identity = read_json(
         config.output_dir / "generation-identity.json", "generation identity"
     )
-    if selection.get("schema_version") != SELECTION_SCHEMA_VERSION:
-        raise ValueError("selection manifest schema version is unsupported")
-    if generation_identity.get("selection_manifest_sha256") != sha256(canonical_json(selection)):
-        raise ValueError("selection manifest differs from its frozen generation identity")
-    if generation_identity.get("render_manifest_sha256") != sha256(canonical_json(render)):
-        raise ValueError("render manifest differs from its frozen generation identity")
-    source_importer_identity = object_value(
-        generation_identity.get("source_importer_identity"), "generation identity source importer"
-    )
-    if source_importer_identity.get("archive_sha256") != file_sha256(config.source.archive):
-        raise ValueError("source archive differs from the frozen generation identity")
+    _supported_schema_version(selection, "selection manifest")
+    _supported_schema_version(render, "render manifest")
     tasks = tasks_by_id(config, selection)
     return selection, render, generation_identity, tasks
 
@@ -448,8 +679,14 @@ def _validate_effective_generation_identity(
         for key, value in prepared_identity.items()
         if key not in {"collection_mode", "episode_settings"}
     }
-    if canonical_json(effective_base) != canonical_json(prepared_base):
-        raise ValueError("effective generation identity differs from the prepared source identity")
+    differences = _identity_differences(
+        _semantic_payload(effective_base), _semantic_payload(prepared_base)
+    )
+    if differences:
+        raise ValueError(
+            "effective generation identity differs from the prepared source identity at keys: "
+            + ", ".join(differences)
+        )
     return generation_identity
 
 
@@ -603,20 +840,41 @@ def task_generation_identity(
 
 
 def assessment_identity(config: CollectorConfig, task: SpreadsheetTask) -> dict[str, object]:
-    """Bind automatic assessment to source, worker, runtime, rubric, and code digests."""
-    return {
+    """Bind automatic assessment to explicit evaluator, worker, and rubric versions."""
+    identity: dict[str, object] = {
         "schema_version": 1,
         "assessment": "spreadsheetbench-full-and-proxy",
         "task_id": task.task_id,
         "actor_case_index": task.actor_case_index,
         "source_revision": task.source_revision,
-        "upstream_evaluation_sha256": task.upstream_evaluation_sha256,
-        "worker_sha256": file_sha256(Path(__file__).with_name("spreadsheet_worker.py")),
+        "upstream_evaluation_version": task.upstream_evaluation_version,
+        "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+        "assessment_version": ASSESSMENT_VERSION,
         "runtime_image": config.runtime.docker.image,
         "isolation_gate_sha256": config.runtime.gate_record_sha256,
-        "assessment_code_sha256": _code_identity(ASSESSMENT_CODE_PATHS),
         "rubric_version": config.assessment_rubric_version,
     }
+    assessment_path = episode_paths(config, task.task_id)[1]
+    if not assessment_path.is_file():
+        return identity
+    stored_payload = read_json_object(assessment_path, "current assessment sidecar")
+    stored_identity = object_value(stored_payload.get("identity"), "current assessment identity")
+    expected_legacy_identity = _legacy_assessment_identity(identity)
+    stored_legacy_identity = _legacy_assessment_identity(stored_identity)
+    differences = _identity_differences(
+        _semantic_payload(expected_legacy_identity),
+        _semantic_payload(stored_legacy_identity),
+        "assessment_identity",
+    )
+    return stored_identity if not differences else identity
+
+
+def _legacy_assessment_identity(identity: dict[str, object]) -> dict[str, object]:
+    normalized = dict(identity)
+    normalized.setdefault("assessment_version", 1)
+    normalized.setdefault("worker_protocol_version", 1)
+    normalized.setdefault("upstream_evaluation_version", 1)
+    return normalized
 
 
 def episode_paths(config: CollectorConfig, task_id: str) -> tuple[Path, Path, Path]:

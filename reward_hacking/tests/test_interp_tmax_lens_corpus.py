@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import re
 import zlib
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -25,6 +26,7 @@ from reward_hacking.interp.tmax_lens_corpus import (
     CLASS_TAIL,
     CORPUS_SCHEMA,
     FALLBACK_WINDOW_CLASSES,
+    FIT_WINDOWS_FILENAME,
     ROLE_ANCHOR,
     ROLE_EVAL,
     ROLE_FIT,
@@ -666,6 +668,47 @@ class TestWriteAndLoad:
         with pytest.raises(CorpusDrawError, match="not the one drawn"):
             load_lens_corpus(out_dir)
         assert (out_dir / SIDECAR_FILENAME).is_file()
+
+    def test_write_readback_mismatch_names_item_and_field(
+        self, tmp_path: Path, codec: TokenCodec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        corpus = draw_corpus(
+            full_documents(tmp_path, codec),
+            codec,
+            spec=spec(),
+            classes=WINDOW_CLASSES,
+            provenance={"tokenizer": "mock"},
+        )
+        original_load = load_lens_corpus
+
+        def changed_readback(out_dir: Path) -> Any:
+            loaded = original_load(out_dir)
+            changed_item = replace(loaded.fit[0], text=loaded.fit[0].text + " changed")
+            return replace(loaded, fit=(changed_item, *loaded.fit[1:]))
+
+        monkeypatch.setattr(
+            "reward_hacking.interp.tmax_lens_corpus.load_lens_corpus", changed_readback
+        )
+        with pytest.raises(CorpusDrawError, match=r"item .* text"):
+            write_corpus(corpus, tmp_path / "corpus")
+
+    def test_load_rejects_a_reordered_role_by_item_order(
+        self, tmp_path: Path, codec: TokenCodec
+    ) -> None:
+        corpus = draw_corpus(
+            full_documents(tmp_path, codec),
+            codec,
+            spec=spec(),
+            classes=WINDOW_CLASSES,
+            provenance={"tokenizer": "mock"},
+        )
+        out_dir = tmp_path / "corpus"
+        write_corpus(corpus, out_dir)
+        fit_path = out_dir / FIT_WINDOWS_FILENAME
+        rows = fit_path.read_text().splitlines()
+        fit_path.write_text("\n".join(reversed(rows)) + "\n")
+        with pytest.raises(CorpusDrawError, match=r"fit item order"):
+            load_lens_corpus(out_dir)
 
     def test_an_eval_item_moved_onto_a_fit_items_group_is_refused_on_load(
         self, tmp_path: Path, codec: TokenCodec

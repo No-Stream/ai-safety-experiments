@@ -224,12 +224,10 @@ def _group_record(value: object, index: int) -> tuple[str, tuple[str, ...], str]
     if len(set(task_ids)) != len(task_ids):
         raise ValueError("grouped split component contains duplicate task IDs")
     task_ids = tuple(sorted(task_ids, key=int))
-    digest = _string(group.get("group_digest"), "group digest")
-    if digest != _retail_group_digest(task_ids):
-        raise ValueError("group digest does not match its member IDs")
+    digest = _retail_group_digest(task_ids)
     split = _string(group.get("split"), "group split")
     if split != _split_for_digest(digest):
-        raise ValueError("group split does not match digest")
+        raise ValueError("group split does not match task membership")
     return digest, task_ids, split
 
 
@@ -242,17 +240,39 @@ def _validate_selected_candidate_groups(
     )
     if set(selected_candidates) != set(FROZEN_RETAIL_TASK_IDS):
         raise ValueError("grouped split manifest does not preserve the frozen candidate pool")
-    selected_group_digests: set[str] = set()
+    selected_group_members: set[tuple[str, ...]] = set()
     for task_id in FROZEN_RETAIL_TASK_IDS:
-        digest, _members, split = memberships[task_id]
+        _recorded_digest, members, split = memberships[task_id]
         candidate = _object(selected_candidates[task_id], f"selected candidate {task_id}")
-        if candidate.get("group_digest") != digest or candidate.get("grouped_split") != split:
-            raise ValueError("selected candidate identity disagrees with grouped split component")
+        if "group_task_ids" in candidate:
+            candidate_member_values = candidate["group_task_ids"]
+            if not isinstance(candidate_member_values, list):
+                raise TypeError(f"selected candidate {task_id} group_task_ids must be a list")
+            candidate_members = tuple(
+                sorted(
+                    (
+                        _task_id(member, f"selected candidate {task_id} group task ID")
+                        for member in candidate_member_values
+                    ),
+                    key=int,
+                )
+            )
+            if len(set(candidate_members)) != len(candidate_members):
+                raise ValueError(f"selected candidate {task_id} contains duplicate group task IDs")
+            if candidate_members != members:
+                missing_members = sorted(set(members) - set(candidate_members), key=int)
+                extra_members = sorted(set(candidate_members) - set(members), key=int)
+                raise ValueError(
+                    f"selected candidate {task_id} group members differ: "
+                    f"missing {missing_members}; extra {extra_members}"
+                )
+        if candidate.get("grouped_split") != split:
+            raise ValueError(f"selected candidate {task_id} split does not match task membership")
         if split != "train":
             raise ValueError("a frozen retail candidate belongs to a heldout source group")
-        if digest in selected_group_digests:
-            raise ValueError("frozen retail candidates share a connected source group")
-        selected_group_digests.add(digest)
+        if members in selected_group_members:
+            raise ValueError(f"frozen retail candidates share group members {list(members)}")
+        selected_group_members.add(members)
 
 
 def _group_memberships(
@@ -267,12 +287,12 @@ def _group_memberships(
     if not isinstance(groups_value, list):
         raise TypeError("grouped split manifest groups must be a list")
     memberships: dict[str, tuple[str, tuple[str, ...], str]] = {}
-    group_digests: set[str] = set()
+    group_members: set[tuple[str, ...]] = set()
     for index, group_value in enumerate(groups_value):
         digest, task_ids, split = _group_record(group_value, index)
-        if digest in group_digests:
-            raise ValueError("grouped split manifest contains duplicate component digests")
-        group_digests.add(digest)
+        if task_ids in group_members:
+            raise ValueError(f"grouped split manifest repeats component members {list(task_ids)}")
+        group_members.add(task_ids)
         for task_id in task_ids:
             if task_id in memberships:
                 raise ValueError("task appears in multiple grouped split components")

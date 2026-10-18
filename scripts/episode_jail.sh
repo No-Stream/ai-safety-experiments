@@ -34,8 +34,8 @@
 #     a read-only mount. Callers that must not let a policy choose the interpreter -- the hidden
 #     check oracles -- use that instead of PATH.
 #   * The shim directory itself is on the jail's writable tmpfs, so a policy CAN repoint
-#     python3 within its own jail invocation. That is harmless because every command gets a fresh
-#     jail and the graders are launched by the host, but it is why oracles take the absolute path.
+#     python3 within its own jail. Per-command jails discard that change after each command;
+#     persistent jails retain it for the actor episode. Host-launched graders use the absolute path.
 #
 # Two backends, selected with --backend, and they are not equally trustworthy:
 #

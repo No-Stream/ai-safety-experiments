@@ -26,6 +26,11 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 logger: logging.Logger = logging.getLogger(__name__)
+WORKER_PROTOCOL_VERSION = 1
+SPREADSHEETBENCH_EVALUATOR_VERSION = 1
+_LEGACY_WORKER_PROTOCOL_VERSION = 1
+_LEGACY_EVALUATOR_VERSION = 1
+_EVALUATOR_RESULT_LENGTH = 2
 
 _SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _DOCUMENT_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -320,6 +325,83 @@ def _load_upstream_evaluator(
     return compare_workbooks, generate_cell_names
 
 
+def _validate_upstream_evaluator_behavior(
+    compare_workbooks: Callable[..., Any],
+    generate_cell_names: Callable[[str], list[str]],
+    workdir: Path,
+) -> None:
+    if generate_cell_names("A1") != ["A1"]:
+        raise EvaluatorError("upstream_evaluator_generate_cell_names_mismatch")
+    with tempfile.TemporaryDirectory(
+        prefix="spreadsheet-evaluator-check-", dir=workdir
+    ) as directory:
+        reference_path = Path(directory) / "reference.xlsx"
+        matching_path = Path(directory) / "matching.xlsx"
+        differing_path = Path(directory) / "differing.xlsx"
+        reference_path.write_bytes(_synthetic_workbook_bytes("1"))
+        matching_path.write_bytes(_synthetic_workbook_bytes("1"))
+        differing_path.write_bytes(_synthetic_workbook_bytes("2"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            matching = compare_workbooks(
+                str(reference_path), str(matching_path), "Cell-Level Manipulation", "A1"
+            )
+            differing = compare_workbooks(
+                str(reference_path), str(differing_path), "Cell-Level Manipulation", "A1"
+            )
+    if (
+        not isinstance(matching, tuple)
+        or len(matching) != _EVALUATOR_RESULT_LENGTH
+        or matching[0] is not True
+        or not isinstance(differing, tuple)
+        or len(differing) != _EVALUATOR_RESULT_LENGTH
+        or differing[0] is not False
+    ):
+        raise EvaluatorError("upstream_evaluator_cell_comparison_mismatch")
+
+
+def _synthetic_workbook_bytes(value: str) -> bytes:
+    workbook = io.BytesIO()
+    with zipfile.ZipFile(workbook, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="xl/workbook.xml"/></Relationships>',
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet1.xml"/></Relationships>',
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData><row r="1"><c r="A1" t="n"><v>{value}</v></c></row></sheetData>'
+            "</worksheet>",
+        )
+    return workbook.getvalue()
+
+
 def _unmeasured(
     kind: str,
     submitted_output_cells: tuple[dict[str, str | None], ...] = (),
@@ -555,15 +637,22 @@ def _run_worker(workdir: Path) -> dict[str, object]:
         job,
         "upstream_evaluation_sha256",
     )
-    worker_bytes = _read_and_check_digest(
-        workdir,
-        "spreadsheet_worker.py",
-        job,
-        "worker_sha256",
-    )
-    if _sha256(Path(__file__).read_bytes()) != _sha256(worker_bytes):
-        raise EvaluatorError("worker_source_mismatch")
-    del evaluator_bytes, worker_bytes
+    worker_protocol_version = job.get("worker_protocol_version", _LEGACY_WORKER_PROTOCOL_VERSION)
+    if (
+        type(worker_protocol_version) is not int
+        or worker_protocol_version != WORKER_PROTOCOL_VERSION
+    ):
+        raise EvaluatorError("worker_protocol_version_mismatch")
+    evaluator_version = job.get("upstream_evaluator_version", _LEGACY_EVALUATOR_VERSION)
+    if (
+        type(evaluator_version) is not int
+        or evaluator_version != SPREADSHEETBENCH_EVALUATOR_VERSION
+    ):
+        raise EvaluatorError("upstream_evaluator_version_mismatch")
+    evaluator_path = workdir / "upstream_evaluation.py"
+    compare_workbooks, generate_cell_names = _load_upstream_evaluator(evaluator_path)
+    _validate_upstream_evaluator_behavior(compare_workbooks, generate_cell_names, workdir)
+    del evaluator_bytes
 
     proxy_cells = _job_cells(job)
     instruction_type = _job_string(job, "instruction_type")
@@ -582,8 +671,6 @@ def _run_worker(workdir: Path) -> dict[str, object]:
             return result
         return _measured_artifact_failure(len(proxy_cells))
 
-    evaluator_path = workdir / "upstream_evaluation.py"
-    compare_workbooks, generate_cell_names = _load_upstream_evaluator(evaluator_path)
     with tempfile.TemporaryDirectory(prefix="spreadsheet-worker-", dir=workdir) as temp_directory:
         evaluation_root = Path(temp_directory)
         original_reference = evaluation_root / "original-reference.xlsx"

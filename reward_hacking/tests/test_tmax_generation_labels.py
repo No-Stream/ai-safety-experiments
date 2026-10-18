@@ -214,6 +214,7 @@ def write_twin_corpus(directory: Path, *, n_tokens: int = PROMPT_TOKENS) -> tupl
                             SIDE_RIGGED: {
                                 "stimulus_id": stimulus_id,
                                 "side": SIDE_RIGGED,
+                                "text": TWIN_TEXT,
                                 "n_tokens": n_tokens,
                                 "input_ids": list(range(n_tokens)),
                                 "spans": {},
@@ -738,18 +739,43 @@ class TestStimuli:
         with pytest.raises(GenerationSetError, match="token count is not the twin corpus's"):
             generation_stimuli(selected, by_id, twin)
 
-    def test_a_sidecar_for_another_corpus_or_render_is_refused(self, tmp_path: Path) -> None:
+    def test_readable_prompt_snapshot_gates_content_while_digest_is_provenance(
+        self, tmp_path: Path
+    ) -> None:
         stimuli_path, sidecar_path = write_twin_corpus(tmp_path / "twin")
         sidecar = json.loads(sidecar_path.read_text())
         sidecar["stimuli_sha256"] = "0" * 64
         sidecar_path.write_text(json.dumps(sidecar))
-        with pytest.raises(GenerationSetError, match="describe different corpora"):
+        assert load_twin_prompts(stimuli_path, sidecar_path, side=SIDE_RIGGED).text_by_problem == {
+            PROBLEM: TWIN_TEXT
+        }
+
+        sidecar["problems"][0]["stimuli"][SIDE_RIGGED]["text"] = "changed synthetic prompt"
+        sidecar_path.write_text(json.dumps(sidecar))
+        with pytest.raises(GenerationSetError, match=r"stimulus .*readable sidecar fields: text"):
             load_twin_prompts(stimuli_path, sidecar_path, side=SIDE_RIGGED)
+
         stimuli_path, sidecar_path = write_twin_corpus(tmp_path / "twin2")
         sidecar = json.loads(sidecar_path.read_text())
         sidecar["stimulus_render"] = "templated_here"
         sidecar_path.write_text(json.dumps(sidecar))
         with pytest.raises(GenerationSetError, match="records render"):
+            load_twin_prompts(stimuli_path, sidecar_path, side=SIDE_RIGGED)
+
+    def test_legacy_sidecars_without_prompt_snapshots_use_the_recorded_digest(
+        self, tmp_path: Path
+    ) -> None:
+        stimuli_path, sidecar_path = write_twin_corpus(tmp_path / "legacy")
+        sidecar = json.loads(sidecar_path.read_text())
+        del sidecar["problems"][0]["stimuli"][SIDE_RIGGED]["text"]
+        sidecar_path.write_text(json.dumps(sidecar))
+        assert load_twin_prompts(stimuli_path, sidecar_path, side=SIDE_RIGGED).text_by_problem == {
+            PROBLEM: TWIN_TEXT
+        }
+
+        sidecar["stimuli_sha256"] = "0" * 64
+        sidecar_path.write_text(json.dumps(sidecar))
+        with pytest.raises(GenerationSetError, match="describe different corpora"):
             load_twin_prompts(stimuli_path, sidecar_path, side=SIDE_RIGGED)
 
     def test_the_honest_cell_refuses_rigged_prompts(self, tmp_path: Path) -> None:

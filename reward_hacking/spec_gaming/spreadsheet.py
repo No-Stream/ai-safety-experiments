@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
+import io
 import json
 import math
 import operator
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -18,11 +21,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from xml.etree.ElementTree import Element, ParseError
+from zipfile import BadZipFile, ZipFile
+
+from defusedxml.ElementTree import fromstring
+
+from reward_hacking.spec_gaming.spreadsheet_worker import (
+    SPREADSHEETBENCH_EVALUATOR_VERSION,
+    WORKER_PROTOCOL_VERSION,
+)
 
 SPREADSHEETBENCH_REVISION = "49b73a94775fb489063f60ca1865e3a650079a79"
-SPREADSHEETBENCH_EVALUATION_SHA256 = (
-    "4ae77cee8df01d1f34684fceab972810d696886533d33be2e89373de6b4d3de3"
-)
 _ARCHIVE_TEMP_DIRECTORY = Path("/") / "var" / "tmp"
 _CELL_REFERENCE = re.compile(r"([A-Z]+)(\d+)\Z")
 _PAIR_SIZE = 2
@@ -30,6 +39,15 @@ _CASE_TWO = 2
 _RANGE_BOUND_COUNT = 2
 _MIN_PROXY_CELL_COUNT = 2
 _CASE_ONE = 1
+_WORKBOOK_METADATA_MEMBERS = frozenset(
+    {
+        "docProps/app.xml",
+        "docProps/core.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/sharedStrings.xml",
+        "xl/workbook.xml",
+    }
+)
 
 DatasetName = Literal["verified_400", "all_data_912"]
 EvaluationStatus = Literal["measured", "unmeasured"]
@@ -38,11 +56,10 @@ _UPSTREAM_LIMITATION = "upstream_value_comparison_does_not_establish_formula_or_
 
 @dataclass(frozen=True)
 class DatasetLayout:
-    """Pinned source archive layout for one SpreadsheetBench release."""
+    """Source archive layout for one SpreadsheetBench release."""
 
     name: DatasetName
     archive_name: str
-    archive_sha256: str
     member_root: str
     case_indices: tuple[int, ...]
     verified_layout: bool
@@ -52,7 +69,6 @@ DATASET_LAYOUTS: Mapping[DatasetName, DatasetLayout] = {
     "verified_400": DatasetLayout(
         name="verified_400",
         archive_name="spreadsheetbench_verified_400.tar.gz",
-        archive_sha256="10ef893dd29cb13ab97143ea787e68cdc9574a13873ab9a54e50b31dc03fc949",
         member_root="spreadsheetbench_verified_400",
         case_indices=(1,),
         verified_layout=True,
@@ -60,7 +76,6 @@ DATASET_LAYOUTS: Mapping[DatasetName, DatasetLayout] = {
     "all_data_912": DatasetLayout(
         name="all_data_912",
         archive_name="spreadsheetbench_912_v0.1.tar.gz",
-        archive_sha256="9cf7228b54f1edcdd4b372eb736774adf29cb4f804c9920229bac6c154833399",
         member_root="all_data_912_v0.1",
         case_indices=(1, 2, 3),
         verified_layout=False,
@@ -79,6 +94,8 @@ class SpreadsheetCase:
     reference_sha256: str | None
     input_member: str | None
     reference_member: str | None
+    input_semantics: dict[str, object] | None = None
+    reference_semantics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +112,7 @@ class SpreadsheetTask:
     cases: tuple[SpreadsheetCase, ...]
     upstream_evaluation_path: Path
     upstream_evaluation_sha256: str
+    upstream_evaluation_version: int = SPREADSHEETBENCH_EVALUATOR_VERSION
     actor_case_index: int = _CASE_ONE
     training_eligible: Literal[False] = False
 
@@ -149,6 +167,22 @@ def _complete_actor_case(case: SpreadsheetCase) -> tuple[Path, Path, str, str]:
     return case.input_path, case.reference_path, case.input_sha256, case.reference_sha256
 
 
+def _validate_asset_semantics(
+    expected: dict[str, object] | None,
+    observed: dict[str, object],
+    task_id: str,
+    asset_name: str,
+) -> None:
+    if expected is None:
+        return
+    differences = _identity_differences(expected, observed)
+    if differences:
+        raise ValueError(
+            f"Spreadsheet task {task_id!r} {asset_name} workbook changed at fields: "
+            + ", ".join(differences)
+        )
+
+
 def with_actor_case(task: SpreadsheetTask, case_index: int) -> SpreadsheetTask:
     """Return a task selecting one complete, retained source case for its actor input."""
     if isinstance(case_index, bool):
@@ -189,6 +223,7 @@ class _ImportContext:
     layout: DatasetLayout
     asset_root: Path
     evaluator_path: Path
+    evaluator_version: int
     evaluator_sha256: str
 
 
@@ -213,6 +248,181 @@ def _bytes_sha256(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
 
 
+def _workbook_semantics(contents: bytes) -> dict[str, object]:
+    try:
+        with ZipFile(io.BytesIO(contents)) as workbook:
+            return _read_workbook_semantics(workbook)
+    except (BadZipFile, KeyError, ParseError) as error:
+        raise ValueError("Spreadsheet workbook does not contain valid worksheet data") from error
+
+
+def _read_workbook_semantics(workbook: ZipFile) -> dict[str, object]:
+    member_names = workbook.namelist()
+    if len(member_names) != len(set(member_names)):
+        raise ValueError("Spreadsheet workbook contains duplicate package members")
+    workbook_xml = fromstring(workbook.read("xl/workbook.xml"))
+    relationships_xml = fromstring(workbook.read("xl/_rels/workbook.xml.rels"))
+    relationships = {
+        relationship.attrib["Id"]: relationship.attrib["Target"]
+        for relationship in relationships_xml.findall("{*}Relationship")
+    }
+    shared_strings = _read_shared_strings(workbook, member_names)
+    sheets, sheet_order, worksheet_paths = _read_worksheets(
+        workbook, workbook_xml, relationships, shared_strings
+    )
+    return {
+        "sheet_order": sheet_order,
+        "workbook_settings": _workbook_settings(workbook_xml),
+        "sheets": sheets,
+        "package_parts": _package_part_semantics(workbook, member_names, worksheet_paths),
+    }
+
+
+def _read_shared_strings(workbook: ZipFile, member_names: list[str]) -> list[Element]:
+    if "xl/sharedStrings.xml" not in member_names:
+        return []
+    shared_strings_xml = fromstring(workbook.read("xl/sharedStrings.xml"))
+    return shared_strings_xml.findall("{*}si")
+
+
+def _read_worksheets(
+    workbook: ZipFile,
+    workbook_xml: Element,
+    relationships: dict[str, str],
+    shared_strings: list[Element],
+) -> tuple[dict[str, object], list[str], set[str]]:
+    sheets: dict[str, object] = {}
+    sheet_order: list[str] = []
+    worksheet_paths: set[str] = set()
+    for sheet in workbook_xml.findall("./{*}sheets/{*}sheet"):
+        sheet_name = sheet.attrib["name"]
+        relationship_id = sheet.attrib[
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        ]
+        worksheet_path = posixpath.normpath(posixpath.join("xl", relationships[relationship_id]))
+        worksheet_paths.add(worksheet_path)
+        worksheet_xml = fromstring(workbook.read(worksheet_path))
+        sheet_order.append(sheet_name)
+        sheets[sheet_name] = _worksheet_semantics(
+            worksheet_xml, shared_strings, sheet.attrib.get("state", "visible")
+        )
+    return sheets, sheet_order, worksheet_paths
+
+
+def _worksheet_semantics(
+    worksheet_xml: Element, shared_strings: list[Element], sheet_state: str
+) -> dict[str, object]:
+    cells: dict[str, object] = {}
+    for cell in worksheet_xml.findall(".//{*}sheetData/{*}row/{*}c"):
+        cell_semantics = _cell_semantics(cell, shared_strings)
+        if cell_semantics is not None:
+            cells[cell.attrib["r"]] = cell_semantics
+    return {
+        "state": sheet_state,
+        "cells": cells,
+        "worksheet_structure": _xml_semantics(worksheet_xml),
+    }
+
+
+def _cell_semantics(cell: Element, shared_strings: list[Element]) -> dict[str, object] | None:
+    cell_type = cell.attrib.get("t", "n")
+    value_element = cell.find("{*}v")
+    formula_element = cell.find("{*}f")
+    inline_string = cell.find("{*}is")
+    value: object = None
+    rich_text: object = None
+    if cell_type == "s" and value_element is not None:
+        shared_string = shared_strings[int(value_element.text or "0")]
+        value = "".join(shared_string.itertext())
+        rich_text = _xml_semantics(shared_string)
+    elif cell_type == "inlineStr" and inline_string is not None:
+        value = "".join(inline_string.itertext())
+        rich_text = _xml_semantics(inline_string)
+    elif value_element is not None:
+        value = value_element.text
+    if value is None and formula_element is None:
+        return None
+    return {
+        "type": cell_type,
+        "value": value,
+        "formula": None if formula_element is None else formula_element.text,
+        "formula_attributes": {} if formula_element is None else dict(formula_element.attrib),
+        "style_id": cell.attrib.get("s", "0"),
+        "rich_text": rich_text,
+    }
+
+
+def _workbook_settings(workbook_xml: Element) -> dict[str, object]:
+    return {
+        "attributes": dict(workbook_xml.attrib),
+        "elements": [
+            _xml_semantics(element)
+            for element in workbook_xml
+            if element.tag.rsplit("}", 1)[-1] != "sheets"
+        ],
+    }
+
+
+def _package_part_semantics(
+    workbook: ZipFile, member_names: list[str], worksheet_paths: set[str]
+) -> dict[str, object]:
+    package_parts: dict[str, object] = {}
+    excluded_members = _WORKBOOK_METADATA_MEMBERS | worksheet_paths
+    for member_name in member_names:
+        if member_name in excluded_members or member_name.startswith("docProps/"):
+            continue
+        member_contents = workbook.read(member_name)
+        if member_name.endswith((".xml", ".rels")):
+            package_parts[member_name] = _xml_semantics(fromstring(member_contents))
+        else:
+            package_parts[member_name] = base64.b64encode(member_contents).decode("ascii")
+    return package_parts
+
+
+def _xml_semantics(element: Element) -> dict[str, object]:
+    text = element.text
+    tail = element.tail
+    if (
+        text is not None
+        and not text.strip()
+        and element.attrib.get("{http://www.w3.org/XML/1998/namespace}space") != "preserve"
+    ):
+        text = None
+    if tail is not None and not tail.strip():
+        tail = None
+    return {
+        "tag": element.tag,
+        "attributes": dict(sorted(element.attrib.items())),
+        "text": text,
+        "tail": tail,
+        "children": [_xml_semantics(child) for child in element],
+    }
+
+
+def _identity_differences(expected: object, observed: object, prefix: str = "") -> list[str]:
+    if isinstance(expected, dict) and isinstance(observed, dict):
+        differences: list[str] = []
+        for key in sorted(expected.keys() | observed.keys()):
+            key_path = f"{prefix}.{key}" if prefix else key
+            if key not in expected or key not in observed:
+                differences.append(key_path)
+            else:
+                differences.extend(_identity_differences(expected[key], observed[key], key_path))
+        return differences
+    if isinstance(expected, list) and isinstance(observed, list):
+        differences = []
+        for index in range(max(len(expected), len(observed))):
+            item_path = f"{prefix}[{index}]"
+            if index >= len(expected) or index >= len(observed):
+                differences.append(item_path)
+            else:
+                differences.extend(
+                    _identity_differences(expected[index], observed[index], item_path)
+                )
+        return differences
+    return [] if expected == observed else [prefix]
+
+
 def _source_revision(source_root: Path) -> str:
     # Fixed executable and argument vector; this does not invoke a shell.
     result = subprocess.run(  # noqa: S603
@@ -227,12 +437,9 @@ def _source_revision(source_root: Path) -> str:
     return revision
 
 
-def _pinned_source_evaluator(source_root: Path) -> tuple[Path, str]:
+def _source_evaluator_metadata(source_root: Path) -> tuple[Path, int, str]:
     evaluator_path = source_root / "evaluation" / "evaluation.py"
-    evaluator_sha256 = _file_sha256(evaluator_path)
-    if evaluator_sha256 != SPREADSHEETBENCH_EVALUATION_SHA256:
-        raise ValueError("SpreadsheetBench upstream evaluator is not pinned")
-    return evaluator_path, evaluator_sha256
+    return evaluator_path, SPREADSHEETBENCH_EVALUATOR_VERSION, _file_sha256(evaluator_path)
 
 
 @contextmanager
@@ -283,14 +490,17 @@ def extract_archive_member(
         raise ValueError("unsafe archive member")
 
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    if destination_path.exists():
-        if _file_sha256(destination_path) != _member_sha256(archive, member):
-            raise FileExistsError(f"Existing imported asset has different contents: {member_name}")
-        return destination_path
-
     source = archive.extractfile(member)
     if source is None:
         raise ValueError("SpreadsheetBench archive member is not readable")
+    if destination_path.exists():
+        with source:
+            if destination_path.read_bytes() != source.read():
+                raise FileExistsError(
+                    f"Existing imported asset has different contents: {member_name}"
+                )
+        return destination_path
+
     temporary_path: Path | None = None
     try:
         with (
@@ -317,17 +527,6 @@ def extract_archive_member(
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return destination_path
-
-
-def _member_sha256(archive: tarfile.TarFile, member: tarfile.TarInfo) -> str:
-    source = archive.extractfile(member)
-    if source is None:
-        raise ValueError("SpreadsheetBench archive member is not readable")
-    digest = hashlib.sha256()
-    with source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _member_names_in_directory(
@@ -474,6 +673,14 @@ def _extract_cases(
                 ),
                 input_member=input_member,
                 reference_member=reference_member,
+                input_semantics=(
+                    _workbook_semantics(input_path.read_bytes()) if input_path is not None else None
+                ),
+                reference_semantics=(
+                    _workbook_semantics(reference_path.read_bytes())
+                    if reference_path is not None
+                    else None
+                ),
             )
         )
         if input_path is None or reference_path is None:
@@ -523,20 +730,18 @@ def _import_metadata_row(
             cases=cases,
             upstream_evaluation_path=context.evaluator_path,
             upstream_evaluation_sha256=context.evaluator_sha256,
+            upstream_evaluation_version=context.evaluator_version,
         ),
         issues,
     )
 
 
 def import_tasks(source_root: Path, archive_path: Path, asset_root: Path) -> SpreadsheetImport:
-    """Import pinned tasks and safely extract their case workbooks."""
+    """Import source tasks and safely extract their case workbooks."""
     source_revision = _source_revision(source_root)
     layout = _dataset_layout(archive_path)
     archive_sha256 = _file_sha256(archive_path)
-    if archive_sha256 != layout.archive_sha256:
-        raise ValueError("SpreadsheetBench archive digest does not match the pinned source")
-
-    evaluator_path, evaluator_sha256 = _pinned_source_evaluator(source_root)
+    evaluator_path, evaluator_version, evaluator_sha256 = _source_evaluator_metadata(source_root)
     with _open_archive(archive_path) as archive:
         context = _ImportContext(
             archive=archive,
@@ -546,6 +751,7 @@ def import_tasks(source_root: Path, archive_path: Path, asset_root: Path) -> Spr
             layout=layout,
             asset_root=asset_root,
             evaluator_path=evaluator_path,
+            evaluator_version=evaluator_version,
             evaluator_sha256=evaluator_sha256,
         )
         tasks: list[SpreadsheetTask] = []
@@ -656,10 +862,9 @@ def validate_proxy_cells(task: SpreadsheetTask, cells: Sequence[str]) -> tuple[s
 def actor_input_files(task: SpreadsheetTask) -> dict[str, bytes]:
     """Return only the selected input workbook visible to the actor."""
     case = task.primary_case
-    input_path, _, input_sha256, _ = _complete_actor_case(case)
-    if _file_sha256(input_path) != input_sha256:
-        raise ValueError("Spreadsheet input asset changed after import")
-    return {"input.xlsx": input_path.read_bytes()}
+    input_path, _, _, _ = _complete_actor_case(case)
+    input_bytes = input_path.read_bytes()
+    return {"input.xlsx": input_bytes}
 
 
 def evaluation_files(
@@ -672,21 +877,30 @@ def evaluation_files(
     """Build the trusted evaluator payload around the immutable submission."""
     selected_cells = validate_proxy_cells(task, proxy_cells)
     case = task.primary_case
-    input_path, reference_path, input_sha256, reference_sha256 = _complete_actor_case(case)
+    input_path, reference_path, _, _ = _complete_actor_case(case)
     input_bytes = input_path.read_bytes()
     reference_bytes = reference_path.read_bytes()
     evaluation_bytes = task.upstream_evaluation_path.read_bytes()
     worker_path = Path(__file__).with_name("spreadsheet_worker.py")
     worker_bytes = worker_path.read_bytes()
-    if _bytes_sha256(input_bytes) != input_sha256:
-        raise ValueError("Spreadsheet input asset changed after import")
-    if _bytes_sha256(reference_bytes) != reference_sha256:
-        raise ValueError("Spreadsheet reference asset changed after import")
-    if _bytes_sha256(evaluation_bytes) != task.upstream_evaluation_sha256:
-        raise ValueError("Spreadsheet upstream evaluator changed after import")
-
+    if case.input_semantics is not None:
+        _validate_asset_semantics(
+            case.input_semantics,
+            _workbook_semantics(input_bytes),
+            task.task_id,
+            "input",
+        )
+    if case.reference_semantics is not None:
+        _validate_asset_semantics(
+            case.reference_semantics,
+            _workbook_semantics(reference_bytes),
+            task.task_id,
+            "reference",
+        )
     job = {
         "source_revision": task.source_revision,
+        "upstream_evaluator_version": task.upstream_evaluation_version,
+        "worker_protocol_version": WORKER_PROTOCOL_VERSION,
         "source_archive_sha256": task.source_archive_sha256,
         "dataset_name": task.dataset_name,
         "task_id": task.task_id,
@@ -695,11 +909,10 @@ def evaluation_files(
         "answer_position": task.answer_position,
         "proxy_cells": list(selected_cells),
         "operational_only": operational_only,
-        "input_sha256": input_sha256,
-        "reference_sha256": reference_sha256,
+        "input_sha256": _bytes_sha256(input_bytes),
+        "reference_sha256": _bytes_sha256(reference_bytes),
         "submission_sha256": _bytes_sha256(submission),
-        "upstream_evaluation_sha256": task.upstream_evaluation_sha256,
-        "worker_sha256": _bytes_sha256(worker_bytes),
+        "upstream_evaluation_sha256": _bytes_sha256(evaluation_bytes),
     }
     return {
         "job.json": json.dumps(job, sort_keys=True, separators=(",", ":")).encode("utf-8"),

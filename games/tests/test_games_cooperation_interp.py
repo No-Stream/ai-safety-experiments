@@ -30,6 +30,7 @@ from games.cooperation_lens import (
     DIRECTION_DECISION_DEPENDENCE,
     REQUIRED_DIRECTIONS,
     load_direction_manifest,
+    validate_construct_capture,
 )
 from games.interp_axes import ProvenanceError, assert_no_pair_crosses_split, build_construct_splits
 from games.interp_cells import (
@@ -248,6 +249,7 @@ def test_cpu_cli_writes_hashed_geometry_and_selected_target(
         "direction",
         "direction_path",
         "direction_sha256",
+        "direction_values",
         "layer",
         "magnitude",
         "alpha_multiplier",
@@ -256,6 +258,7 @@ def test_cpu_cli_writes_hashed_geometry_and_selected_target(
         "expected_effect",
         "expectation_recorded_before_intervention",
         "geometry_report_path",
+        "geometry_report_step",
         "geometry_report_sha256",
         "exploratory",
     }
@@ -270,6 +273,7 @@ def test_cpu_cli_writes_hashed_geometry_and_selected_target(
         selection["geometry_report_sha256"] == hashlib.sha256(report_path.read_bytes()).hexdigest()
     )
     assert selection["geometry_report_path"] == str(report_path.resolve())
+    assert selection["geometry_report_step"] == FINAL_STEP
     direction_path = Path(selection["direction_path"])
     assert selection["direction_sha256"] == hashlib.sha256(direction_path.read_bytes()).hexdigest()
     selected_directions = torch.load(direction_path, weights_only=True)
@@ -311,6 +315,31 @@ def test_cpu_cli_writes_hashed_geometry_and_selected_target(
         weights_only=True,
     )
     assert exported[0][0].item() == pytest.approx(4.1)
+    assert selection["direction_values"] == pytest.approx(exported[selection["layer"]].tolist())
+
+
+def test_construct_capture_binds_adapter_path_instead_of_recorded_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter_path = tmp_path / "checkpoint-20"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"adapter weights")
+    (adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    base_cell, final_cell = make_ladder(make_stimuli()).cells
+    final_cell = replace(
+        final_cell,
+        adapter_weights_sha256="stale-recorded-adapter-digest",
+        provenance={**final_cell.provenance, "adapter_dir": str(adapter_path.resolve())},
+    )
+    ladder = Ladder(cells=(base_cell, final_cell))
+    monkeypatch.setattr("games.cooperation_lens.load_ladder", lambda *_args, **_kwargs: ladder)
+
+    capture = validate_construct_capture(
+        tmp_path / "capture", adapter_path, final_arm=FINAL_ARM, final_step=FINAL_STEP
+    )
+
+    assert capture["final_adapter_path"] == str(adapter_path.resolve())
+    assert capture["final_step"] == FINAL_STEP
 
 
 def test_displacement_pooling_is_row_weighted() -> None:
@@ -365,7 +394,8 @@ def test_predeclared_construct_overrides_stronger_off_target_calibration(tmp_pat
         direction_paths,
         preferred_pooling="last",
         geometry_report_path=report_path,
-        geometry_report_sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        geometry_report_step=FINAL_STEP,
+        geometry_report_sha256="recorded-before-a-harmless-report-edit",
         expectation={
             "target_construct": DIRECTION_COSTLY_OTHER_REGARD,
             "expected_effect": "opaque expected directional change",
@@ -374,6 +404,8 @@ def test_predeclared_construct_overrides_stronger_off_target_calibration(tmp_pat
 
     assert selected["direction"] == DIRECTION_COSTLY_OTHER_REGARD
     assert selected["calibration_metric"] < 0.0
+    assert selected["geometry_report_sha256"] == "recorded-before-a-harmless-report-edit"
+    assert selected["geometry_report_step"] == FINAL_STEP
 
 
 def test_intervention_expectation_rejects_unknown_target_construct(
@@ -442,18 +474,24 @@ def test_ladder_refuses_shuffled_rows_and_cropped_stimulus_digest(tmp_path: Path
     clean_root = tmp_path / "clean"
     write_fixture(clean_root, stimuli)
     cropped = stimuli[:-1]
-    with pytest.raises(CellFormatError, match="different stimulus corpus"):
-        load_ladder(clean_root, stimuli_sha256=stimuli_digest(cropped))
+    with pytest.raises(CellFormatError, match="stimulus row fields"):
+        load_ladder(clean_root, stimuli=cropped)
 
 
-def test_natural_prefix_pair_must_match_full_identity(tmp_path: Path) -> None:
+def test_natural_prefix_pair_must_match_full_identity(  # noqa: PLR0915 - both capture states share one end-to-end setup
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("games.interp_cells.PRIVATE_ARTIFACT_ROOT", tmp_path)
     stimuli = make_stimuli()
     ladder = make_ladder(stimuli)
     paths: dict[str, Path] = {}
+    capture_root = tmp_path / "capture"
+    source_paths: dict[str, str] = {}
+    source_cells: dict[str, CapturedCell] = {}
     for state, cell in zip(("base", "final"), ladder.cells, strict=True):
         state_rows = [
             Stimulus(
-                f"natural-{state}",
+                "natural-0",
                 "natural",
                 "A",
                 "natural-0",
@@ -461,13 +499,21 @@ def test_natural_prefix_pair_must_match_full_identity(tmp_path: Path) -> None:
                 metadata={
                     "natural_state": state,
                     "rollout_id": f"rollout-{state}",
+                    "request_id": "request-0",
+                    "scenario_group": "scenario-0",
                 },
             )
         ]
+        source_path = tmp_path / f"natural-{state}.jsonl"
+        write_stimuli(source_path, state_rows)
+        source_paths[cell.label] = str(source_path)
+        cell_source = capture_root / cell.arm / f"step-{cell.step}"
+        cell_source.mkdir(parents=True)
+        source_cells[state] = replace(cell, source=cell_source)
         state_positions = [1] if state == "base" else [2, 3]
         selection_records = (
             {
-                "stimulus_id": f"natural-{state}",
+                "stimulus_id": "natural-0",
                 "natural_state": state,
                 "request_id": "request-0",
                 "rollout_id": f"rollout-{state}",
@@ -494,14 +540,14 @@ def test_natural_prefix_pair_must_match_full_identity(tmp_path: Path) -> None:
             cell.identity,
             natural_prefix_layers=(0,),
             natural_selection_manifest_sha256=manifest_digest,
-            natural_prefix_stimuli_sha256="",
-            natural_prefix_rendered_sha256="",
+            natural_prefix_stimuli_sha256=f"recorded-stimuli-{state}",
+            natural_prefix_rendered_sha256=f"recorded-rendered-{state}",
         )
         paths[state] = write_natural_prefix_capture(
             tmp_path / state,
             identity=identity,
             stimuli=state_rows,
-            activations={f"natural-{state}": torch.ones(len(state_positions), 1, HIDDEN_SIZE)},
+            activations={"natural-0": torch.ones(len(state_positions), 1, HIDDEN_SIZE)},
             selection_records=selection_records,
             selection_manifest=selection_manifest,
             rendered_sha256=f"rendered-{state}",
@@ -511,32 +557,56 @@ def test_natural_prefix_pair_must_match_full_identity(tmp_path: Path) -> None:
             applied_adapter_weights=cell.applied_adapter_weights,
             adapter_weights_sha256=cell.adapter_weights_sha256,
         )
+        persisted = json.loads(paths[state].read_text())
+        persisted["selection_manifest"]["sha256"] = "edited-selection-hash"
+        persisted["identity"]["natural_selection_manifest_sha256"] = "older-recorded-hash"
+        persisted["stimuli_sha256"] = "edited-stimulus-hash"
+        persisted["rendered_sha256"] = "edited-rendered-hash"
+        paths[state].write_text(json.dumps(persisted), encoding="utf-8")
+    (capture_root / "ladder-manifest.json").write_text(
+        json.dumps({"natural_prefix_stimuli_file": source_paths}), encoding="utf-8"
+    )
     artifacts = {
-        state: load_natural_prefix_artifact(paths[state], state=state, cell=cell)
-        for state, cell in zip(("base", "final"), ladder.cells, strict=True)
+        state: load_natural_prefix_artifact(paths[state], state=state, cell=source_cells[state])
+        for state in ("base", "final")
     }
     with pytest.raises(CooperationInterpError, match="may not be swapped"):
-        load_natural_prefix_artifact(paths["base"], state="final", cell=ladder.cells[1])
+        load_natural_prefix_artifact(paths["base"], state="final", cell=source_cells["final"])
     result = analyze_cached_cells(ladder, stimuli, pairs_per_construct=4, n_placebos=2)
     cross_check = natural_prefix_cross_check(artifacts, result)
     assert cross_check["base_to_final"]["available"] is True
     assert cross_check["content_confounding"]["present"] is True
     assert cross_check["content_confounding"]["reasons"] == [
-        "natural stimulus corpus digests differ",
-        "rendered natural prefix digests differ",
         "selected token positions differ",
+        "captured stimulus content differs under a shared request id",
+    ]
+    assert cross_check["content_confounding"]["source_text_comparison"] == "available"
+
+    for state in ("base", "final"):
+        persisted = json.loads(paths[state].read_text())
+        persisted.pop("stimulus_records")
+        paths[state].write_text(json.dumps(persisted), encoding="utf-8")
+    legacy_artifacts = {
+        state: load_natural_prefix_artifact(paths[state], state=state, cell=source_cells[state])
+        for state in ("base", "final")
+    }
+    legacy_cross_check = natural_prefix_cross_check(legacy_artifacts, result)
+    assert legacy_cross_check["content_confounding"]["source_text_comparison"] == "available"
+    assert legacy_cross_check["content_confounding"]["reasons"] == [
+        "selected token positions differ",
+        "source stimulus text or assistant prefix differs under a shared request id",
     ]
 
     payload = json.loads(paths["final"].read_text())
     payload["selection_manifest"]["request_ids"] = ["different"]
     paths["final"].write_text(json.dumps(payload))
     with pytest.raises(CooperationInterpError, match="do not match request_ids"):
-        load_natural_prefix_artifact(paths["final"], state="final", cell=ladder.cells[1])
+        load_natural_prefix_artifact(paths["final"], state="final", cell=source_cells["final"])
 
     payload["selection_manifest"]["request_ids"] = ["request-0", "request-0"]
     paths["final"].write_text(json.dumps(payload))
     with pytest.raises(CooperationInterpError, match="repeats or omits request_ids"):
-        load_natural_prefix_artifact(paths["final"], state="final", cell=ladder.cells[1])
+        load_natural_prefix_artifact(paths["final"], state="final", cell=source_cells["final"])
     with pytest.raises(ValueError, match="base and final"):
         _natural_artifact_specs([f"base={paths['base']}"])
 

@@ -48,6 +48,7 @@ import json
 import logging
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -63,7 +64,7 @@ from reward_hacking.trace import refuse_tracked_trace_path
 from sociology.records import completion_telemetry
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from pathlib import Path
 
     from reward_hacking.model_backend import BedrockCompletion, DetailedBackend
@@ -236,6 +237,62 @@ def rubric_digest(instructions: str) -> str:
     return hashlib.sha256(instructions.encode("utf-8")).hexdigest()[:16]
 
 
+def identity_differences(expected: Mapping[str, object], actual: Mapping[str, object]) -> list[str]:
+    """Return the readable field paths whose stored identity differs from the current one."""
+    differences: list[str] = []
+
+    def compare(left: object, right: object, path: str) -> None:
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            for key in sorted(set(left) | set(right), key=str):
+                child_path = f"{path}.{key}" if path else str(key)
+                if key not in left or key not in right:
+                    differences.append(child_path)
+                else:
+                    compare(left[key], right[key], child_path)
+        elif left != right:
+            differences.append(path)
+
+    compare(expected, actual, "")
+    return differences
+
+
+def prompt_identity_mismatches(
+    payload: Mapping[str, Any],
+    *,
+    identity_field: str,
+    version_field: str,
+    expected: Mapping[str, Any],
+    path: Path,
+) -> list[str]:
+    """Compare a validation summary's readable prompt identity, tolerating legacy digest-only files."""
+    recorded = payload.get(identity_field)
+    recorded_version = payload.get(version_field)
+    version_mismatch = (
+        f"validated prompt version {version_field}={recorded_version!r} on disk but "
+        f"{expected['version']!r} for this prompt"
+    )
+    problems: list[str] = []
+    if recorded_version is not None and recorded_version != expected["version"]:
+        problems.append(version_mismatch)
+    if recorded is None:
+        if recorded_version != expected["version"]:
+            return problems or [version_mismatch]
+        logger.warning(
+            "%s has only the legacy digest fields for %s; those fields are retained as metadata and "
+            "are not used as a semantic gate",
+            path,
+            identity_field,
+        )
+        return problems
+    if not isinstance(recorded, Mapping):
+        problems.append(f"{identity_field} is not a readable identity object")
+        return problems
+    problems.extend(
+        f"{identity_field}.{field} differs" for field in identity_differences(expected, recorded)
+    )
+    return problems
+
+
 def escape_lone_backslashes(text: str) -> str:
     r"""Double every backslash that begins no valid JSON escape, and touch nothing else.
 
@@ -402,19 +459,29 @@ def judgeable(record: Mapping[str, Any]) -> bool:
 
 
 def judged_under_current_rubric(
-    row: Mapping[str, Any], digest: str, *, prompt_version: str
+    row: Mapping[str, Any],
+    instructions: str,
+    *,
+    prompt_version: str,
+    sections: Sequence[str],
 ) -> bool:
-    """Whether a judged row may be resumed: it parsed, under THIS prompt version and THIS rubric.
+    """Whether a judged row may be resumed under this version, rubric and prompt sections.
 
     A verdict alone is not enough. The rubric is authored stimulus that gets edited between passes, and
     a verdict produced under the previous wording is an answer to a different question -- kept in the
-    file for the record, never counted as this pass's.
+    file for the record, never counted as this pass's. New rows carry the readable rubric and fixed
+    section strings. Older rows carry only a digest, so their historical format remains resumable by the
+    explicit prompt version; new rows never use that digest to decide reuse.
     """
-    return (
-        "verdict" in row
-        and row.get("judge_prompt_version") == prompt_version
-        and row.get("judge_prompt_digest") == digest
-    )
+    has_readable_identity = "judge_prompt_rubric" in row and "judge_prompt_sections" in row
+    if has_readable_identity:
+        return (
+            "verdict" in row
+            and row.get("judge_prompt_version") == prompt_version
+            and row.get("judge_prompt_rubric") == instructions
+            and row.get("judge_prompt_sections") == list(sections)
+        )
+    return "verdict" in row and row.get("judge_prompt_version") == prompt_version
 
 
 def rows_by_rubric(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -491,6 +558,8 @@ def _row_for(  # noqa: PLR0913 - one keyword per piece of the row's provenance
             "judge_schema": schema.name,
             "judge_prompt_version": schema.prompt_version,
             "judge_prompt_digest": rubric_digest(instructions),
+            "judge_prompt_rubric": instructions,
+            "judge_prompt_sections": list(schema.scaffold),
             "had_inline_think": had_inline_think,
             "judge_stop_reason": completion.stop_reason,
             "judge_input_tokens": completion.usage.input_tokens,
@@ -544,12 +613,16 @@ def judge_records(  # noqa: PLR0913 - trailing keyword-only knobs, each a seam
     stream refuses before a row of it is written (:func:`refuse_short_chunk_without_a_stream`).
     """
     assert_scaffold_is_blind(instructions, schema)
-    digest = rubric_digest(instructions)
     existing = load_judged(out_path)
     done = {
         key
         for key, row in existing.items()
-        if judged_under_current_rubric(row, digest, prompt_version=schema.prompt_version)
+        if judged_under_current_rubric(
+            row,
+            instructions,
+            prompt_version=schema.prompt_version,
+            sections=schema.scaffold,
+        )
     }
     stale = {key for key, row in existing.items() if "verdict" in row and key not in done}
     pending = [r for r in records if judgeable(r) and str(r["key"]) not in done]

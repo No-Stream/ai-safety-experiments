@@ -51,6 +51,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import torch
 
@@ -77,6 +78,7 @@ from reward_hacking.interp.lens_artifacts import (
     PROVENANCE_FILENAME,
     LensArtifactError,
     LensProvenance,
+    SavedLens,
     StoredUnembed,
     assert_same_fit,
     unembed_agreement,
@@ -376,7 +378,6 @@ def wanted_identity(
         "lens_name": plan.lens_name,
         "model_label": handle.facts.label,
         "weights_identity": handle.weights_identity,
-        "weights_fingerprint": handle.facts.fingerprint,
         "load_path": LENS_LOAD_PATH,
         "corpus_digests": dict(cast("dict[str, str]", corpus.sidecar["digests"])),
         "fit_role": plan.fit_role,
@@ -389,7 +390,8 @@ def wanted_identity(
 
 
 HALF_IDENTITY_FIELDS: tuple[str, ...] = (
-    "weights_fingerprint",
+    "model_label",
+    "weights_identity",
     "corpus_digests",
     "fit_role",
     "dim_batch",
@@ -446,10 +448,6 @@ def load_halves(
             )
         provenance = LensProvenance.load(directory)
         lens_path = directory / LENS_FILENAME
-        if sha256_of_file(lens_path) != provenance.lens_sha256:
-            raise LensArtifactError(
-                f"{lens_path} is not the lens file {directory}'s provenance describes"
-            )
         if provenance.fit_role != ROLE_FIT or not provenance.lens_name.endswith(
             tuple(f"-{h}" for h in FIT_HALVES)
         ):
@@ -512,12 +510,14 @@ def cross_lens_reads(  # noqa: PLR0913 - a cross read is the other lens, this mo
             )
         provenance = LensProvenance.load(directory)
         lens_path = directory / LENS_FILENAME
-        if sha256_of_file(lens_path) != provenance.lens_sha256:
-            raise LensArtifactError(f"{lens_path} is not the lens file its provenance describes")
-        if provenance.weights_fingerprint == handle.facts.fingerprint:
+        if (
+            provenance.model_label == handle.facts.label
+            and provenance.weights_identity == handle.weights_identity
+        ):
             raise LensArtifactError(
-                f"{directory} was fitted on this checkpoint's own weights ({handle.facts.label}); a "
-                f"cross-lens read applies another checkpoint's lens"
+                f"{directory} was fitted on this checkpoint's own model_label "
+                f"{provenance.model_label!r} and weights_identity {provenance.weights_identity!r}; "
+                "a cross-lens read applies another checkpoint's lens"
             )
         other = jl.JacobianLens.load(str(lens_path))
         quality = read_reconstruction(
@@ -611,12 +611,11 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
     if (out_dir / PROVENANCE_FILENAME).is_file():
         existing = LensProvenance.load(out_dir)
         assert_same_fit(existing, identity, out_dir=out_dir)
-        if sha256_of_file(lens_path) != existing.lens_sha256:
-            raise LensArtifactError(
-                f"{out_dir} carries a provenance for a lens file that is not the one on disk"
-            )
+        SavedLens.load(lens_path)
         logger.info(f"lens directory already complete and identical, {out_dir=}; nothing to fit")
         return existing
+
+    fit_id = uuid4().hex
 
     kernels_bound = bound_deltanet_kernels()
     deltanet_kernel = prefill_deltanet_kernels(kernels_bound)
@@ -678,6 +677,7 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
             skip_first=skip_first,
             jlens_commit=jlens_commit,
             load_path=LENS_LOAD_PATH,
+            fit_id=fit_id,
         ),
     )
     gate.save(out_dir)
@@ -693,7 +693,12 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
             f"rows (max |logit diff| {agreement['max_abs_logit_diff']:.3g}); a CPU read through it would "
             f"gate on the wrong tokens, so nothing is written as complete"
         )
-    stored.save(out_dir, weights_fingerprint=handle.facts.fingerprint)
+    stored.save(
+        out_dir,
+        weights_fingerprint=handle.facts.fingerprint,
+        model_label=handle.facts.label,
+        weights_identity=handle.weights_identity,
+    )
 
     started = time.perf_counter()
     quality = saved.quality
@@ -761,6 +766,7 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
             "merged_from": None if merged is None else merged.as_payload(),
             "cross_lens": cross,
         },
+        fit_id=fit_id,
     )
     provenance.save(out_dir)
     checkpoint = out_dir / FIT_CHECKPOINT_FILENAME

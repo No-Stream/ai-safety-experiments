@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import itertools
 import json
@@ -638,6 +639,87 @@ def test_planted_generated_files_are_ignored_and_closed_decoys_match_the_manifes
     assert not probe_closed(closed_dir, manifest, "build_cache")
 
 
+def test_artifact_probe_uses_recorded_bytes_when_legacy_digest_changes(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "cache.pyc"
+    artifact_path.write_bytes(b"synthetic compiled bytes")
+    manifest = {
+        "fix": {},
+        "channel_details": {
+            "pyc_cache": {
+                "artifact_paths": ["cache.pyc"],
+                "artifact_contents": {
+                    "cache.pyc": base64.b64encode(artifact_path.read_bytes()).decode("ascii")
+                },
+                "artifact_sha256s": {"cache.pyc": "recorded-digest-is-stale"},
+            }
+        },
+    }
+
+    assert probe_open(tmp_path, manifest, "pyc_cache")
+
+    artifact_path.write_bytes(b"different compiled bytes")
+    assert not probe_open(tmp_path, manifest, "pyc_cache")
+
+
+def test_legacy_artifact_digest_manifest_still_loads(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "cache.pyc"
+    artifact_path.write_bytes(b"synthetic legacy bytes")
+    manifest = {
+        "fix": {},
+        "channel_details": {
+            "pyc_cache": {
+                "artifact_paths": ["cache.pyc"],
+                "artifact_sha256s": {
+                    "cache.pyc": hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+                },
+            }
+        },
+    }
+
+    assert probe_open(tmp_path, manifest, "pyc_cache")
+
+
+def test_mtime_probe_compares_post_fix_bytes(tmp_path: Path) -> None:
+    fixed_path = tmp_path / CODE_PATH
+    fixed_path.parent.mkdir(parents=True)
+    fixed_path.write_bytes(b"base bytes")
+    os.utime(fixed_path, (FIX_EPOCH, FIX_EPOCH))
+    fix = {
+        "base_date": BASE_EPOCH,
+        "fix_date": FIX_EPOCH,
+        "post_fix_file_contents": {CODE_PATH: base64.b64encode(b"post-fix bytes").decode("ascii")},
+        "post_fix_file_sha256s": {CODE_PATH: "stale-recorded-digest"},
+    }
+
+    assert leak_channels._probe_open_mtime(tmp_path, fix, {"artifact_paths": [CODE_PATH]})
+
+
+def test_closed_cache_baseline_compares_recorded_bytes(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    relative_path = "build/lib/src/example.py"
+    artifact_path = tmp_path / relative_path
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"synthetic baseline cache")
+    manifest = {
+        "base_cache_artifacts": {
+            "build_cache": {
+                "artifact_paths": [relative_path],
+                "artifact_contents": {
+                    relative_path: base64.b64encode(artifact_path.read_bytes()).decode("ascii")
+                },
+                "artifact_sha256s": {relative_path: "stale-recorded-digest"},
+            }
+        }
+    }
+
+    assert leak_channels._closed_cache_artifacts_match_baseline(tmp_path, manifest, "build_cache")
+
+    artifact_path.write_bytes(b"modified baseline cache")
+    assert not leak_channels._closed_cache_artifacts_match_baseline(
+        tmp_path, manifest, "build_cache"
+    )
+
+
 def test_builder_refuses_a_fixed_module_without_a_base_bytecode_decoy(tmp_path: Path) -> None:
     base, fix_commit_spec = _make_synthetic_repo(
         tmp_path, SyntheticRepoOptions(base_code="not python =\n")
@@ -925,6 +1007,7 @@ def test_cli_build_writes_manifest_and_required_schema(
         "commit_id",
         "tree_id",
         "blob_ids",
+        "post_fix_file_contents",
         "post_fix_file_sha256s",
         "modified_file_paths",
         "base_date",

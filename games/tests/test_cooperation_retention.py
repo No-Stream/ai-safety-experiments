@@ -337,6 +337,12 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
                         f"care/step-{final_step}": {
                             "identity": identity_payload.to_payload(),
                             "applied_adapter_weights": 2,
+                            "step": final_step,
+                            "adapter_path": str(checkpoint.resolve()),
+                            "adapter_weights_size_bytes": (checkpoint / "adapter_model.safetensors")
+                            .stat()
+                            .st_size,
+                            "adapter_config": adapter_config,
                             "adapter_weights_sha256": adapter_weights_sha256,
                         },
                     },
@@ -404,6 +410,7 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
                 "direction": "costly-other-regard",
                 "direction_path": str(selected_direction),
                 "direction_sha256": _digest(selected_direction),
+                "direction_values": [1.0, 1.0, 1.0, 1.0],
                 "layer": 1,
                 "magnitude": 1.0,
                 "alpha_multiplier": 0.5,
@@ -412,6 +419,7 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
                 "expected_effect": "synthetic expectation",
                 "expectation_recorded_before_intervention": True,
                 "geometry_report_path": str(geometry.resolve()),
+                "geometry_report_step": final_step,
                 "geometry_report_sha256": _digest(geometry),
                 "exploratory": True,
             }
@@ -447,6 +455,7 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
     layer_readout = {
         "quality": layer_quality,
         "direction_norm": 2.0,
+        "direction_shape": [4],
         "random_norm": 2.0,
         "real": [{"token": "a", "logit": 0.0}],
         "matched_norm_random": [{"token": "b", "logit": 0.0}],
@@ -499,6 +508,10 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
                 "final_step": final_step,
                 "construct_capture": {
                     "cells": ["base/step-0", f"care/step-{final_step}"],
+                    "final_step": final_step,
+                    "final_adapter_weights_size_bytes": (checkpoint / "adapter_model.safetensors")
+                    .stat()
+                    .st_size,
                     "final_adapter_weights_sha256": adapter_weights_sha256,
                 },
                 "states": {"base": lens_entry, "final": final_entry},
@@ -566,6 +579,7 @@ def _write_readouts(  # noqa: PLR0915 - one complete native authorization bundle
         "sha256": _digest(selected_target),
         "payload": selected_target_payload,
         "geometry_report_path": str(geometry.resolve()),
+        "geometry_report_step": final_step,
         "geometry_report_sha256": _digest(geometry),
         "cell": {"direction": "costly-other-regard", "layer": 1, "alpha_multiplier": 0.5},
     }
@@ -597,8 +611,6 @@ class TestReadoutValidation:
     @pytest.mark.parametrize(
         ("field", "value", "message"),
         [
-            ("adapter_weights_sha256", "0" * 64, "different final adapter weights"),
-            ("adapter_config_sha256", "0" * 64, "different final adapter config"),
             ("model_adapter_dir", "other-checkpoint", "different final adapter path"),
             ("settings.step", 2, "disagree on final arm and step"),
         ],
@@ -639,6 +651,169 @@ class TestReadoutValidation:
 
         with pytest.raises(ValueError, match=message):
             retention.run_retention(args)
+
+    def test_endpoint_hash_metadata_is_record_only_but_size_is_checked(
+        self, tmp_path: Path
+    ) -> None:
+        readouts = _write_readouts(tmp_path)
+        trace = readouts[0].with_name("behavior.jsonl")
+        lines = trace.read_text(encoding="utf-8").splitlines()
+        meta = json.loads(lines[0])
+        meta["adapter_weights_sha256"] = "stale-recorded-hash"
+        meta["adapter_config_sha256"] = "stale-recorded-config-hash"
+        trace.write_text(f"{json.dumps(meta)}\n{lines[1]}\n", encoding="utf-8")
+        expected = retention._adapter_identity(tmp_path / "checkpoint-3", 3)
+
+        retention._validate_json_identity(readouts[0], {}, "base-model", expected, "care")
+
+        meta["adapter_weights_size_bytes"] = 1
+        trace.write_text(f"{json.dumps(meta)}\n{lines[1]}\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="adapter_weights_size_bytes"):
+            retention._validate_json_identity(readouts[0], {}, "base-model", expected, "care")
+
+    def test_adapter_payload_uses_readable_identity_fields(self, tmp_path: Path) -> None:
+        checkpoint = _write_checkpoint(tmp_path, 3)
+        expected = retention._adapter_identity(checkpoint, 3)
+        payload = {
+            "path": str(expected.path),
+            "weights_filename": "adapter_model.safetensors",
+            "weights_sha256": "stale-recorded-hash",
+            "weights_size_bytes": expected.weights_size_bytes,
+            "config": expected.config,
+            "applied_adapter_weights": 2,
+        }
+
+        retention._assert_adapter_payload(
+            payload, path=tmp_path / "readout.json", expected=expected
+        )
+
+        payload["weights_size_bytes"] = expected.weights_size_bytes + 1
+        with pytest.raises(ValueError, match="weights_size_bytes"):
+            retention._assert_adapter_payload(
+                payload, path=tmp_path / "readout.json", expected=expected
+            )
+
+    def test_geometry_hashes_are_metadata_but_adapter_step_and_size_are_checked(
+        self, tmp_path: Path
+    ) -> None:
+        readouts = _write_readouts(tmp_path)
+        geometry = readouts[7]
+        selected_target_path = Path(
+            json.loads(geometry.read_text(encoding="utf-8"))["context"]["selected_target"]
+        )
+        selected_target = json.loads(selected_target_path.read_text(encoding="utf-8"))
+        selected_target["direction_sha256"] = "d" * 64
+        selected_target["geometry_report_sha256"] = "r" * 64
+        selected_target_path.write_text(json.dumps(selected_target), encoding="utf-8")
+        retention.validate_readout(geometry)
+
+        expected = retention._adapter_identity(tmp_path / "checkpoint-3", 3)
+        geometry_payload = json.loads(geometry.read_text(encoding="utf-8"))
+        retention._validate_json_identity(
+            geometry, geometry_payload, "base-model", expected, "care"
+        )
+
+        final_entry = geometry_payload["context"]["cell_identities"]["care/step-3"]
+        final_entry["step"] = 2
+        with pytest.raises(ValueError, match="final adapter step"):
+            retention._validate_json_identity(
+                geometry, geometry_payload, "base-model", expected, "care"
+            )
+        final_entry["step"] = 3
+        final_entry["adapter_weights_size_bytes"] = 1
+        with pytest.raises(ValueError, match="adapter_weights_size_bytes"):
+            retention._validate_json_identity(
+                geometry, geometry_payload, "base-model", expected, "care"
+            )
+
+    def test_lens_capture_hash_is_metadata_but_step_and_size_are_checked(
+        self, tmp_path: Path
+    ) -> None:
+        readouts = _write_readouts(tmp_path)
+        lens_path = readouts[8]
+        lens_payload = json.loads(lens_path.read_text(encoding="utf-8"))
+        capture = lens_payload["construct_capture"]
+        capture["final_adapter_weights_sha256"] = "a" * 64
+        retention.validate_readout(lens_path)
+
+        expected = retention._adapter_identity(tmp_path / "checkpoint-3", 3)
+        retention._validate_json_identity(lens_path, lens_payload, "base-model", expected, "care")
+
+        capture["final_step"] = 2
+        with pytest.raises(ValueError, match=r"construct capture.*step"):
+            retention._validate_json_identity(
+                lens_path, lens_payload, "base-model", expected, "care"
+            )
+        capture["final_step"] = 3
+        capture["final_adapter_weights_size_bytes"] = 1
+        with pytest.raises(ValueError, match="adapter_weights_size_bytes"):
+            retention._validate_json_identity(
+                lens_path, lens_payload, "base-model", expected, "care"
+            )
+
+    def test_complete_bundle_accepts_stale_adapter_direction_and_report_hash_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        readouts = _write_readouts(tmp_path)
+        for summary_path in readouts[:6]:
+            trace_path = retention._endpoint_trace_path(summary_path)
+            lines = trace_path.read_text(encoding="utf-8").splitlines()
+            metadata = json.loads(lines[0])
+            metadata["adapter_weights_sha256"] = "d" * 64
+            metadata["adapter_config_sha256"] = "c" * 64
+            trace_path.write_text(f"{json.dumps(metadata)}\n{lines[1]}\n", encoding="utf-8")
+        cell_manifest = readouts[6].parent / "care" / "step-3" / "manifest.json"
+        cell_payload = json.loads(cell_manifest.read_text(encoding="utf-8"))
+        cell_payload["adapter_weights_sha256"] = "e" * 64
+        cell_manifest.write_text(json.dumps(cell_payload), encoding="utf-8")
+
+        geometry_path = readouts[7]
+        geometry_payload = json.loads(geometry_path.read_text(encoding="utf-8"))
+        geometry_payload["context"]["cell_identities"]["care/step-3"]["adapter_weights_sha256"] = (
+            "f" * 64
+        )
+        geometry_path.write_text(json.dumps(geometry_payload), encoding="utf-8")
+        selected_target_path = Path(geometry_payload["context"]["selected_target"])
+        selected_target = json.loads(selected_target_path.read_text(encoding="utf-8"))
+        selected_target["direction_sha256"] = "1" * 64
+        selected_target["geometry_report_sha256"] = "2" * 64
+        selected_target_path.write_text(json.dumps(selected_target), encoding="utf-8")
+
+        lens_path = readouts[8]
+        lens_payload = json.loads(lens_path.read_text(encoding="utf-8"))
+        lens_payload["construct_capture"]["final_adapter_weights_sha256"] = "3" * 64
+        for state in lens_payload["states"].values():
+            for readout in state["direction_readouts"].values():
+                readout["sha256"] = "4" * 64
+        for readout in lens_payload["shared_base_lens_coordinate_sensitivity"][
+            "direction_readouts"
+        ].values():
+            readout["sha256"] = "5" * 64
+        lens_path.write_text(json.dumps(lens_payload), encoding="utf-8")
+
+        steering_path = readouts[9]
+        records = [json.loads(line) for line in steering_path.read_text().splitlines()]
+        for record in records:
+            record["adapter"]["weights_sha256"] = "6" * 64
+        steering_path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+        steering_summary_path = steering_path.with_name("steering_summary.json")
+        steering_summary = json.loads(steering_summary_path.read_text(encoding="utf-8"))
+        steering_summary["adapter"]["weights_sha256"] = "6" * 64
+        steering_summary_path.write_text(json.dumps(steering_summary), encoding="utf-8")
+        ledger_path = steering_path.with_name(steering_path.name + ".resume.json")
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger["identity"]["adapter"]["weights_sha256"] = "6" * 64
+        ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+        expected, final_arm = retention._validate_complete_bundle(
+            tmp_path,
+            readouts,
+            base_model="base-model",
+            final_step=3,
+        )
+
+        assert expected.path == (tmp_path / "checkpoint-3").resolve()
+        assert final_arm == "care"
 
     def test_one_valid_readout_cannot_authorize_pruning(self, tmp_path: Path) -> None:
         _write_checkpoint(tmp_path, 3)
@@ -702,7 +877,7 @@ class TestReadoutValidation:
         selection = json.loads(Path(payload["context"]["selected_target"]).read_text())
         torch.save({1: torch.zeros(4)}, Path(selection["direction_path"]))
 
-        with pytest.raises(ValueError, match=r"direction_sha256.*does not match"):
+        with pytest.raises(ValueError, match="direction_values"):
             retention.validate_readout(geometry)
 
     def test_geometry_without_natural_measurement_cannot_authorize_pruning(
@@ -714,7 +889,7 @@ class TestReadoutValidation:
         geometry.write_text(json.dumps(payload), encoding="utf-8")
         selected_target = Path(payload["context"]["selected_target"])
         selection = json.loads(selected_target.read_text(encoding="utf-8"))
-        selection["geometry_report_sha256"] = _digest(geometry)
+        selection["geometry_report_sha256"] = "f" * 64
         selected_target.write_text(json.dumps(selection), encoding="utf-8")
 
         with pytest.raises(ValueError, match="natural_prefix_cross_check"):

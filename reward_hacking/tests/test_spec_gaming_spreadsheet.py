@@ -22,7 +22,7 @@ from reward_hacking.spec_gaming.spreadsheet import (
     SpreadsheetCase,
     SpreadsheetTask,
     _full_case_members,
-    _pinned_source_evaluator,
+    _source_evaluator_metadata,
     _verified_pair_members,
     actor_input_files,
     evaluation_files,
@@ -37,14 +37,32 @@ from reward_hacking.spec_gaming.spreadsheet_worker import (
     _assess_workbooks,
     _AssessmentRequest,
     _formula_failure,
+    _load_upstream_evaluator,
     _recalculate_assessment_copy,
     _submitted_output_diagnostics,
+    _validate_upstream_evaluator_behavior,
     run_worker,
 )
 
 
 def _sha256(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
+
+
+def _evaluator_source() -> bytes:
+    return (
+        b"from zipfile import ZipFile\n"
+        b"from xml.etree.ElementTree import fromstring\n"
+        b"def _value(path):\n"
+        b"    with ZipFile(path) as workbook:\n"
+        b"        sheet = fromstring(workbook.read('xl/worksheets/sheet1.xml'))\n"
+        b"    return sheet.find(\".//{*}c[@r='A1']/{*}v\").text\n"
+        b"def compare_workbooks(reference, submission, instruction_type, position):\n"
+        b"    del instruction_type, position\n"
+        b"    return _value(reference) == _value(submission), ''\n"
+        b"def generate_cell_names(position):\n"
+        b"    return [position]\n"
+    )
 
 
 def _object_mapping(value: object) -> dict[str, object]:
@@ -102,6 +120,18 @@ def _replace_xlsx_member(contents: bytes, member_name: str, replacement: bytes) 
     return workbook_buffer.getvalue()
 
 
+def _append_xlsx_member(contents: bytes, member_name: str, appended: bytes) -> bytes:
+    workbook_buffer = io.BytesIO()
+    with (
+        ZipFile(io.BytesIO(contents)) as source,
+        ZipFile(workbook_buffer, "w", compression=ZIP_DEFLATED) as destination,
+    ):
+        for source_member in source.namelist():
+            destination.writestr(source_member, source.read(source_member))
+        destination.writestr(member_name, appended)
+    return workbook_buffer.getvalue()
+
+
 def _with_xlsx_comment(contents: bytes, comment: bytes) -> bytes:
     workbook_buffer = io.BytesIO()
     with (
@@ -112,6 +142,56 @@ def _with_xlsx_comment(contents: bytes, comment: bytes) -> bytes:
         for source_member in source.namelist():
             destination.writestr(source_member, source.read(source_member))
     return workbook_buffer.getvalue()
+
+
+def test_workbook_semantics_ignore_zip_packaging_and_detect_non_cell_structure() -> None:
+    workbook = _synthetic_xlsx()
+    repacked = _with_xlsx_comment(workbook, b"repacked workbook")
+    merged_sheet = _replace_xlsx_member(
+        workbook,
+        "xl/worksheets/sheet1.xml",
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<sheetData><row r="1"><c r="A1" t="n"><v>1</v></c></row></sheetData>'
+        b'<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>',
+    )
+
+    workbook_semantics = spreadsheet._workbook_semantics(workbook)
+    merged_semantics = spreadsheet._workbook_semantics(merged_sheet)
+
+    assert spreadsheet._workbook_semantics(repacked) == workbook_semantics
+    assert "sheets.Sheet1.worksheet_structure.children[1]" in spreadsheet._identity_differences(
+        workbook_semantics,
+        merged_semantics,
+    )
+
+
+def test_workbook_semantics_detect_formatting_changes() -> None:
+    workbook = _synthetic_xlsx()
+    styled_sheet = _replace_xlsx_member(
+        workbook,
+        "xl/worksheets/sheet1.xml",
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<sheetData><row r="1"><c r="A1" t="n" s="1"><v>1</v></c></row></sheetData></worksheet>',
+    )
+    first_style = _append_xlsx_member(
+        styled_sheet,
+        "xl/styles.xml",
+        b'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<numFmts count="1"><numFmt numFmtId="164" formatCode="0.00"/></numFmts></styleSheet>',
+    )
+    second_style = _replace_xlsx_member(
+        first_style,
+        "xl/styles.xml",
+        b'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<numFmts count="1"><numFmt numFmtId="164" formatCode="0.000"/></numFmts></styleSheet>',
+    )
+
+    differences = spreadsheet._identity_differences(
+        spreadsheet._workbook_semantics(first_style),
+        spreadsheet._workbook_semantics(second_style),
+    )
+
+    assert any(path.startswith("package_parts.xl/styles.xml.children") for path in differences)
 
 
 def _configure_synthetic_import(
@@ -131,14 +211,12 @@ def _configure_synthetic_import(
             member.size = len(contents)
             archive.addfile(member, io.BytesIO(contents))
 
-    compressed_contents = archive_path.read_bytes()
     evaluator_path = tmp_path / "evaluation.py"
     evaluator_bytes = b"synthetic trusted evaluator"
     evaluator_path.write_bytes(evaluator_bytes)
     layout = DatasetLayout(
         name="verified_400",
         archive_name=archive_path.name,
-        archive_sha256=_sha256(compressed_contents),
         member_root="synthetic",
         case_indices=(1,),
         verified_layout=True,
@@ -151,8 +229,12 @@ def _configure_synthetic_import(
     )
     monkeypatch.setattr(
         spreadsheet,
-        "_pinned_source_evaluator",
-        lambda _source_root: (evaluator_path, _sha256(evaluator_bytes)),
+        "_source_evaluator_metadata",
+        lambda _source_root: (
+            evaluator_path,
+            spreadsheet.SPREADSHEETBENCH_EVALUATOR_VERSION,
+            _sha256(evaluator_bytes),
+        ),
     )
     return archive_path
 
@@ -161,7 +243,7 @@ def _configure_synthetic_import(
 def task(tmp_path: Path) -> SpreadsheetTask:
     input_contents = _synthetic_xlsx()
     reference_contents = _synthetic_xlsx()
-    evaluator_contents = b"synthetic trusted evaluator source"
+    evaluator_contents = _evaluator_source()
     input_path = tmp_path / "input.xlsx"
     reference_path = tmp_path / "reference.xlsx"
     evaluator_path = tmp_path / "evaluation.py"
@@ -212,13 +294,104 @@ def test_frozen_proxy_cells_must_be_a_nonempty_unique_strict_subset(task: Spread
         validate_proxy_cells(task, ("Z99",))
 
 
-def test_import_rejects_a_modified_pinned_upstream_evaluator(tmp_path: Path) -> None:
+def test_import_records_evaluator_version_without_loading_host_dependencies(tmp_path: Path) -> None:
     evaluator_path = tmp_path / "evaluation" / "evaluation.py"
     evaluator_path.parent.mkdir()
-    evaluator_path.write_text("def compare_workbooks(*args): return False, ''\n")
+    evaluator_path.write_text("import dependency_available_only_in_the_worker\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="upstream evaluator is not pinned"):
-        _pinned_source_evaluator(tmp_path)
+    resolved_path, evaluator_version, evaluator_sha256 = _source_evaluator_metadata(tmp_path)
+
+    assert resolved_path == evaluator_path
+    assert evaluator_version == spreadsheet.SPREADSHEETBENCH_EVALUATOR_VERSION
+    assert evaluator_sha256 == _sha256(evaluator_path.read_bytes())
+
+
+def test_worker_evaluator_self_test_accepts_cell_matches_and_rejects_differences(
+    tmp_path: Path,
+) -> None:
+    evaluator_path = tmp_path / "evaluation" / "evaluation.py"
+    evaluator_path.parent.mkdir()
+    evaluator_path.write_bytes(_evaluator_source())
+    compare_workbooks, generate_cell_names = _load_upstream_evaluator(evaluator_path)
+
+    _validate_upstream_evaluator_behavior(compare_workbooks, generate_cell_names, tmp_path)
+
+
+def test_worker_evaluator_self_test_rejects_wrong_cell_name_generation(tmp_path: Path) -> None:
+    evaluator_path = tmp_path / "evaluation" / "evaluation.py"
+    evaluator_path.parent.mkdir()
+    evaluator_path.write_text(
+        "def compare_workbooks(*args): return False, ''\n"
+        "def generate_cell_names(position): return []\n",
+        encoding="utf-8",
+    )
+    compare_workbooks, generate_cell_names = _load_upstream_evaluator(evaluator_path)
+
+    with pytest.raises(EvaluatorError, match="upstream_evaluator_generate_cell_names_mismatch"):
+        _validate_upstream_evaluator_behavior(compare_workbooks, generate_cell_names, tmp_path)
+
+
+def test_worker_evaluator_self_test_rejects_an_evaluator_that_always_reports_a_match(
+    tmp_path: Path,
+) -> None:
+    evaluator_path = tmp_path / "evaluation" / "evaluation.py"
+    evaluator_path.parent.mkdir()
+    evaluator_path.write_text(
+        "def compare_workbooks(*args): return True, ''\n"
+        "def generate_cell_names(position): return [position]\n",
+        encoding="utf-8",
+    )
+    compare_workbooks, generate_cell_names = _load_upstream_evaluator(evaluator_path)
+
+    with pytest.raises(EvaluatorError, match="upstream_evaluator_cell_comparison_mismatch"):
+        _validate_upstream_evaluator_behavior(compare_workbooks, generate_cell_names, tmp_path)
+
+
+def test_import_accepts_a_repacked_source_archive_with_unchanged_member_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata_rows = [
+        {
+            "id": "synthetic-task",
+            "instruction": "Synthetic import fixture.",
+            "instruction_type": "Cell-Level Manipulation",
+            "answer_position": "A1",
+            "spreadsheet_path": "synthetic-task",
+        }
+    ]
+    source_members = {
+        "synthetic/synthetic-task/1_synthetic-task_init.xlsx": _synthetic_xlsx(),
+        "synthetic/synthetic-task/1_synthetic-task_golden.xlsx": _synthetic_xlsx(),
+    }
+    archive_path = _configure_synthetic_import(
+        tmp_path,
+        monkeypatch,
+        metadata_rows,
+        source_members,
+    )
+    initial_archive_digest = _sha256(archive_path.read_bytes())
+    original_import = spreadsheet.import_tasks(tmp_path, archive_path, tmp_path / "original-assets")
+    archive_members = {
+        "synthetic/dataset.json": json.dumps(metadata_rows).encode(),
+        **source_members,
+    }
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for member_name, contents in reversed(tuple(archive_members.items())):
+            member = tarfile.TarInfo(member_name)
+            member.size = len(contents)
+            member.mtime = 1
+            archive.addfile(member, io.BytesIO(contents))
+
+    repacked_archive_digest = _sha256(archive_path.read_bytes())
+    repacked_import = spreadsheet.import_tasks(tmp_path, archive_path, tmp_path / "repacked-assets")
+
+    assert repacked_archive_digest != initial_archive_digest
+    assert original_import.tasks[0].source_archive_sha256 == initial_archive_digest
+    assert repacked_import.tasks[0].source_archive_sha256 == repacked_archive_digest
+    assert (
+        original_import.tasks[0].cases[0].input_semantics
+        == repacked_import.tasks[0].cases[0].input_semantics
+    )
 
 
 def test_proxy_selection_rejects_a_single_required_cell(task: SpreadsheetTask) -> None:
@@ -328,7 +501,43 @@ def test_evaluation_files_bind_both_evaluations_to_one_submission(
     assert "spreadsheet_worker.py" in files
     assert job["answer_position"] == task.answer_position
     assert job["proxy_cells"] == list(selected_cells)
+    assert job["upstream_evaluator_version"] == task.upstream_evaluation_version
+    assert job["worker_protocol_version"] == spreadsheet.WORKER_PROTOCOL_VERSION
     assert "instruction" not in job
+
+
+def test_evaluation_files_preserve_imported_workbook_semantics(task: SpreadsheetTask) -> None:
+    original_workbook = _synthetic_xlsx()
+    repacked_workbook = _with_xlsx_comment(original_workbook, b"synthetic repackaging")
+    changed_workbook = _replace_xlsx_member(
+        original_workbook,
+        "xl/worksheets/sheet1.xml",
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<sheetData><row r="1"><c r="A1" t="n"><v>2</v></c></row></sheetData></worksheet>',
+    )
+    input_path = task.primary_case.input_path
+    assert input_path is not None
+    case_with_semantic_snapshot = replace(
+        task.primary_case,
+        input_sha256=_sha256(original_workbook),
+        input_semantics=spreadsheet._workbook_semantics(original_workbook),
+    )
+    task_with_semantic_snapshot = replace(task, cases=(case_with_semantic_snapshot,))
+
+    input_path.write_bytes(repacked_workbook)
+    evaluation_files(
+        task_with_semantic_snapshot,
+        b"synthetic submission",
+        select_proxy_cells(task_with_semantic_snapshot),
+    )
+
+    input_path.write_bytes(changed_workbook)
+    with pytest.raises(ValueError, match=r"input workbook changed at fields: .*cells.A1.value"):
+        evaluation_files(
+            task_with_semantic_snapshot,
+            b"synthetic submission",
+            select_proxy_cells(task_with_semantic_snapshot),
+        )
 
 
 def test_evaluation_files_can_request_operational_only_proxy_assessment(
@@ -726,6 +935,92 @@ def test_worker_scores_an_unreadable_submission_as_artifact_failure(
     assert parsed.error_kind is None
 
 
+def test_worker_code_copy_change_does_not_require_a_source_hash(
+    task: SpreadsheetTask,
+    tmp_path: Path,
+) -> None:
+    files = evaluation_files(task, b"not an xlsx workbook", select_proxy_cells(task))
+    files["spreadsheet_worker.py"] += b"\n# synthetic harmless packaging change\n"
+    job = json.loads(files["job.json"])
+    assert "worker_sha256" not in job
+    files["job.json"] = json.dumps(job).encode()
+    for file_name, contents in files.items():
+        (tmp_path / file_name).write_bytes(contents)
+
+    parsed = parse_evaluation(run_worker(tmp_path))
+
+    assert parsed.status == "measured"
+    assert parsed.proxy_success is False
+    assert parsed.error_kind is None
+
+
+def test_worker_rejects_an_unknown_protocol_version(
+    task: SpreadsheetTask,
+    tmp_path: Path,
+) -> None:
+    files = evaluation_files(task, b"not an xlsx workbook", select_proxy_cells(task))
+    job = json.loads(files["job.json"])
+    job["worker_protocol_version"] = spreadsheet.WORKER_PROTOCOL_VERSION + 1
+    files["job.json"] = json.dumps(job).encode()
+    for file_name, contents in files.items():
+        (tmp_path / file_name).write_bytes(contents)
+
+    parsed = parse_evaluation(run_worker(tmp_path))
+
+    assert parsed.status == "unmeasured"
+    assert parsed.error_kind == "worker_protocol_version_mismatch"
+
+
+def test_worker_rejects_an_unknown_upstream_evaluator_version(
+    task: SpreadsheetTask,
+    tmp_path: Path,
+) -> None:
+    files = evaluation_files(task, b"not an xlsx workbook", select_proxy_cells(task))
+    job = json.loads(files["job.json"])
+    job["upstream_evaluator_version"] = spreadsheet.SPREADSHEETBENCH_EVALUATOR_VERSION + 1
+    files["job.json"] = json.dumps(job).encode()
+    for file_name, contents in files.items():
+        (tmp_path / file_name).write_bytes(contents)
+
+    parsed = parse_evaluation(run_worker(tmp_path))
+
+    assert parsed.status == "unmeasured"
+    assert parsed.error_kind == "upstream_evaluator_version_mismatch"
+
+
+def test_worker_accepts_legacy_jobs_without_version_fields(
+    task: SpreadsheetTask,
+    tmp_path: Path,
+) -> None:
+    files = evaluation_files(task, b"not an xlsx workbook", select_proxy_cells(task))
+    job = json.loads(files["job.json"])
+    job.pop("worker_protocol_version")
+    job.pop("upstream_evaluator_version")
+    files["job.json"] = json.dumps(job).encode()
+    for file_name, contents in files.items():
+        (tmp_path / file_name).write_bytes(contents)
+
+    parsed = parse_evaluation(run_worker(tmp_path))
+
+    assert parsed.status == "measured"
+    assert parsed.error_kind is None
+
+
+def test_worker_keeps_exact_input_bytes_integrity_check(
+    task: SpreadsheetTask,
+    tmp_path: Path,
+) -> None:
+    files = evaluation_files(task, b"not an xlsx workbook", select_proxy_cells(task))
+    files["input.xlsx"] += b"synthetic mutation"
+    for file_name, contents in files.items():
+        (tmp_path / file_name).write_bytes(contents)
+
+    parsed = parse_evaluation(run_worker(tmp_path))
+
+    assert parsed.status == "unmeasured"
+    assert parsed.error_kind == "input_digest_mismatch"
+
+
 @pytest.mark.parametrize(
     "workbook_xml",
     [
@@ -965,10 +1260,10 @@ def test_import_skips_whitespace_only_instruction_and_keeps_valid_rows(
     blank_input_name = "synthetic/blank-instruction-task/1_blank-instruction-task_init.xlsx"
     blank_reference_name = "synthetic/blank-instruction-task/1_blank-instruction-task_golden.xlsx"
     source_members = {
-        input_name: b"valid synthetic input",
-        reference_name: b"valid synthetic reference",
-        blank_input_name: b"blank row input",
-        blank_reference_name: b"blank row reference",
+        input_name: _synthetic_xlsx(),
+        reference_name: _synthetic_xlsx(),
+        blank_input_name: _synthetic_xlsx(),
+        blank_reference_name: _synthetic_xlsx(),
     }
     archive_path = _configure_synthetic_import(tmp_path, monkeypatch, metadata_rows, source_members)
     original_archive_digest = _sha256(archive_path.read_bytes())
@@ -1007,7 +1302,7 @@ def test_import_still_rejects_non_string_instruction_types(
         spreadsheet.import_tasks(tmp_path, archive_path, tmp_path / "assets")
 
 
-def test_import_decompresses_pinned_archive_once_sequentially(
+def test_import_decompresses_source_archive_once_sequentially(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1021,8 +1316,8 @@ def test_import_decompresses_pinned_archive_once_sequentially(
         }
     ]
     source_members = {
-        "synthetic/synthetic-task/1_synthetic-task_init.xlsx": b"synthetic-input",
-        "synthetic/synthetic-task/1_synthetic-task_golden.xlsx": b"synthetic-reference",
+        "synthetic/synthetic-task/1_synthetic-task_init.xlsx": _synthetic_xlsx(),
+        "synthetic/synthetic-task/1_synthetic-task_golden.xlsx": _synthetic_xlsx(),
     }
     archive_path = _configure_synthetic_import(tmp_path, monkeypatch, metadata_rows, source_members)
     compressed_contents = archive_path.read_bytes()

@@ -12,8 +12,10 @@ silent default downstream.
 What the sidecar is: one JSON object with the corpus identity (schema, kind, base model and revision,
 render convention, set name, the six side names, the stimulus-file digest) and one record per problem
 holding its id, the perturbation facts a reader may see (`detectable` among them) and one entry per
-side with the token ids the corpus was tokenized to, the named `[start, end)` spans over them, and the
-spans that rendering lacks with the reason for each. The prompt text lives in the stimulus file only.
+side with a text snapshot, the token ids the corpus was tokenized to, the named `[start, end)` spans
+over them, and the spans that rendering lacks with the reason for each. New sidecars duplicate prompt
+text from the local stimulus file so readers can compare the actual prompt and report a differing id;
+older sidecars without snapshots remain readable through their recorded digest.
 
 The six renderings and the spans are described in the writer's docstring; the names are here.
 """
@@ -131,17 +133,18 @@ class TwinSidecarError(ValueError):
 
 @dataclass(frozen=True)
 class SidecarStimulus:
-    """One rendering's sidecar entry: its ids, the spans it declares and the spans it lacks, with reasons."""
+    """One rendering's sidecar entry and optional prompt snapshot, with its declared spans."""
 
     stimulus_id: str
     side: str
     input_ids: tuple[int, ...]
     spans: dict[str, tuple[int, int]]
     spans_absent: dict[str, str]
+    text: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        """Serialise for the sidecar; the prompt text is deliberately not here."""
-        return {
+        """Serialise the readable prompt snapshot when available, alongside its spans."""
+        payload: dict[str, object] = {
             ENTRY_STIMULUS_ID_KEY: self.stimulus_id,
             ENTRY_SIDE_KEY: self.side,
             ENTRY_N_TOKENS_KEY: len(self.input_ids),
@@ -149,6 +152,9 @@ class SidecarStimulus:
             ENTRY_SPANS_KEY: {name: [start, end] for name, (start, end) in self.spans.items()},
             ENTRY_SPANS_ABSENT_KEY: dict(self.spans_absent),
         }
+        if self.text is not None:
+            payload["text"] = self.text
+        return payload
 
     @classmethod
     def from_dict(cls, entry: Mapping[str, Any], *, source: str) -> SidecarStimulus:
@@ -195,13 +201,23 @@ class SidecarStimulus:
             str(name): str(reason)
             for name, reason in cast("Mapping[str, object]", entry[ENTRY_SPANS_ABSENT_KEY]).items()
         }
+        text = entry.get("text")
+        if text is not None and (not isinstance(text, str) or not text):
+            raise TwinSidecarError(
+                f"{source}: stimulus {stimulus_id!r} text must be a non-empty string when present"
+            )
         both = sorted(set(spans) & set(absent))
         if both:
             raise TwinSidecarError(
                 f"{source}: stimulus {stimulus_id!r} both declares and declares absent {both}"
             )
         return cls(
-            stimulus_id=stimulus_id, side=side, input_ids=ids, spans=spans, spans_absent=absent
+            stimulus_id=stimulus_id,
+            side=side,
+            input_ids=ids,
+            spans=spans,
+            spans_absent=absent,
+            text=text,
         )
 
 

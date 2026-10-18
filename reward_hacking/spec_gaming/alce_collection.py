@@ -32,8 +32,12 @@ from reward_hacking.spec_gaming.alce_source import (
     load_alce_tasks,
     validate_alce_checkout,
 )
-from reward_hacking.spec_gaming.alce_support import validate_support_review
+from reward_hacking.spec_gaming.alce_support import (
+    SUPPORT_REVIEW_VALIDATOR_VERSION,
+    validate_support_review,
+)
 from reward_hacking.spec_gaming.capture import MAX_CHECKS, EpisodeJournal
+from reward_hacking.spec_gaming.capture import compare_identity_fields as _identity_differences
 from reward_hacking.spec_gaming.collection import make_backend_factory
 from reward_hacking.spec_gaming.config import (
     canonical_json,
@@ -54,6 +58,8 @@ if TYPE_CHECKING:
     from reward_hacking.spec_gaming.episode import EpisodeBackend, EpisodeSettings
 
 logger = logging.getLogger(__name__)
+ALCE_ASSESSMENT_VERSION = 1
+ALCE_AUTOAIS_ASSESSMENT_VERSION = 1
 
 
 def validate_smoke(config: AlceConfig) -> None:
@@ -109,6 +115,7 @@ def _identity(
         "selection_sha256": sha256(canonical_json(selection)),
         "render_sha256": sha256(canonical_json(render)),
         "serving": {
+            "manifest": serving.manifest,
             "manifest_sha256": config.model.serving_manifest_sha256,
             "semantic_sha256": sha256(canonical_json(serving.manifest)),
         },
@@ -158,20 +165,57 @@ def load_prepared(config: AlceConfig, *, resolve_models: bool) -> dict[str, Any]
     identity = read_json_object(
         config.output_dir / "generation-identity.json", "generation identity"
     )
-    for name, current, key in (
-        ("selection-manifest", selection, "selection_sha256"),
-        ("render-manifest", render, "render_sha256"),
+    for name, current in (
+        ("selection-manifest", selection),
+        ("render-manifest", render),
     ):
         stored = read_json_object(config.output_dir / f"{name}.json", name)
-        if canonical_json(current) != canonical_json(stored) or identity[key] != sha256(
-            canonical_json(stored)
-        ):
-            raise ValueError("current source or render differs from frozen selection")
-    if resolve_models and canonical_json(identity) != canonical_json(
-        _identity(config, selection, render)
-    ):
-        raise ValueError("current model, serving, sampling or code identity changed")
+        differences = _identity_differences(
+            _without_recorded_digests(current),
+            _without_recorded_digests(stored),
+            name,
+        )
+        if differences:
+            raise ValueError(f"current {name} differs at keys: " + ", ".join(differences))
+    if resolve_models:
+        expected_identity = _identity(config, selection, render)
+        identity_differences = _prepared_identity_differences(expected_identity, identity)
+        if identity_differences:
+            raise ValueError(
+                "current model, serving, sampling or code identity changed at keys: "
+                + ", ".join(identity_differences)
+            )
     return identity
+
+
+def _prepared_identity_differences(expected: dict[str, Any], stored: dict[str, Any]) -> list[str]:
+    expected_payload = object_value(
+        _without_recorded_digests(expected), "expected generation identity"
+    )
+    stored_payload = object_value(_without_recorded_digests(stored), "stored generation identity")
+    expected_serving = object_value(expected_payload.get("serving"), "expected serving identity")
+    stored_serving = object_value(stored_payload.get("serving"), "stored serving identity")
+    if "manifest" not in stored_serving:
+        expected_serving.pop("manifest", None)
+        differences = _identity_differences(expected_payload, stored_payload, "generation_identity")
+        expected_source = object_value(expected.get("serving"), "expected serving identity")
+        stored_source = object_value(stored.get("serving"), "stored serving identity")
+        if expected_source.get("manifest_sha256") != stored_source.get("manifest_sha256"):
+            differences.append("generation_identity.serving.manifest_sha256")
+        return differences
+    return _identity_differences(expected_payload, stored_payload, "generation_identity")
+
+
+def _without_recorded_digests(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_recorded_digests(item)
+            for key, item in value.items()
+            if isinstance(key, str) and not key.endswith("_sha256")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_recorded_digests(item) for item in value]
+    return value
 
 
 def _effective(config: AlceConfig) -> dict[str, Any]:
@@ -179,8 +223,18 @@ def _effective(config: AlceConfig) -> dict[str, Any]:
         config.output_dir / "effective-run-manifest.json", "effective run manifest"
     )
     base = load_prepared(config, resolve_models=False)
-    if canonical_json(base) != canonical_json(payload["generation_identity"]):
-        raise ValueError("effective run generation identity differs from prepared identity")
+    base_differences = _identity_differences(
+        _without_recorded_digests(base),
+        _without_recorded_digests(
+            object_value(payload["generation_identity"], "effective generation identity")
+        ),
+        "generation_identity",
+    )
+    if base_differences:
+        raise ValueError(
+            "effective run generation identity differs from prepared identity at keys: "
+            + ", ".join(base_differences)
+        )
     if (
         payload["collection_mode"] not in {"plumbing_smoke", "research_only"}
         or payload["training_eligible"] is not False
@@ -190,19 +244,67 @@ def _effective(config: AlceConfig) -> dict[str, Any]:
         raise ValueError("effective task selection changed")
     selection, render, _ = _source_and_render(config)
     for task_id, task_identity in payload["task_identities"].items():
-        if (
-            task_identity.get("task_id") != task_id
-            or canonical_json(task_identity.get("model")) != canonical_json(base)
-            or canonical_json(task_identity.get("settings"))
-            != canonical_json(payload["episode_settings"])
-            or canonical_json(task_identity.get("source"))
-            != canonical_json(selection["tasks"][task_id])
-            or canonical_json(task_identity.get("render"))
-            != canonical_json(render["tasks"][task_id])
-            or canonical_json(task_identity.get("segmentation"))
-            != canonical_json(render["segmentation"])
-        ):
-            raise ValueError("effective task identity differs from frozen inputs")
+        differences: list[str] = []
+        if task_identity.get("task_id") != task_id:
+            differences.append(f"tasks.{task_id}.task_id")
+        differences.extend(
+            _identity_differences(
+                _without_recorded_digests(
+                    object_value(task_identity.get("model"), f"task model {task_id}")
+                ),
+                _without_recorded_digests(base),
+                f"tasks.{task_id}.model",
+            )
+        )
+        differences.extend(
+            _identity_differences(
+                _without_recorded_digests(
+                    object_value(task_identity.get("settings"), f"task settings {task_id}")
+                ),
+                _without_recorded_digests(
+                    object_value(payload["episode_settings"], "episode settings")
+                ),
+                f"tasks.{task_id}.settings",
+            )
+        )
+        differences.extend(
+            _identity_differences(
+                _without_recorded_digests(
+                    object_value(task_identity.get("source"), f"task source {task_id}")
+                ),
+                _without_recorded_digests(
+                    object_value(selection["tasks"][task_id], f"selection task {task_id}")
+                ),
+                f"tasks.{task_id}.source",
+            )
+        )
+        differences.extend(
+            _identity_differences(
+                _without_recorded_digests(
+                    object_value(task_identity.get("render"), f"task render {task_id}")
+                ),
+                _without_recorded_digests(
+                    object_value(render["tasks"][task_id], f"render task {task_id}")
+                ),
+                f"tasks.{task_id}.render",
+            )
+        )
+        differences.extend(
+            _identity_differences(
+                _without_recorded_digests(
+                    object_value(task_identity.get("segmentation"), f"task segmentation {task_id}")
+                ),
+                _without_recorded_digests(
+                    object_value(render["segmentation"], "render segmentation")
+                ),
+                f"tasks.{task_id}.segmentation",
+            )
+        )
+        if differences:
+            raise ValueError(
+                f"effective task identity for {task_id!r} differs at keys: "
+                + ", ".join(differences)
+            )
     return payload
 
 
@@ -211,16 +313,54 @@ def _episode_dir(config: AlceConfig, task_id: str) -> Path:
 
 
 def _assessment_identity(config: AlceConfig, task: AlceTask) -> dict[str, Any]:
-    return {
+    identity = {
         "assessment": "alce-native-str-em-with-pending-support-v1",
-        "source_identity": task.source_identity,
+        "source_identity": _without_recorded_digests(task.source_identity),
         "rubric": config.assessment_rubric_version,
-        "source_evaluator_sha256": file_sha256(config.checkout / "eval.py"),
-        "source_utils_sha256": file_sha256(config.checkout / "utils.py"),
-        "assessment_code_sha256": file_sha256(Path(__file__).with_name("alce.py")),
-        "metrics_code_sha256": file_sha256(Path(__file__).with_name("alce_source.py")),
-        "assessment_orchestrator_sha256": file_sha256(Path(__file__)),
+        "assessment_version": ALCE_ASSESSMENT_VERSION,
     }
+    assessment_path = _episode_dir(config, task.task_id) / "assessment-current.json"
+    if not assessment_path.is_file():
+        return identity
+    stored_payload = read_json_object(assessment_path, "current ALCE assessment sidecar")
+    stored_identity = object_value(
+        stored_payload.get("identity"), "current ALCE assessment identity"
+    )
+    normalized_stored = dict(stored_identity)
+    normalized_stored.setdefault("assessment_version", 1)
+    if "source_identity" in normalized_stored:
+        normalized_stored["source_identity"] = _without_recorded_digests(
+            normalized_stored["source_identity"]
+        )
+    if not _identity_differences(identity, normalized_stored):
+        return stored_identity
+    if _legacy_assessment_identity_matches(task.source_identity, stored_identity, identity):
+        return stored_identity
+    return identity
+
+
+def _legacy_assessment_identity_matches(
+    current_source_identity: dict[str, object],
+    stored_identity: dict[str, Any],
+    expected_identity: dict[str, Any],
+) -> bool:
+    stored_version = stored_identity.get("assessment_version", 1)
+    if (
+        stored_identity.get("assessment") != expected_identity["assessment"]
+        or stored_identity.get("rubric") != expected_identity["rubric"]
+        or type(stored_version) is not int
+        or stored_version != ALCE_ASSESSMENT_VERSION
+    ):
+        return False
+    stored_source = stored_identity.get("source_identity")
+    if (
+        not isinstance(stored_source, dict)
+        or not stored_source
+        or set(stored_source) - current_source_identity.keys()
+    ):
+        return False
+    current_projection = {key: current_source_identity.get(key) for key in stored_source}
+    return not _identity_differences(stored_source, current_projection)
 
 
 def _pending_task_ids(config: AlceConfig, effective: dict[str, Any]) -> list[str]:
@@ -338,8 +478,7 @@ def _assess_autoais(  # noqa: PLR0913, PLR0917
             "automatic_assessment_digest": base["digest"],
             "manifest": manifest,
             "dependencies": autoais_dependency_identity(),
-            "loader_sha256": file_sha256(Path(__file__).with_name("alce_autoais.py")),
-            "bridge_sha256": file_sha256(Path(__file__).with_name("alce_source.py")),
+            "assessment_version": ALCE_AUTOAIS_ASSESSMENT_VERSION,
         }
         metric = journal.load_assessment(metric_identity)
         if metric is None:
@@ -527,7 +666,7 @@ def record_support_review(config: AlceConfig, task_id: str, review_path: Path) -
             "reviewer": review["reviewer"],
             "rubric": review["rubric_version"],
             "automatic_assessment_digest": automatic["digest"],
-            "validator_sha256": file_sha256(Path(__file__).with_name("alce_support.py")),
+            "validator_version": SUPPORT_REVIEW_VALIDATOR_VERSION,
         }
         review = {**review, "awareness_status": "pending", "mechanism_evidence": []}
         digest = journal.save_assessment(review_identity, review)

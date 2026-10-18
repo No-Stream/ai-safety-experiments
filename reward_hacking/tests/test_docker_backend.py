@@ -609,6 +609,27 @@ def test_generated_command_argv_runs_ladder_wrapper_under_bash(tmp_path: Path) -
         assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
 
 
+def test_restore_shell_state_preserves_stderr_after_state_delimiter(tmp_path: Path) -> None:
+    marker = "__LADDER_SHELL_STATE_oom_note__"
+    state = _ShellState(cwd=str(tmp_path))
+    oom_note = "[command exited 137 (SIGKILL or cgroup OOM); episode supervisor remains available]"
+    private_trailer = f"\0{marker}\0{tmp_path}\0export OOM_TEST=ready\0{marker}\0"
+    result = backend.CommandResult(
+        "memory-bomb",
+        137,
+        "",
+        f"command stderr\n{private_trailer}{oom_note}",
+        False,
+    )
+
+    next_state, visible_stderr, cwd_after = _restore_shell_state(result, state, marker)
+
+    assert next_state.cwd == str(tmp_path)
+    assert next_state.exported_script == "export OOM_TEST=ready"
+    assert cwd_after == str(tmp_path)
+    assert visible_stderr == f"command stderr\n{oom_note}"
+
+
 @pytest.mark.slow
 @pytest.mark.docker_real
 def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Path) -> None:
@@ -812,7 +833,7 @@ def test_live_gate_ignores_disk_and_code_hash_and_runs_once(
     assert calls == [IMAGE]
 
 
-def test_pinned_gate_preserves_bytes_and_persists_fresh_probes(
+def test_recorded_gate_digest_does_not_replace_live_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
 ) -> None:
     gate = tmp_path / "frozen-gate.json"
@@ -826,21 +847,18 @@ def test_pinned_gate_preserves_bytes_and_persists_fresh_probes(
         return live_gate_record
 
     monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
+    monkeypatch.setattr(backend, "_PASSED_GATES", set())
     config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(original).hexdigest())
     require_gate(config)
-    assert gate.read_bytes() == original
+    assert gate.read_bytes() != original
     assert len(calls) == 1
-    assert calls[0] != gate
-    assert calls[0].parent == gate.parent
+    assert calls[0] == gate
     assert json.loads(calls[0].read_text()) == live_gate_record
     require_gate(config)
     assert len(calls) == 1
-    gate.write_text("modified evidence")
-    with pytest.raises(RuntimeError, match="pinned Docker isolation gate record"):
-        require_gate(config)
 
 
-def test_pinned_gate_refuses_changed_bytes_before_live_probe(
+def test_changed_recorded_gate_bytes_still_run_live_probes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
 ) -> None:
     gate = tmp_path / "frozen-gate.json"
@@ -855,9 +873,12 @@ def test_pinned_gate_refuses_changed_bytes_before_live_probe(
         return live_gate_record
 
     monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
-    with pytest.raises(RuntimeError, match="pinned Docker isolation gate record"):
-        require_gate(config)
-    assert calls == []
+    monkeypatch.setattr(backend, "_PASSED_GATES", set())
+
+    require_gate(config)
+
+    assert calls == [gate]
+    assert json.loads(gate.read_text()) == live_gate_record
 
 
 @pytest.mark.parametrize(

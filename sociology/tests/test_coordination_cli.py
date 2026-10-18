@@ -1,9 +1,9 @@
 """The coordination pass through the shared CLI, offline: plan, resume, batch, smoke, and the pass binding.
 
 Nothing here touches AWS. The batch path runs against an in-memory S3 and a scripted control plane borrowed
-from the deference pass's own tests, which is what makes the digest guards testable at all: a mismatch is
-planted into a saved handle deliberately and required to refuse, because it would otherwise file real
-responses under the wrong cells with every count looking plausible.
+from the deference pass's own tests. A mismatch is planted into saved readable stimulus identity and must
+refuse, because it would otherwise file real responses under the wrong cells with every count looking
+plausible.
 
 The class that matters most for this build is the last one. ``--pass`` binds a loader, a leg table, a set of
 audits and two judge schemas together, and what it has to guarantee is that no command can read one pass's
@@ -195,7 +195,7 @@ class TestLiveResume:
             write_synthetic_coordination_stimulus(tmp_path / "edited.json", scenarios=scenarios)
         )
         assert moved.prompt_digest != coordination_stimulus.prompt_digest
-        with pytest.raises(ValueError, match="refusing to resume"):
+        with pytest.raises(ValueError, match="refusing to sample") as raised:
             cli._run_live_calls(
                 planned_calls_for_leg(leg_for(LIVE_LEG_ID), moved)[:2],
                 out,
@@ -205,6 +205,7 @@ class TestLiveResume:
                 chunk_size=1,
                 backend_factory=scripted_factory(reply),
             )
+        assert "readable stimulus fields ['scenarios'] changed" in str(raised.value)
 
     def test_a_reply_row_carries_this_passs_labels_and_digests(
         self, tmp_path: Path, coordination_stimulus: CoordinationStimulus
@@ -437,12 +438,15 @@ class TestTheBatchPath:
         self.submit(tmp_path, coordination_stimulus)
         path = cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID))
         payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["stimulus_prompt_digest"] = "0000000000000000"
+        payload["stimulus_prompt_identity"]["scenarios"][0]["oversight_on"] = (
+            "Synthetic changed oversight sentence."
+        )
         path.write_text(json.dumps(payload), encoding="utf-8")
-        with pytest.raises(RuntimeError, match="was submitted under stimulus prompt digest"):
+        with pytest.raises(RuntimeError, match="different stimulus prompt fields") as raised:
             cli.collect_batch(
                 BATCH_LEG_ID, tmp_path, bound(coordination_stimulus), timeout_seconds=1.0
             )
+        assert "in ['scenarios']" in str(raised.value)
 
     def test_submitting_a_live_leg_refuses(
         self, tmp_path: Path, coordination_stimulus: CoordinationStimulus

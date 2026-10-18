@@ -22,6 +22,7 @@ from sociology import judge_loop as judge_loop_module
 from sociology.decoupled_judge import (
     ACTION_NONE,
     CROSS_JUDGE_MODEL_ID,
+    DECOUPLED_VERDICT_SCHEMA,
     JUDGE_MODEL_ID,
     JUDGE_PROMPT_VERSION,
     JudgeReplyError,
@@ -439,12 +440,33 @@ class TestRubricStaleness:
         judge_records(
             ScriptedDetailedBackend([verdict_json()]), [reply_record("k1")], out, decoupled_stimulus
         )
+        stored = load_judged(out)["k1"]
+        assert stored["judge_prompt_rubric"] == decoupled_stimulus.judge_instructions
+        assert stored["judge_prompt_sections"] == list(DECOUPLED_VERDICT_SCHEMA.scaffold)
+        stored["judge_prompt_digest"] = "synthetic-irrelevant-digest"
+        out.write_text(json.dumps(stored) + "\n", encoding="utf-8")
         again = judge_records(
             ScriptedDetailedBackend([verdict_json()]), [reply_record("k1")], out, decoupled_stimulus
         )
         assert again["already_judged"] == 1
         assert again["stale_rejudged"] == 0
         assert again["judged"] == 0
+
+    def test_a_row_with_a_different_named_prompt_section_is_re_judged(
+        self, tmp_path: Path, decoupled_stimulus: DecoupledStimulus
+    ) -> None:
+        out = tmp_path / "judged.jsonl"
+        judge_records(
+            ScriptedDetailedBackend([verdict_json()]), [reply_record("k1")], out, decoupled_stimulus
+        )
+        stored = load_judged(out)["k1"]
+        stored["judge_prompt_sections"][0] = "SYNTHETIC-CHANGED-SECTION"
+        out.write_text(json.dumps(stored) + "\n", encoding="utf-8")
+        after = judge_records(
+            ScriptedDetailedBackend([verdict_json()]), [reply_record("k1")], out, decoupled_stimulus
+        )
+        assert after["already_judged"] == 0
+        assert after["stale_rejudged"] == 1
 
     def test_a_row_from_an_older_prompt_version_is_re_judged_as_stale(
         self, tmp_path: Path, decoupled_stimulus: DecoupledStimulus

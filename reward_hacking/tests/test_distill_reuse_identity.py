@@ -1,5 +1,6 @@
 """Compatibility and semantic-change controls for distillation artifact reuse."""
 
+import hashlib
 import json
 import shutil
 from dataclasses import replace
@@ -84,6 +85,43 @@ def test_model_identity_uses_tensor_content_independent_of_serialization_and_lay
     )
     assert model_identity(str(second)) != initial
     assert not recorded_model_matches({"model": str(first), "model_identity": initial}, str(second))
+
+
+def test_model_identity_differences_name_changed_tensor_and_preserve_legacy_records(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    weight_path = model_path / "model.safetensors"
+    _save_weights(weight_path, value=1.0)
+    recorded_identity = model_identity(str(model_path))
+    assert recorded_identity is not None
+
+    current_identity = model_identity(str(model_path))
+    assert current_identity is not None
+    recorded_tensors = cast("dict[str, object]", recorded_identity["tensors"])
+    legacy_identity = {
+        "tensor_content_sha256": hashlib.sha256(
+            json.dumps(recorded_tensors, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        **{key: value for key, value in recorded_identity.items() if key != "tensors"},
+    }
+    legacy_record = {"model": str(model_path), "model_identity": legacy_identity}
+    assert recorded_model_matches(legacy_record, str(model_path), identity=current_identity)
+
+    _save_weights(weight_path, value=2.0)
+    changed_identity = model_identity(str(model_path))
+    assert changed_identity is not None
+
+    assert semantic_identity.model_identity_differences(recorded_identity, changed_identity) == [
+        "tensors.layer.weight.content_sha256"
+    ]
+    assert not recorded_model_matches(
+        {"model": str(model_path), "model_identity": recorded_identity},
+        str(model_path),
+        identity=changed_identity,
+    )
+    assert not recorded_model_matches(legacy_record, str(model_path), identity=changed_identity)
 
 
 def test_model_weight_identity_memoizes_resolved_checkpoint_path(

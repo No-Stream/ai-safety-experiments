@@ -29,11 +29,11 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors.torch import load_file, save_file
 
-from games.fileio import sha256_of_file
 from reward_hacking.interp.lens_geometry import (
     GateProvenanceError,
     StoredDecodeGate,
     assert_gate_matches_lens_file,
+    assert_gate_matches_lens_identity,
     assert_gate_matches_weights,
 )
 
@@ -146,6 +146,8 @@ class StoredUnembed:
     norm_weight: torch.Tensor
     lm_head_weight: torch.Tensor
     rms_eps: float
+    model_label: str | None = None
+    weights_identity: str | None = None
 
     def __post_init__(self) -> None:
         """Hold the two tensors to each other."""
@@ -181,7 +183,14 @@ class StoredUnembed:
         normed = (normed * (1.0 + self.norm_weight.float())).to(self.served_dtype)
         return normed @ self.lm_head_weight.T
 
-    def save(self, out_dir: Path, *, weights_fingerprint: str) -> None:
+    def save(
+        self,
+        out_dir: Path,
+        *,
+        weights_fingerprint: str,
+        model_label: str | None = None,
+        weights_identity: str | None = None,
+    ) -> None:
         """Write the two tensors and the facts a reader needs to apply them the same way."""
         out_dir.mkdir(parents=True, exist_ok=True)
         save_file(
@@ -202,6 +211,12 @@ class StoredUnembed:
                     "vocab_size": self.vocab_size,
                     "hidden": int(self.norm_weight.shape[0]),
                     "weights_fingerprint": weights_fingerprint,
+                    **({"model_label": model_label} if model_label is not None else {}),
+                    **(
+                        {"weights_identity": weights_identity}
+                        if weights_identity is not None
+                        else {}
+                    ),
                 },
                 indent=1,
             )
@@ -245,6 +260,13 @@ class StoredUnembed:
                 f"{out_dir}: the head on disk is {tuple(unembed.lm_head_weight.shape)} but the "
                 f"sidecar declares {declared}"
             )
+        unembed = cls(
+            norm_weight=unembed.norm_weight,
+            lm_head_weight=unembed.lm_head_weight,
+            rms_eps=unembed.rms_eps,
+            model_label=str(meta["model_label"]) if "model_label" in meta else None,
+            weights_identity=str(meta["weights_identity"]) if "weights_identity" in meta else None,
+        )
         return unembed, str(meta["weights_fingerprint"])
 
 
@@ -306,6 +328,7 @@ class LensProvenance:
     jlens_commit: str
     lens_sha256: str
     report: dict[str, Any]
+    fit_id: str | None = None
 
     @property
     def identity(self) -> dict[str, object]:
@@ -314,7 +337,6 @@ class LensProvenance:
             "lens_name": self.lens_name,
             "model_label": self.model_label,
             "weights_identity": self.weights_identity,
-            "weights_fingerprint": self.weights_fingerprint,
             "load_path": self.load_path,
             "corpus_digests": dict(self.corpus_digests),
             "fit_role": self.fit_role,
@@ -350,10 +372,10 @@ class LensProvenance:
                 f"(kind={payload.get('kind')!r} schema={payload.get('schema')!r})"
             )
         fields = {field.name for field in cls.__dataclass_fields__.values()}
-        missing = sorted(fields - set(payload))
+        missing = sorted((fields - {"fit_id"}) - set(payload))
         if missing:
             raise LensArtifactError(f"{path} lacks {missing}")
-        return cls(**{name: payload[name] for name in fields})
+        return cls(**{name: payload[name] for name in fields if name in payload})
 
 
 def assert_same_fit(
@@ -361,7 +383,8 @@ def assert_same_fit(
 ) -> None:
     """Compare semantic fit fields shared with older provenance records."""
     semantic_fields = {
-        "weights_fingerprint",
+        "model_label",
+        "weights_identity",
         "corpus_digests",
         "fit_role",
         "n_fit_prompts",
@@ -376,8 +399,6 @@ def assert_same_fit(
     provenance_fields = {
         "lens_name",
         "load_path",
-        "model_label",
-        "weights_identity",
         "jlens_commit",
     }
     shared_fields = (set(existing.identity) & set(wanted)) - provenance_fields
@@ -427,8 +448,8 @@ def load_lens_bundle(lens_dir: Path) -> LensBundle:
     """Open a lens directory and hold every file in it to the others.
 
     The provenance is read first, since without it the directory is a torn fit; the gate is held to
-    the lens file's digest and to the provenance's weights fingerprint; the unembedding is held to
-    the same fingerprint. A mismatch anywhere is a refusal naming both sides, never a decode.
+    the fit id, model label and resolved weights identity. The lens and gate retain their file
+    digests as provenance. A mismatch in the readable fit identity is a refusal naming both sides.
     """
     if not (lens_dir / PROVENANCE_FILENAME).is_file():
         raise LensArtifactError(
@@ -437,23 +458,40 @@ def load_lens_bundle(lens_dir: Path) -> LensBundle:
         )
     provenance = LensProvenance.load(lens_dir)
     lens_path = lens_dir / LENS_FILENAME
-    lens_sha256 = sha256_of_file(lens_path)
-    if lens_sha256 != provenance.lens_sha256:
-        raise LensArtifactError(
-            f"{lens_path} digests to {lens_sha256[:12]} but the provenance names "
-            f"{provenance.lens_sha256[:12]}; the lens file is not the one the sidecar describes"
-        )
     lens = SavedLens.load(lens_path)
     gate = StoredDecodeGate.load(lens_dir)
-    assert_gate_matches_lens_file(gate, lens_path)
+    gate_provenance = gate.provenance
+    if gate_provenance is not None and gate_provenance.fit_id is None and provenance.fit_id is None:
+        assert_gate_matches_lens_file(gate, lens_path)
+    assert_gate_matches_lens_identity(
+        gate,
+        fit_id=provenance.fit_id,
+        model_label=provenance.model_label,
+        weights_identity=provenance.weights_identity,
+    )
     assert_gate_matches_weights(
-        gate, provenance.weights_fingerprint, what=f"lens {provenance.lens_name}"
+        gate,
+        model_label=provenance.model_label,
+        weights_identity=provenance.weights_identity,
+        weights_fingerprint=provenance.weights_fingerprint,
+        what=f"lens {provenance.lens_name}",
     )
     unembed, unembed_fingerprint = StoredUnembed.load(lens_dir)
-    if unembed_fingerprint != provenance.weights_fingerprint:
+    if unembed.model_label is None or unembed.weights_identity is None:
+        if unembed_fingerprint == provenance.weights_fingerprint:
+            pass
+        else:
+            raise GateProvenanceError(
+                f"{lens_dir}: legacy stored unembedding weights fingerprint differs from the lens provenance"
+            )
+    elif (
+        unembed.model_label != provenance.model_label
+        or unembed.weights_identity != provenance.weights_identity
+    ):
         raise GateProvenanceError(
-            f"{lens_dir}: the stored unembedding came from weights {unembed_fingerprint[:12]} but the "
-            f"lens was fitted on {provenance.weights_fingerprint[:12]}"
+            f"{lens_dir}: unembedding model identity differs from lens provenance: "
+            f"model_label {unembed.model_label!r} vs {provenance.model_label!r}; "
+            f"weights_identity {unembed.weights_identity!r} vs {provenance.weights_identity!r}"
         )
     if (
         int(unembed.norm_weight.shape[0]) != lens.d_model

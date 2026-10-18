@@ -81,7 +81,7 @@ from reward_hacking.interp.tmax_directions import (
     load_directions,
     records_table,
 )
-from reward_hacking.interp.tmax_full_weights import cell_fingerprint
+from reward_hacking.interp.tmax_full_weights import cell_weights_identity
 from reward_hacking.legibility_narration_summary import ALL_STRATA, IDENTIFIABILITY_DEFINITIONS
 
 if TYPE_CHECKING:
@@ -650,7 +650,13 @@ def decode_context_for(  # noqa: PLR0913 - a context is a bundle, a cell, the to
     """
     assert_gate_matches_weights(
         bundle.gate,
-        cell_fingerprint(cell),
+        model_label=str(cell.provenance["weights_label"]),
+        weights_identity=cell_weights_identity(cell),
+        weights_fingerprint=(
+            str(cell.provenance["weights_fingerprint"])
+            if "weights_fingerprint" in cell.provenance
+            else None
+        ),
         what=f"cell {cell.label} ({stimulus_set}/{pooling})",
     )
     return DecodeContext(
@@ -739,7 +745,15 @@ def read_directions_through(  # noqa: PLR0913 - one stage is its inputs, its kno
                 f"raw only, without a standardized row"
             )
             assert_gate_matches_weights(
-                bundle.gate, cell_fingerprint(cell), what=f"cell {cell.label}"
+                bundle.gate,
+                model_label=str(cell.provenance["weights_label"]),
+                weights_identity=cell_weights_identity(cell),
+                weights_fingerprint=(
+                    str(cell.provenance["weights_fingerprint"])
+                    if "weights_fingerprint" in cell.provenance
+                    else None
+                ),
+                what=f"cell {cell.label}",
             )
             context = DecodeContext(
                 lens=bundle.lens,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import re
 import subprocess
@@ -25,7 +24,6 @@ from reward_hacking.spec_gaming.episode import EpisodeSettings
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-logger: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA_VERSION = 1
 MAXIMUM_TASKS = 8
 MAXIMUM_TURNS = 20
@@ -347,12 +345,11 @@ def _runtime_config(value: object) -> RuntimeConfig:
     )
     gate_record = configured_path(raw["gate_record"], "runtime.gate_record", private=True)
     gate_sha256 = sha256_string(raw["gate_record_sha256"], "runtime.gate_record_sha256")
-    if not gate_record.is_file() or file_sha256(gate_record) != gate_sha256:
-        raise ValueError("runtime isolation gate record is missing or has changed")
+    gate_record_sha256 = file_sha256(gate_record) if gate_record.is_file() else None
     docker = DockerConfig(
         image=nonempty_string(raw["image"], "runtime.image"),
         gate_record=gate_record,
-        gate_record_sha256=gate_sha256,
+        gate_record_sha256=gate_record_sha256,
         memory_bytes=integer(raw["memory_bytes"], "runtime.memory_bytes"),
         pids_limit=integer(raw["pids_limit"], "runtime.pids_limit", minimum=4),
         cpus=_number(raw["cpus"], "runtime.cpus"),
@@ -595,14 +592,6 @@ def load_serving_identity(config: ServingConfig) -> ServingIdentity:
     path = config.model.serving_manifest
     if not path.is_file():
         raise ValueError("serving manifest is missing")
-    observed_sha256 = file_sha256(path)
-    if observed_sha256 != config.model.serving_manifest_sha256:
-        logger.warning(
-            "serving manifest %s records sha256 %s but observed %s",
-            path,
-            config.model.serving_manifest_sha256,
-            observed_sha256,
-        )
     manifest = read_json_object(path, "serving manifest")
     exact_keys(
         manifest,

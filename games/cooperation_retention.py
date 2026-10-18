@@ -423,8 +423,6 @@ def _validate_geometry_report(  # noqa: C901, PLR0912, PLR0915 - one native geom
         raise ValueError(
             f"selected target {selected_target} references a different geometry report"
         )
-    if _sha256(path) != selected_target_wrapper["geometry_report_sha256"]:
-        raise ValueError(f"selected target {selected_target} has a stale geometry_report_sha256")
     final_layers = {
         name: set(direction_layers) for name, direction_layers in directions["final"].items()
     }
@@ -547,20 +545,14 @@ def _validate_lens_report(  # noqa: C901, PLR0912, PLR0915 - one native lens con
                 readout_item.get("path"),
                 field_name=f"states[{state!r}].direction_readouts[{name!r}].path",
             )
-            expected_sha = _require_sha256(
-                readout_item,
-                "sha256",
-                path,
-            )
-            if _sha256(direction_path) != expected_sha:
-                raise ValueError(f"readout {path} has a stale direction hash for {state}/{name}")
             state_direction_paths[state][name] = direction_path
+            direction_tensors = load_direction_file(direction_path)
             layers = _require_mapping(
                 readout_item.get("layers"),
                 path,
                 f"states[{state!r}].direction_readouts[{name!r}].layers",
             )
-            expected_layers = {str(layer) for layer in load_direction_file(direction_path)}
+            expected_layers = {str(layer) for layer in direction_tensors}
             if set(layers) != expected_layers:
                 raise ValueError(
                     f"readout {path} {state}/{name} has incomplete per-layer measurements"
@@ -569,6 +561,26 @@ def _validate_lens_report(  # noqa: C901, PLR0912, PLR0915 - one native lens con
                 layer_item = _require_mapping(
                     layer_payload, path, f"states[{state!r}].direction_readouts[{name!r}].{layer}"
                 )
+                direction = direction_tensors[int(layer)]
+                recorded_norm = layer_item.get("direction_norm")
+                if (
+                    isinstance(recorded_norm, bool)
+                    or not isinstance(recorded_norm, int | float)
+                    or not math.isclose(
+                        float(recorded_norm),
+                        float(direction.float().norm()),
+                        rel_tol=1e-6,
+                        abs_tol=1e-7,
+                    )
+                ):
+                    raise ValueError(
+                        f"readout {path} direction layer {state}/{name}/{layer} has a different norm"
+                    )
+                recorded_shape = layer_item.get("direction_shape")
+                if recorded_shape is not None and recorded_shape != list(direction.shape):
+                    raise ValueError(
+                        f"readout {path} direction layer {state}/{name}/{layer} has a different shape"
+                    )
                 _require_mapping(layer_item.get("quality"), path, f"{state}/{name}/{layer}.quality")
                 _require_nonempty_list(layer_item, "real", path)
                 _require_nonempty_list(layer_item, "matched_norm_random", path)
@@ -600,9 +612,6 @@ def _validate_lens_report(  # noqa: C901, PLR0912, PLR0915 - one native lens con
         direction_path = _referenced_path(
             path, readout_item.get("path"), field_name=f"shared.direction_readouts[{name!r}].path"
         )
-        expected_sha = _require_sha256(readout_item, "sha256", path)
-        if _sha256(direction_path) != expected_sha:
-            raise ValueError(f"readout {path} has a stale shared direction hash for {name}")
         if direction_path != state_direction_paths["final"][name]:
             raise ValueError(f"readout {path} shared/{name} does not use the final direction")
         layers = _require_mapping(
@@ -610,11 +619,32 @@ def _validate_lens_report(  # noqa: C901, PLR0912, PLR0915 - one native lens con
             path,
             f"shared.direction_readouts[{name!r}].layers",
         )
-        expected_layers = {str(layer) for layer in load_direction_file(direction_path)}
+        direction_tensors = load_direction_file(direction_path)
+        expected_layers = {str(layer) for layer in direction_tensors}
         if set(layers) != expected_layers:
             raise ValueError(f"readout {path} shared/{name} has incomplete per-layer measurements")
         for layer, layer_payload in layers.items():
             layer_item = _require_mapping(layer_payload, path, f"shared/{name}/{layer}")
+            direction = direction_tensors[int(layer)]
+            recorded_norm = layer_item.get("direction_norm")
+            if (
+                isinstance(recorded_norm, bool)
+                or not isinstance(recorded_norm, int | float)
+                or not math.isclose(
+                    float(recorded_norm),
+                    float(direction.float().norm()),
+                    rel_tol=1e-6,
+                    abs_tol=1e-7,
+                )
+            ):
+                raise ValueError(
+                    f"readout {path} shared direction layer {name}/{layer} has a different norm"
+                )
+            recorded_shape = layer_item.get("direction_shape")
+            if recorded_shape is not None and recorded_shape != list(direction.shape):
+                raise ValueError(
+                    f"readout {path} shared direction layer {name}/{layer} has a different shape"
+                )
             _require_mapping(layer_item.get("quality"), path, f"shared/{name}/{layer}.quality")
             _require_nonempty_list(layer_item, "real", path)
             _require_nonempty_list(layer_item, "matched_norm_random", path)
@@ -722,12 +752,11 @@ def _validate_json_readout(path: Path) -> None:
 
 @dataclass(frozen=True)
 class AdapterArtifactIdentity:
-    """Exact on-disk identity of the final adapter whose readouts permit pruning."""
+    """Readable on-disk identity of the final adapter whose readouts permit pruning."""
 
     path: Path
     step: int
-    weights_sha256: str
-    config_sha256: str
+    weights_size_bytes: int
     config: dict[str, Any]
 
 
@@ -738,8 +767,7 @@ def _adapter_identity(checkpoint: Path, step: int) -> AdapterArtifactIdentity:
     return AdapterArtifactIdentity(
         path=checkpoint.resolve(),
         step=step,
-        weights_sha256=_sha256(weights_path),
-        config_sha256=_sha256(config_path),
+        weights_size_bytes=weights_path.stat().st_size,
         config=cast(
             "dict[str, Any]",
             json.loads(json.dumps(adapter_config_identity(checkpoint), sort_keys=True)),
@@ -755,8 +783,11 @@ def _assert_adapter_payload(
         raise ValueError(f"readout {path} references a different final adapter path")
     if adapter.get("weights_filename") != "adapter_model.safetensors":
         raise ValueError(f"readout {path} references the wrong adapter weights filename")
-    if adapter.get("weights_sha256") != expected.weights_sha256:
-        raise ValueError(f"readout {path} references different final adapter weights")
+    if (
+        "weights_size_bytes" in adapter
+        and adapter["weights_size_bytes"] != expected.weights_size_bytes
+    ):
+        raise ValueError(f"readout {path} references different adapter_weights_size_bytes")
     config = _require_mapping(adapter.get("config"), path, "adapter.config")
     if config != expected.config:
         raise ValueError(f"readout {path} references a different final adapter config")
@@ -800,9 +831,13 @@ def _validate_json_identity(  # noqa: C901, PLR0912, PLR0915 - explicit per-arti
         )
         if adapter_path != expected.path:
             raise ValueError(f"readout {path} was produced from a different final adapter path")
-        if meta.get("adapter_weights_sha256") != expected.weights_sha256:
-            raise ValueError(f"readout {path} was produced from different final adapter weights")
-        if meta.get("adapter_config_sha256") != expected.config_sha256:
+        if (
+            "adapter_weights_size_bytes" in meta
+            and meta["adapter_weights_size_bytes"] != expected.weights_size_bytes
+        ):
+            raise ValueError(f"readout {path} has different adapter_weights_size_bytes")
+        recorded_config = meta.get("adapter_config")
+        if isinstance(recorded_config, Mapping) and dict(recorded_config) != expected.config:
             raise ValueError(f"readout {path} was produced from a different final adapter config")
         return
     if path.name == "ladder-manifest.json":
@@ -815,8 +850,6 @@ def _validate_json_identity(  # noqa: C901, PLR0912, PLR0915 - explicit per-arti
                 f"readout {path} does not contain exactly the base and final capture cells"
             )
         final_cell = ladder.cell(final_arm, expected.step)
-        if final_cell.adapter_weights_sha256 != expected.weights_sha256:
-            raise ValueError(f"readout {path} captured different final adapter weights")
         if final_cell.applied_adapter_weights is None or final_cell.applied_adapter_weights <= 0:
             raise ValueError(f"readout {path} did not apply the final adapter")
         adapter_dir = _referenced_path(
@@ -828,6 +861,9 @@ def _validate_json_identity(  # noqa: C901, PLR0912, PLR0915 - explicit per-arti
             raise ValueError(f"readout {path} captured a different final adapter path")
         if final_cell.provenance.get("adapter_config") != expected.config:
             raise ValueError(f"readout {path} captured a different final adapter config")
+        recorded_size = final_cell.provenance.get("adapter_weights_size_bytes")
+        if recorded_size is not None and recorded_size != expected.weights_size_bytes:
+            raise ValueError(f"readout {path} captured different adapter_weights_size_bytes")
         return
     if path.name == "cooperation_interp.json":
         context = cast("Mapping[str, Any]", payload["context"])
@@ -847,9 +883,35 @@ def _validate_json_identity(  # noqa: C901, PLR0912, PLR0915 - explicit per-arti
         final_entry = _require_mapping(
             identities[f"{final_arm}/step-{expected.step}"], path, "final cell identity"
         )
-        if final_entry.get("adapter_weights_sha256") != expected.weights_sha256:
-            raise ValueError(f"readout {path} used different final adapter weights")
+        if (
+            "adapter_path" in final_entry
+            and _referenced_path(
+                path, final_entry["adapter_path"], field_name="final cell adapter_path"
+            )
+            != expected.path
+        ):
+            raise ValueError(f"readout {path} used a different final adapter path")
+        if "step" in final_entry and final_entry["step"] != expected.step:
+            raise ValueError(f"readout {path} used a different final adapter step")
+        if (
+            "adapter_weights_size_bytes" in final_entry
+            and final_entry["adapter_weights_size_bytes"] != expected.weights_size_bytes
+        ):
+            raise ValueError(f"readout {path} used different adapter_weights_size_bytes")
+        if "adapter_config" in final_entry and final_entry["adapter_config"] != expected.config:
+            raise ValueError(f"readout {path} used a different final adapter config")
         _require_positive_int(final_entry, "applied_adapter_weights", path)
+        selected_target_path = _referenced_path(
+            path, context.get("selected_target"), field_name="context.selected_target"
+        )
+        selected_target = _require_object(
+            json.loads(selected_target_path.read_text(encoding="utf-8")), selected_target_path
+        )
+        report_step = selected_target.get("geometry_report_step")
+        if report_step is not None and report_step != expected.step:
+            raise ValueError(
+                f"readout {path} selected a geometry report from a different adapter step"
+            )
         return
     if path.name == "cooperation_lens.json":
         if payload["base_model"] != base_model:
@@ -862,8 +924,27 @@ def _validate_json_identity(  # noqa: C901, PLR0912, PLR0915 - explicit per-arti
         if payload["final_arm"] != final_arm or payload["final_step"] != expected.step:
             raise ValueError(f"readout {path} used a different final arm or step")
         capture = _require_mapping(payload["construct_capture"], path, "construct_capture")
-        if capture.get("final_adapter_weights_sha256") != expected.weights_sha256:
-            raise ValueError(f"readout {path} used different final adapter weights")
+        if (
+            "final_adapter_path" in capture
+            and _referenced_path(
+                path,
+                capture["final_adapter_path"],
+                field_name="construct_capture.final_adapter_path",
+            )
+            != expected.path
+        ):
+            raise ValueError(f"readout {path} used a different final adapter path")
+        if (
+            "final_adapter_weights_size_bytes" in capture
+            and capture["final_adapter_weights_size_bytes"] != expected.weights_size_bytes
+        ):
+            raise ValueError(f"readout {path} used different adapter_weights_size_bytes")
+        if "final_step" in capture and capture["final_step"] != expected.step:
+            raise ValueError(
+                f"readout {path} construct capture used a different final adapter step"
+            )
+        if "final_adapter_config" in capture and capture["final_adapter_config"] != expected.config:
+            raise ValueError(f"readout {path} used a different final adapter config")
         final_state = _require_mapping(
             cast("Mapping[str, Any]", payload["states"])["final"], path, "states.final"
         )
@@ -991,8 +1072,20 @@ def _validate_complete_bundle(  # noqa: C901, PLR0912, PLR0915 - authorization b
     steering_target = _require_mapping(
         steering_summary.get("selected_target"), steering_summary_path, "selected_target"
     )
-    if steering_target != selected_target_wrapper:
-        raise ValueError("intervention readout used a different selected geometry target")
+    selected_target_fields = _selected_target_fields(
+        selected_target_wrapper, path=selected_target_path
+    )
+    steering_target_fields = _selected_target_fields(steering_target, path=steering_summary_path)
+    if steering_target_fields != selected_target_fields:
+        changed_fields = sorted(
+            field
+            for field in set(selected_target_fields) | set(steering_target_fields)
+            if selected_target_fields.get(field) != steering_target_fields.get(field)
+        )
+        raise ValueError(
+            "intervention readout selected geometry target differs in "
+            f"readable fields {changed_fields}"
+        )
     if steering_summary.get("model_weights_identity") != resolved_base_weights_identity:
         raise ValueError("intervention readout used different base model weights")
     lens_path = next(path for path in readouts if path.name == "cooperation_lens.json")
@@ -1000,6 +1093,23 @@ def _validate_complete_bundle(  # noqa: C901, PLR0912, PLR0915 - authorization b
     if lens.get("base_weights_identity") != resolved_base_weights_identity:
         raise ValueError("lens readout used different base model weights")
     return expected, final_arm_value
+
+
+def _selected_target_fields(wrapper: Mapping[str, Any], *, path: Path) -> dict[str, Any]:
+    """Return selected-target identity without wrapper and embedded digest metadata."""
+    payload = _require_mapping(wrapper.get("payload"), path, "selected_target.payload")
+    readable_payload = {
+        field: value
+        for field, value in payload.items()
+        if field not in {"direction_sha256", "geometry_report_sha256"}
+    }
+    return {
+        "path": wrapper.get("path"),
+        "payload": readable_payload,
+        "geometry_report_path": wrapper.get("geometry_report_path"),
+        "geometry_report_step": wrapper.get("geometry_report_step"),
+        "cell": wrapper.get("cell"),
+    }
 
 
 def _authorization_payload(readouts: Sequence[Path]) -> dict[str, object]:

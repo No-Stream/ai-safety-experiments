@@ -924,7 +924,7 @@ class TestCpuPreparation:
         }
         identity = json.loads((run / "run-identity.preflight.json").read_text())
         static_plan = json.loads((run / "static-plan.json").read_text())
-        assert identity["schema"] == "cooperation-generalization-run/v2"
+        assert identity["schema"] == "cooperation-generalization-run/v3"
         assert not (run / "run-identity.json").exists()
         assert static_plan["disk"]["estimated_bytes"] == 3380
 
@@ -1088,6 +1088,102 @@ class TestPhaseResume:
         assert phase.receipt_path.read_bytes() == receipt_bytes
         assert artifact.read_bytes() == artifact_bytes
 
+    def test_phase_identity_uses_readable_files_and_does_not_pin_orchestrator_source(
+        self, tmp_path: Path
+    ) -> None:
+        phase, input_path, _artifact = self.make_phase(tmp_path)
+
+        identity = plan.phase_identity(phase)
+
+        assert "orchestrator_sha256" not in identity
+        inputs = identity["inputs"]
+        assert isinstance(inputs, dict)
+        input_identity = inputs[str(input_path)]
+        assert isinstance(input_identity, dict)
+        assert input_identity == {
+            "kind": "file",
+            "path": str(input_path),
+            "size_bytes": input_path.stat().st_size,
+        }
+
+    def test_phase_resume_ignores_same_size_input_edit_and_names_size_drift(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        phase, input_path, artifact = self.make_phase(tmp_path)
+
+        def runner(operation: plan.Operation) -> int:
+            _write(artifact, b"result\n")
+            return 0
+
+        monkeypatch.setattr(plan, "phase_specs", lambda: (phase,))
+        plan.execute_phase(phase, runner=runner)
+        original_size = input_path.stat().st_size
+        input_path.write_bytes(b"changed input\n")
+
+        assert input_path.stat().st_size == original_size
+        assert plan.phase_is_complete(phase)
+
+        input_path.write_bytes(b"larger runtime input\n")
+        with pytest.raises(ValueError, match=r"inputs.*size_bytes"):
+            plan.phase_is_complete(phase)
+
+    def test_legacy_phase_receipt_loads_after_a_same_size_input_edit(self, tmp_path: Path) -> None:
+        phase, input_path, artifact = self.make_phase(tmp_path)
+        _write(artifact, b"legacy result\n")
+        operation = phase.operations[0]
+        legacy_identity = {
+            "schema": "cooperation-generalization-phase/v1",
+            "orchestrator_sha256": "old source digest",
+            "phase": phase.name,
+            "operations": [
+                {
+                    "name": operation.name,
+                    "argv": list(operation.argv),
+                    "env": dict(operation.env or {}),
+                }
+            ],
+            "inputs": {str(input_path): "old input digest"},
+        }
+        phase.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        phase.receipt_path.write_text(
+            json.dumps(
+                {
+                    "phase_identity": legacy_identity,
+                    "outputs": {str(artifact): "old output digest"},
+                }
+            )
+        )
+        input_path.write_bytes(b"changed input\n")
+
+        assert input_path.stat().st_size == len(b"runtime input\n")
+        assert plan.phase_is_complete(phase)
+
+    def test_run_identity_names_runtime_payload_fields_and_omits_source_hash(
+        self, minimal_prepare_inputs: dict[str, Path]
+    ) -> None:
+        identity = plan.run_identity()
+        expectation_path = minimal_prepare_inputs["INTERVENTION_EXPECTATION"]
+
+        assert "orchestrator_sha256" not in identity
+        runtime_input_values = identity["runtime_input_values"]
+        assert isinstance(runtime_input_values, dict)
+        assert runtime_input_values[str(expectation_path)] == {
+            "expected_effect": "directional probe",
+            "expectation_recorded_before_intervention": True,
+        }
+
+    def test_stale_preflight_names_the_changed_runtime_field(
+        self, minimal_prepare_inputs: dict[str, Path]
+    ) -> None:
+        plan.write_json_atomic(plan.preflight_identity_path(), plan.run_identity())
+        expectation_path = minimal_prepare_inputs["INTERVENTION_EXPECTATION"]
+        payload = json.loads(expectation_path.read_text(encoding="utf-8"))
+        payload["expected_effect"] = "directional signal"
+        expectation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"intervention-expectation\.json.*expected_effect"):
+            plan.freeze_run_identity()
+
     def test_mismatched_input_identity_refuses_before_running(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1101,9 +1197,9 @@ class TestPhaseResume:
 
         monkeypatch.setattr(plan, "phase_specs", lambda: (phase,))
         plan.execute_phase(phase, runner=runner)
-        _write(input_path, b"changed input\n")
+        _write(input_path, b"input content changed and larger\n")
 
-        with pytest.raises(ValueError, match="identity"):
+        with pytest.raises(ValueError, match=r"inputs.*size_bytes"):
             plan.execute_phase(phase, runner=runner)
         assert calls == [phase.operations[0].name]
 
@@ -1316,10 +1412,35 @@ class TestSemanticArtifactValidation:
     ) -> None:
         stimuli = tmp_path / "base.jsonl"
         sidecar = stimuli.with_suffix(".jsonl.manifest.json")
-        records = _write(tmp_path / "behavior.jsonl", b'{"record":"meta"}\n')
-        selection_path = _write(tmp_path / "selection.json", b'{"version":1}\n')
         request_ids = [f"request-{index}" for index in range(4)]
         stimulus_ids = [f"natural-prefix--{request_id}" for request_id in request_ids]
+        selection_payload = {
+            "version": 1,
+            "request_ids": request_ids,
+            "scenario_groups": [f"group-{index}" for index in range(4)],
+            "selection_rule": "synthetic predeclared selection",
+            "layers": [8, 16, 24],
+            "rollout_ids_by_state": {
+                "base": "base/step-0",
+                "final": "trained/step-20",
+            },
+        }
+        selection_path = _write(tmp_path / "selection.json", json.dumps(selection_payload).encode())
+        behavior_records = [
+            {
+                "record": "game-behavior",
+                "request_id": request_id,
+                "rollout_id": "base/step-0",
+                "scenario_group": f"group-{index}",
+                "prompt": f"synthetic source prompt {index}",
+                "pre_action_prefix": f"synthetic prefix {index}",
+            }
+            for index, request_id in enumerate(request_ids)
+        ]
+        records = _write(
+            tmp_path / "behavior.jsonl",
+            ("\n".join(json.dumps(row) for row in behavior_records) + "\n").encode(),
+        )
         stimuli.write_text(
             "".join(
                 json.dumps(
@@ -1328,9 +1449,12 @@ class TestSemanticArtifactValidation:
                         "set": "natural-prefix",
                         "side": "N",
                         "pair_id": request_id,
-                        "assistant_prefix": "opaque prefix",
+                        "text": f"synthetic source prompt {index}",
+                        "assistant_prefix": f"synthetic prefix {index}",
                         "metadata": {
                             "request_id": request_id,
+                            "scenario_group": f"group-{index}",
+                            "selection_rule": "synthetic predeclared selection",
                             "measurement_boundary": "pre_action",
                             "action_commitment_present": False,
                             "selected_positions": [1, 2, 3],
@@ -1340,7 +1464,9 @@ class TestSemanticArtifactValidation:
                     }
                 )
                 + "\n"
-                for request_id, stimulus_id in zip(request_ids, stimulus_ids, strict=True)
+                for index, (request_id, stimulus_id) in enumerate(
+                    zip(request_ids, stimulus_ids, strict=True)
+                )
             )
         )
         sidecar.write_text(
@@ -1352,16 +1478,12 @@ class TestSemanticArtifactValidation:
                     "stimuli_sha256": "stimuli-digest",
                     "rendered_sha256": "rendered-digest",
                     "tokenizer_identity": "tokenizer-digest",
-                    "records_sha256": hashlib.sha256(records.read_bytes()).hexdigest(),
+                    "records_sha256": "stale-record-digest-is-record-only",
                     "selection_manifest_path": str(selection_path),
                     "natural_state": "base",
                     "selection_manifest": {
-                        "request_ids": request_ids,
-                        "layers": [8, 16, 24],
-                        "rollout_ids_by_state": {
-                            "base": "base/step-0",
-                            "final": "trained/step-20",
-                        },
+                        **selection_payload,
+                        "path": str(selection_path),
                         "sha256": "selection-digest",
                     },
                 }
@@ -1380,6 +1502,17 @@ class TestSemanticArtifactValidation:
         )
 
         plan._validate_operation_artifacts(operation)
+        behavior_records[0]["pre_action_prefix"] = "edited synthetic prefix"
+        records.write_text(
+            "\n".join(json.dumps(row) for row in behavior_records) + "\n", encoding="utf-8"
+        )
+        with pytest.raises(RuntimeError, match=r"request-0.*pre_action_prefix"):
+            plan._validate_operation_artifacts(operation)
+
+        behavior_records[0]["pre_action_prefix"] = "synthetic prefix 0"
+        records.write_text(
+            "\n".join(json.dumps(row) for row in behavior_records) + "\n", encoding="utf-8"
+        )
         payload = json.loads(sidecar.read_text())
         payload["stimulus_ids"] = payload["stimulus_ids"][:-1]
         sidecar.write_text(json.dumps(payload))
@@ -1396,6 +1529,20 @@ class TestSemanticArtifactValidation:
         )
         artifacts: list[Path] = [ladder, *cell_dirs]
         request_ids = [f"request-{index}" for index in range(4)]
+        selection_payload = {
+            "version": 1,
+            "rollout_ids_by_state": {
+                "base": "base/step-0",
+                "final": "trained/step-20",
+            },
+            "request_ids": request_ids,
+            "scenario_groups": [f"group-{index}" for index in range(4)],
+            "selection_rule": "synthetic predeclared selection",
+            "layers": [8, 16, 24],
+        }
+        selection_path = _write(
+            tmp_path / "natural-selection.json", json.dumps(selection_payload).encode()
+        )
         for cell_dir in cell_dirs:
             natural_dir = cell_dir / "natural-prefix"
             manifest_path = natural_dir / "natural-prefix-manifest.json"
@@ -1409,14 +1556,14 @@ class TestSemanticArtifactValidation:
                     {
                         "identity": {
                             "natural_prefix_layers": [8, 16, 24],
-                            "natural_selection_manifest_sha256": "selection-digest",
+                            "natural_selection_manifest_sha256": "stale-selection-digest",
                             "hidden_size": 4096,
                         },
                         "stimulus_ids": stimulus_ids,
                         "selection_manifest": {
-                            "request_ids": request_ids,
-                            "layers": [8, 16, 24],
-                            "sha256": "selection-digest",
+                            **selection_payload,
+                            "path": str(selection_path),
+                            "sha256": "stale-selection-digest",
                         },
                         "selection_records": [
                             {"stimulus_id": stimulus_id, "request_id": request_id}
@@ -1434,11 +1581,28 @@ class TestSemanticArtifactValidation:
             tuple(artifacts),
             "--natural-prefix-layers",
             "8,16,24",
+            "--natural-selection-manifest",
+            str(selection_path),
         )
 
         plan._validate_operation_artifacts(operation)
         final_manifest = artifacts[-2]
+        manifest_payload = json.loads(final_manifest.read_text())
+        manifest_payload["selection_manifest"]["request_ids"] = [
+            "different-request",
+            *request_ids[1:],
+        ]
+        final_manifest.write_text(json.dumps(manifest_payload))
+        with pytest.raises(RuntimeError, match=r"selection_manifest.*request_ids"):
+            plan._validate_operation_artifacts(operation)
+
+        final_manifest = artifacts[-2]
         payload = json.loads(final_manifest.read_text())
+        payload["selection_manifest"] = {
+            **selection_payload,
+            "path": str(selection_path),
+            "sha256": "stale-selection-digest",
+        }
         payload["identity"]["natural_prefix_layers"] = [8, 16]
         final_manifest.write_text(json.dumps(payload))
         with pytest.raises(RuntimeError, match="layers"):
@@ -1529,9 +1693,19 @@ class TestSemanticArtifactValidation:
             )
         )
         report_payload: dict[str, Any] = {
-            "context": {"cpu_only": True},
+            "context": {"cpu_only": True, "export_pooling": "last"},
             "confound_checks": {},
-            "projections": [{}],
+            "projections": [
+                {
+                    "state": "final",
+                    "construct": "costly-other-regard",
+                    "pooling": "last",
+                    "layer": 16,
+                    "fit_direction_accuracy": 0.8,
+                    "fit_placebo_accuracy_max": 0.3,
+                    "fit_direction_norm": 2.0,
+                }
+            ],
             "displacements": [{}],
             "calibration_selection": {},
             "natural_prefix_cross_check": {
@@ -1562,7 +1736,7 @@ class TestSemanticArtifactValidation:
                     "layer": 16,
                     "magnitude": 1.0,
                     "alpha_multiplier": 0.5,
-                    "calibration_metric": "fit-only",
+                    "calibration_metric": 0.5,
                     "calibration_rationale": "opaque",
                     "expected_effect": "opaque",
                     "expectation_recorded_before_intervention": True,
@@ -1670,10 +1844,27 @@ class TestSemanticArtifactValidation:
         with pytest.raises(RuntimeError, match="model_weights_identity"):
             plan._validate_operation_artifacts(steering_operation)
 
-    def test_selected_target_is_bound_to_native_report_and_direction_bytes(
+    def test_selected_target_is_bound_to_readable_report_and_direction_fields(
         self, tmp_path: Path
     ) -> None:
-        report = _write(tmp_path / "geometry" / "cooperation_interp.json", b'{"native":true}\n')
+        report_payload = {
+            "context": {"export_pooling": "last"},
+            "projections": [
+                {
+                    "state": "final",
+                    "construct": "costly-other-regard",
+                    "pooling": "last",
+                    "layer": 16,
+                    "fit_direction_accuracy": 0.8,
+                    "fit_placebo_accuracy_max": 0.3,
+                    "fit_direction_norm": 2.0,
+                }
+            ],
+        }
+        report = _write(
+            tmp_path / "geometry" / "cooperation_interp.json",
+            json.dumps(report_payload).encode(),
+        )
         direction = _write(tmp_path / "geometry" / "directions" / "final" / "axis.pt", b"axis")
         direction_manifest = tmp_path / "geometry" / "direction-manifest.json"
         direction_manifest.write_text(
@@ -1698,16 +1889,16 @@ class TestSemanticArtifactValidation:
             "direction": "costly-other-regard",
             "target_construct": "costly-other-regard",
             "direction_path": str(direction),
-            "direction_sha256": hashlib.sha256(direction.read_bytes()).hexdigest(),
+            "direction_sha256": "stale-direction-digest-is-record-only",
             "layer": 16,
             "magnitude": 1.0,
             "alpha_multiplier": 0.5,
-            "calibration_metric": "fit-only",
+            "calibration_metric": 0.5,
             "calibration_rationale": "opaque",
             "expected_effect": "opaque",
             "expectation_recorded_before_intervention": True,
             "geometry_report_path": str(report.resolve()),
-            "geometry_report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+            "geometry_report_sha256": "stale-report-digest-is-record-only",
             "exploratory": True,
         }
         selection.write_text(json.dumps(payload))
@@ -1718,9 +1909,9 @@ class TestSemanticArtifactValidation:
         with pytest.raises(RuntimeError, match="target construct"):
             plan._validate_selected_target(report, direction_manifest, selection)
         payload["target_construct"] = "costly-other-regard"
-        payload["direction_sha256"] = "0" * 64
+        payload["calibration_metric"] = 0.4
         selection.write_text(json.dumps(payload))
-        with pytest.raises(RuntimeError, match="direction digest mismatch"):
+        with pytest.raises(RuntimeError, match=r"calibration_metric.*layer 16"):
             plan._validate_selected_target(report, direction_manifest, selection)
 
     def test_receipt_skip_revalidates_semantic_artifacts(self, tmp_path: Path) -> None:
@@ -1756,7 +1947,7 @@ class TestSemanticArtifactValidation:
             json.dumps(
                 {
                     "phase_identity": plan.phase_identity(phase),
-                    "outputs": {str(lens): plan._path_digest(lens)},
+                    "outputs": {str(lens): plan._path_inventory(lens)},
                 }
             )
         )

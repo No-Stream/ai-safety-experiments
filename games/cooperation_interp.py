@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -48,6 +49,7 @@ from games.interp_cells import (
     concept_activations,
     load_ladder,
     load_private_construct_stimuli,
+    load_stimuli,
     pair_layout,
     stimuli_digest,
 )
@@ -61,7 +63,7 @@ from reward_hacking.interp.eval_awareness_probe import (
 from reward_hacking.interp.linear_probe import ConceptActivations, ProbeConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
 logger = logging.getLogger("games.cooperation_interp")
 
@@ -623,6 +625,8 @@ class NaturalPrefixArtifact:
     tokenizer_identity: str
     kernel_identity: str
     capture_identity: dict[str, Any]
+    source_text_by_request: dict[str, tuple[str, str | None]] | None = None
+    stimulus_records_by_id: dict[str, dict[str, Any]] | None = None
 
 
 def _natural_manifest_path(path: Path) -> Path:
@@ -631,6 +635,168 @@ def _natural_manifest_path(path: Path) -> Path:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"natural-prefix artifact is missing: {manifest_path}")
     return manifest_path
+
+
+def _natural_source_records_by_id(
+    cell: CapturedCell, records: Sequence[Mapping[str, Any]]
+) -> dict[str, dict[str, Any]] | None:
+    """Read the private source rows only when the capture ladder still names that source file."""
+    ladder_path = next(
+        (
+            parent / "ladder-manifest.json"
+            for parent in (cell.source, *cell.source.parents)
+            if (parent / "ladder-manifest.json").is_file()
+        ),
+        None,
+    )
+    if ladder_path is None:
+        return None
+    ladder = cast("dict[str, Any]", json.loads(ladder_path.read_text(encoding="utf-8")))
+    source_paths = ladder.get("natural_prefix_stimuli_file")
+    if not isinstance(source_paths, Mapping):
+        return None
+    raw_source_path = source_paths.get(cell.label)
+    if not isinstance(raw_source_path, str) or not raw_source_path.strip():
+        return None
+    source_path = Path(raw_source_path)
+    if not source_path.is_absolute():
+        candidates = (source_path.resolve(), (ladder_path.parent / source_path).resolve())
+        source_path = next(
+            (candidate for candidate in candidates if candidate.is_file()), candidates[0]
+        )
+    if not source_path.is_file():
+        return None
+    stimuli = load_stimuli(source_path)
+    source_records_by_id: dict[str, dict[str, Any]] = {}
+    by_stimulus_id = {stimulus.stimulus_id: stimulus for stimulus in stimuli}
+    for record in records:
+        stimulus = by_stimulus_id.get(str(record["stimulus_id"]))
+        if stimulus is None:
+            raise CooperationInterpError(
+                f"natural source {source_path} omits stimulus id {record['stimulus_id']!r}"
+            )
+        if stimulus.stimulus_id in source_records_by_id:
+            raise CooperationInterpError(
+                f"natural source repeats stimulus id {stimulus.stimulus_id!r}"
+            )
+        source_records_by_id[stimulus.stimulus_id] = {
+            "stimulus_set": stimulus.stimulus_set,
+            "stimulus_id": stimulus.stimulus_id,
+            "side": stimulus.side,
+            "pair_id": stimulus.pair_id,
+            "text": stimulus.text,
+            "assistant_prefix": stimulus.assistant_prefix,
+            "metadata": dict(stimulus.metadata),
+        }
+    return source_records_by_id
+
+
+def _natural_stimulus_record(
+    stimulus_set: str, raw_row: object, index: int, path: Path
+) -> tuple[str, dict[str, Any]]:
+    required_row_fields = {
+        "stimulus_id",
+        "side",
+        "pair_id",
+        "text",
+        "assistant_prefix",
+        "metadata",
+    }
+    if not isinstance(raw_row, Mapping) or set(raw_row) != required_row_fields:
+        raise CooperationInterpError(
+            f"{path} stimulus_records[{stimulus_set!r}][{index}] has invalid fields"
+        )
+    row = cast("dict[str, Any]", raw_row)
+    stimulus_id = row["stimulus_id"]
+    if not isinstance(stimulus_id, str) or not stimulus_id.strip():
+        raise CooperationInterpError(f"{path} stimulus record has an invalid stimulus_id")
+    if any(
+        not isinstance(row[field], str) or not row[field].strip()
+        for field in ("side", "pair_id", "text")
+    ):
+        raise CooperationInterpError(
+            f"{path} stimulus record {stimulus_id!r} has invalid side, pair_id or text"
+        )
+    if row["assistant_prefix"] is not None and not isinstance(row["assistant_prefix"], str):
+        raise CooperationInterpError(
+            f"{path} stimulus record {stimulus_id!r} has an invalid assistant_prefix"
+        )
+    metadata = row["metadata"]
+    if not isinstance(metadata, Mapping):
+        raise CooperationInterpError(
+            f"{path} stimulus record {stimulus_id!r} metadata is not an object"
+        )
+    return stimulus_id, {
+        "stimulus_set": stimulus_set,
+        **dict(row),
+        "metadata": dict(metadata),
+    }
+
+
+def _natural_stimulus_records_by_id(
+    payload: Mapping[str, Any], path: Path, stimulus_ids: Sequence[str]
+) -> dict[str, dict[str, Any]] | None:
+    """Read capture-time stimulus rows without copying their private text into the readout."""
+    raw_records = payload.get("stimulus_records")
+    if raw_records is None:
+        return None
+    if not isinstance(raw_records, Mapping) or not raw_records:
+        raise CooperationInterpError(f"{path} stimulus_records must map stimulus sets to row lists")
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for stimulus_set, rows in raw_records.items():
+        if (
+            not isinstance(stimulus_set, str)
+            or not stimulus_set.strip()
+            or not isinstance(rows, list)
+        ):
+            raise CooperationInterpError(f"{path} stimulus_records has an invalid set or row list")
+        for index, raw_row in enumerate(rows):
+            stimulus_id, row = _natural_stimulus_record(stimulus_set, raw_row, index, path)
+            if stimulus_id in records_by_id:
+                raise CooperationInterpError(f"{path} stimulus_records repeats {stimulus_id!r}")
+            records_by_id[stimulus_id] = row
+    if set(records_by_id) != set(stimulus_ids):
+        raise CooperationInterpError(
+            f"{path} stimulus_records do not cover exactly the captured stimulus ids"
+        )
+    return records_by_id
+
+
+def _natural_stimulus_comparison_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep prompt identity while omitting metadata that necessarily changes by rollout state."""
+    metadata = cast("Mapping[str, Any]", record["metadata"])
+    return {
+        "stimulus_set": record["stimulus_set"],
+        "stimulus_id": record["stimulus_id"],
+        "side": record["side"],
+        "pair_id": record["pair_id"],
+        "text": record["text"],
+        "assistant_prefix": record["assistant_prefix"],
+        "metadata": {
+            key: value
+            for key, value in metadata.items()
+            if key not in {"natural_state", "rollout_id"}
+        },
+    }
+
+
+def _cell_adapter_metadata(cell: CapturedCell) -> dict[str, Any]:
+    """Expose the adapter path, checkpoint step, size and config when capture provenance has them."""
+    metadata: dict[str, Any] = {
+        "step": cell.step,
+        "applied_adapter_weights": cell.applied_adapter_weights,
+    }
+    adapter_path = cell.provenance.get("adapter_dir")
+    if isinstance(adapter_path, str) and adapter_path.strip():
+        resolved_path = Path(adapter_path).resolve()
+        metadata["adapter_path"] = str(resolved_path)
+        weights_path = resolved_path / "adapter_model.safetensors"
+        if weights_path.is_file():
+            metadata["adapter_weights_size_bytes"] = weights_path.stat().st_size
+    adapter_config = cell.provenance.get("adapter_config")
+    if isinstance(adapter_config, dict):
+        metadata["adapter_config"] = adapter_config
+    return metadata
 
 
 def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a durable artifact field by field
@@ -657,9 +823,11 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
         "rendered_sha256",
         "natural_state",
     }
-    if set(payload) != required:
+    allowed = required | {"stimulus_records"}
+    if not required <= set(payload) or not set(payload) <= allowed:
         raise CooperationInterpError(
-            f"{manifest_path} must contain natural-prefix fields {sorted(required)}"
+            f"{manifest_path} must contain natural-prefix fields {sorted(required)} "
+            "with only optional stimulus_records"
         )
     artifact_state = payload["natural_state"]
     if artifact_state != state:
@@ -698,16 +866,6 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
     rendered_sha256 = payload["rendered_sha256"]
     if not isinstance(rendered_sha256, str) or not rendered_sha256:
         raise CooperationInterpError(f"{manifest_path} records no rendered natural corpus digest")
-    identity_natural_stimuli_sha256 = identity.get("natural_prefix_stimuli_sha256")
-    if identity_natural_stimuli_sha256 not in (None, "", natural_stimuli_sha256):
-        raise CooperationInterpError(
-            f"{manifest_path} natural corpus digest disagrees with its identity"
-        )
-    identity_natural_rendered_sha256 = identity.get("natural_prefix_rendered_sha256")
-    if identity_natural_rendered_sha256 not in (None, "", rendered_sha256):
-        raise CooperationInterpError(
-            f"{manifest_path} rendered natural corpus digest disagrees with its identity"
-        )
     layers = tuple(int(layer) for layer in identity["natural_prefix_layers"])
     if not layers or len(set(layers)) != len(layers):
         raise CooperationInterpError(
@@ -738,12 +896,6 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
     if not isinstance(raw_selection_manifest, dict):
         raise CooperationInterpError(f"{manifest_path} selection_manifest is not an object")
     selection_manifest = cast("dict[str, Any]", raw_selection_manifest)
-    selection_digest = selection_manifest.get("sha256")
-    identity_selection_digest = str(identity.get("natural_selection_manifest_sha256", ""))
-    if not identity_selection_digest or selection_digest != identity_selection_digest:
-        raise CooperationInterpError(
-            f"{manifest_path} selection manifest digest does not match its capture identity"
-        )
     request_ids = tuple(str(value) for value in selection_manifest.get("request_ids", ()))
     if not request_ids or len(set(request_ids)) != len(request_ids):
         raise CooperationInterpError(
@@ -816,12 +968,14 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
         "arm": cell.arm,
         "step": cell.step,
         "applied_adapter_weights": cell.applied_adapter_weights,
-        "adapter_weights_sha256": cell.adapter_weights_sha256,
     }
-    if capture_identity != expected_capture:
+    compared_capture_identity = {
+        key: value for key, value in capture_identity.items() if key != "adapter_weights_sha256"
+    }
+    if compared_capture_identity != expected_capture:
         raise CooperationInterpError(
             f"{manifest_path} natural-prefix capture identity does not match {cell.label}: "
-            f"{capture_identity} != {expected_capture}"
+            f"{compared_capture_identity} != {expected_capture}"
         )
     activation_path = manifest_path.parent / NATURAL_PREFIX_ACTIVATIONS_FILENAME
     if not activation_path.is_file():
@@ -866,6 +1020,39 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
             raise CooperationInterpError(
                 f"{manifest_path} states shape for {stimulus_id!r} disagrees with activations"
             )
+    stimulus_records_by_id = _natural_stimulus_records_by_id(payload, manifest_path, stimulus_ids)
+    source_records_by_id = _natural_source_records_by_id(cell, records)
+    if stimulus_records_by_id is not None and source_records_by_id is not None:
+        changed_stimulus_fields = {
+            stimulus_id: sorted(
+                field
+                for field in set(stimulus_records_by_id.get(stimulus_id, {}))
+                | set(source_records_by_id.get(stimulus_id, {}))
+                if stimulus_records_by_id.get(stimulus_id, {}).get(field)
+                != source_records_by_id.get(stimulus_id, {}).get(field)
+            )
+            for stimulus_id in set(stimulus_records_by_id) | set(source_records_by_id)
+        }
+        changed_stimulus_fields = {
+            stimulus_id: fields for stimulus_id, fields in changed_stimulus_fields.items() if fields
+        }
+        if changed_stimulus_fields:
+            raise CooperationInterpError(
+                f"{manifest_path} stimulus fields differ from the named source by id: "
+                f"{dict(sorted(changed_stimulus_fields.items()))}"
+            )
+    source_text_by_request: dict[str, tuple[str, str | None]] | None = None
+    if stimulus_records_by_id is None and source_records_by_id is not None:
+        source_text_by_request = {}
+        for record in records:
+            request_id = str(record["request_id"])
+            if request_id in source_text_by_request:
+                raise CooperationInterpError(f"natural source repeats request id {request_id!r}")
+            source_record = source_records_by_id[str(record["stimulus_id"])]
+            source_text_by_request[request_id] = (
+                str(source_record["text"]),
+                cast("str | None", source_record["assistant_prefix"]),
+            )
     return NaturalPrefixArtifact(
         state=state,
         path=manifest_path.parent,
@@ -878,6 +1065,8 @@ def load_natural_prefix_artifact(  # noqa: C901, PLR0912, PLR0915 - validates a 
         tokenizer_identity=str(identity["tokenizer_identity"]),
         kernel_identity=str(identity["kernel_identity"]),
         capture_identity=capture_identity,
+        source_text_by_request=source_text_by_request,
+        stimulus_records_by_id=stimulus_records_by_id,
     )
 
 
@@ -885,6 +1074,7 @@ def natural_prefix_cross_check(  # noqa: C901, PLR0912, PLR0915 - explicit artif
     artifacts: Mapping[str, NaturalPrefixArtifact], result: CooperationInterpResult
 ) -> dict[str, Any]:
     """Describe selected positions, construct-axis projections, and base/final deltas."""
+    source_text_comparison = "unavailable"
     if artifacts:
         stable_manifest_fields = (
             "version",
@@ -997,10 +1187,6 @@ def natural_prefix_cross_check(  # noqa: C901, PLR0912, PLR0915 - explicit artif
     final_artifact = artifacts.get(STATE_FINAL)
     content_confounding_reasons: list[str] = []
     if base_artifact is not None and final_artifact is not None:
-        if base_artifact.natural_stimuli_sha256 != final_artifact.natural_stimuli_sha256:
-            content_confounding_reasons.append("natural stimulus corpus digests differ")
-        if base_artifact.rendered_sha256 != final_artifact.rendered_sha256:
-            content_confounding_reasons.append("rendered natural prefix digests differ")
         positions_by_request = {
             state: {
                 str(record["request_id"]): tuple(int(value) for value in record["positions"])
@@ -1019,6 +1205,43 @@ def natural_prefix_cross_check(  # noqa: C901, PLR0912, PLR0915 - explicit artif
             for record in final_artifact.selection_records
         }
         common_ids = sorted(set(base_stimulus_by_request) & set(final_stimulus_by_request))
+        if base_stimulus_by_request != final_stimulus_by_request:
+            content_confounding_reasons.append("selected stimulus ids differ by request id")
+        if (
+            base_artifact.stimulus_records_by_id is not None
+            and final_artifact.stimulus_records_by_id is not None
+        ):
+            source_text_comparison = "available"
+            common_requests = sorted(set(base_stimulus_by_request) & set(final_stimulus_by_request))
+            if any(
+                _natural_stimulus_comparison_fields(
+                    base_artifact.stimulus_records_by_id[base_stimulus_by_request[request_id]]
+                )
+                != _natural_stimulus_comparison_fields(
+                    final_artifact.stimulus_records_by_id[final_stimulus_by_request[request_id]]
+                )
+                for request_id in common_requests
+            ):
+                content_confounding_reasons.append(
+                    "captured stimulus content differs under a shared request id"
+                )
+        elif (
+            base_artifact.source_text_by_request is not None
+            and final_artifact.source_text_by_request is not None
+        ):
+            source_text_comparison = "available"
+            common_requests = sorted(
+                set(base_artifact.source_text_by_request)
+                & set(final_artifact.source_text_by_request)
+            )
+            if any(
+                base_artifact.source_text_by_request[request_id]
+                != final_artifact.source_text_by_request[request_id]
+                for request_id in common_requests
+            ):
+                content_confounding_reasons.append(
+                    "source stimulus text or assistant prefix differs under a shared request id"
+                )
         common_layers = sorted(set(base_artifact.layers) & set(final_artifact.layers))
         base_index = {layer: index for index, layer in enumerate(base_artifact.layers)}
         final_index = {layer: index for index, layer in enumerate(final_artifact.layers)}
@@ -1048,11 +1271,17 @@ def natural_prefix_cross_check(  # noqa: C901, PLR0912, PLR0915 - explicit artif
         "supported": bool(artifacts),
         "content_confounding": {
             "present": bool(content_confounding_reasons),
+            "source_text_comparison": (
+                source_text_comparison
+                if base_artifact is not None and final_artifact is not None
+                else "unavailable"
+            ),
             "reasons": content_confounding_reasons,
             "basis": (
-                "Natural rollout text and selected positions may differ by state. Deltas join on "
-                "stable predeclared request IDs and are descriptive, so they combine content and "
-                "checkpoint effects."
+                "Captured stimulus records are compared by stimulus ID when both manifests retain "
+                "them; legacy captures fall back to current private source files when available. "
+                "Selected positions are compared by request ID. Recorded content digests are "
+                "metadata, not identity gates."
             ),
             "stimuli_sha256_by_state": {
                 state: artifact.natural_stimuli_sha256
@@ -1086,6 +1315,7 @@ def _select_calibration_target(  # noqa: PLR0913 - selection binds geometry, fil
     *,
     preferred_pooling: str,
     geometry_report_path: Path,
+    geometry_report_step: int,
     geometry_report_sha256: str,
     expectation: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1120,12 +1350,6 @@ def _select_calibration_target(  # noqa: PLR0913 - selection binds geometry, fil
     resolved_report_path = geometry_report_path.resolve()
     if not resolved_report_path.is_file():
         raise FileNotFoundError(f"geometry report is missing: {resolved_report_path}")
-    actual_report_sha256 = sha256_of_file(resolved_report_path)
-    if actual_report_sha256 != geometry_report_sha256:
-        raise CooperationInterpError(
-            f"geometry report digest changed before selected-target write: "
-            f"{geometry_report_sha256} != {actual_report_sha256}"
-        )
     calibration_margin = chosen.fit_direction_accuracy - chosen.fit_placebo_accuracy_max
     return {
         "schema": "cooperation-generalization-selected-target/v1",
@@ -1133,6 +1357,7 @@ def _select_calibration_target(  # noqa: PLR0913 - selection binds geometry, fil
         "target_construct": target_construct,
         "direction": chosen.construct,
         "direction_path": str(path),
+        "direction_values": direction.detach().cpu().reshape(-1).tolist(),
         "layer": chosen.layer,
         "magnitude": magnitude,
         "alpha_multiplier": alpha_multiplier,
@@ -1150,6 +1375,7 @@ def _select_calibration_target(  # noqa: PLR0913 - selection binds geometry, fil
         "exploratory": True,
         "direction_sha256": sha256_of_file(path),
         "geometry_report_path": str(resolved_report_path),
+        "geometry_report_step": geometry_report_step,
         "geometry_report_sha256": geometry_report_sha256,
     }
 
@@ -1473,6 +1699,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         arms=[args.final_arm],
         steps=[args.final_step],
         stimuli_sha256=digest,
+        stimuli=stimuli,
         require_capture_provenance=args.require_capture_provenance,
     )
     expected = {f"{BASE_ARM}/step-{BASE_STEP}", f"{args.final_arm}/step-{args.final_step}"}
@@ -1521,7 +1748,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "cell_identities": {
                 cell.label: {
                     "identity": cell.identity.to_payload(),
-                    "applied_adapter_weights": cell.applied_adapter_weights,
+                    **_cell_adapter_metadata(cell),
                     "adapter_weights_sha256": cell.adapter_weights_sha256,
                 }
                 for cell in ladder.cells
@@ -1554,6 +1781,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         direction_paths,
         preferred_pooling=result.export_pooling,
         geometry_report_path=report_path,
+        geometry_report_step=args.final_step,
         geometry_report_sha256=geometry_report_sha256,
         expectation=expectation,
     )

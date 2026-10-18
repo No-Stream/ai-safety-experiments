@@ -105,7 +105,11 @@ from reward_hacking.interp.directions import (
 )
 from reward_hacking.interp.generation_capture import resolved_sampler_for
 from reward_hacking.interp.jacobian import resolve_weights_identity
-from reward_hacking.interp.jsonl_resume import resume_records
+from reward_hacking.interp.jsonl_resume import (
+    ResumeMismatchError,
+    normalize_identity,
+    resume_records,
+)
 from reward_hacking.interp.steering import ablation_hook, residual_intervention, steering_hook
 from reward_hacking.interp.vllm_interventions import (
     InterventionSpec,
@@ -239,6 +243,9 @@ SELECTED_TARGET_COLUMNS: frozenset[str] = frozenset(
         "exploratory",
     }
 )
+SELECTED_TARGET_READABLE_COLUMNS: frozenset[str] = frozenset(
+    {"direction_values", "geometry_report_step"}
+)
 ADAPTER_WEIGHT_FILENAMES: tuple[str, ...] = ("adapter_model.safetensors", "adapter_model.bin")
 
 ALLOCATION_TEMPLATE_FIELDS: frozenset[str] = frozenset(
@@ -316,19 +323,20 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
 ) -> dict[str, Any]:
     """Load one calibration-only target and translate it into a generation cell.
 
-    The geometry leg owns this artifact.  Keeping the target's direction path and digest beside
-    the chosen layer and scale prevents a caller from silently pairing a calibration result with a
-    same-named direction file from another endpoint.  ``path`` is retained in the returned payload
-    so both the resume identity and the report bind the exact selection artifact bytes.
+    The geometry leg owns this artifact. The selected vector and layer bind the target to the
+    currently loaded direction. The report path and selected step identify the source read; digest
+    fields remain metadata for older artifacts.
     """
+    del direction_paths
     target_path = path.resolve()
     payload = json.loads(target_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError(f"selected target {target_path} must be a JSON object.")
     actual_columns = frozenset(payload)
-    if actual_columns != SELECTED_TARGET_COLUMNS:
-        missing = sorted(SELECTED_TARGET_COLUMNS - actual_columns)
-        extra = sorted(actual_columns - SELECTED_TARGET_COLUMNS)
+    allowed_columns = SELECTED_TARGET_COLUMNS | SELECTED_TARGET_READABLE_COLUMNS
+    missing = sorted(SELECTED_TARGET_COLUMNS - actual_columns)
+    extra = sorted(actual_columns - allowed_columns)
+    if missing or extra:
         raise ValueError(
             f"selected target {target_path} has unsupported fields; missing={missing} extra={extra}."
         )
@@ -345,7 +353,10 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
             f"selected target construct {target_construct!r} does not match direction "
             f"{direction_name!r}."
         )
-    direction_path = Path(str(payload["direction_path"])).expanduser().resolve()
+    direction_path_value = payload["direction_path"]
+    if not isinstance(direction_path_value, str) or not direction_path_value.strip():
+        raise ValueError("selected target direction_path must be non-empty text.")
+    direction_path = Path(direction_path_value).expanduser().resolve()
     if not isinstance(direction_name, str) or not direction_name.strip():
         raise TypeError("selected target direction must be a non-empty string.")
     if direction_name not in directions:
@@ -353,32 +364,21 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
             f"selected target names direction {direction_name!r}, but --direction provides "
             f"{sorted(directions)}."
         )
-    if direction_paths is not None:
-        expected_path = direction_paths[direction_name].expanduser().resolve()
-        if direction_path != expected_path:
-            raise ValueError(
-                f"selected target direction_path {direction_path} does not match --direction "
-                f"{direction_name}={expected_path}."
+    selected_values = payload.get("direction_values")
+    if selected_values is None:
+        if not direction_path.is_file():
+            raise FileNotFoundError(
+                f"legacy selected target direction_path {direction_path} is not a direction file."
             )
-    if not direction_path.is_file():
-        raise FileNotFoundError(
-            f"selected target direction_path {direction_path} is not a direction file."
-        )
-    expected_digest = payload["direction_sha256"]
-    if (
-        not isinstance(expected_digest, str)
-        or len(expected_digest) != SHA256_HEX_LENGTH
-        or any(character not in "0123456789abcdef" for character in expected_digest)
-    ):
-        raise ValueError(
-            "selected target direction_sha256 must be a lowercase 64-character hex digest."
-        )
-    actual_digest = sha256_of_file(direction_path)
-    if expected_digest != actual_digest:
-        raise ValueError(
-            f"selected target direction_sha256 {expected_digest} does not match {direction_path} "
-            f"({actual_digest})."
-        )
+        expected_digest = payload["direction_sha256"]
+        if not isinstance(expected_digest, str) or len(expected_digest) != SHA256_HEX_LENGTH:
+            raise ValueError(
+                "legacy selected target direction_sha256 must be a 64-character digest."
+            )
+        if expected_digest != sha256_of_file(direction_path):
+            raise ValueError(
+                "legacy selected target direction_sha256 does not match its direction file."
+            )
     layer = payload["layer"]
     if isinstance(layer, bool) or not isinstance(layer, int):
         raise TypeError("selected target layer must be an integer.")
@@ -387,6 +387,23 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
             f"selected target layer {layer} is absent from direction {direction_name!r}; "
             f"available layers are {sorted(directions[direction_name])}."
         )
+    loaded_direction = directions[direction_name][layer].detach().float().cpu()
+    if selected_values is not None:
+        if not isinstance(selected_values, list) or any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            for value in selected_values
+        ):
+            raise ValueError("selected target direction_values must be a list of finite numbers.")
+        selected_direction = torch.tensor(selected_values, dtype=loaded_direction.dtype)
+        if selected_direction.shape != loaded_direction.shape or not torch.equal(
+            selected_direction, loaded_direction
+        ):
+            raise ValueError(
+                f"selected target direction_values do not match direction {direction_name!r} "
+                f"at layer {layer}."
+            )
     magnitude = payload["magnitude"]
     alpha_multiplier = payload["alpha_multiplier"]
     calibration_metric = payload["calibration_metric"]
@@ -420,13 +437,9 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
     if payload["exploratory"] is not True:
         raise ValueError("selected target exploratory must be true.")
     report_digest = payload["geometry_report_sha256"]
-    if (
-        not isinstance(report_digest, str)
-        or len(report_digest) != SHA256_HEX_LENGTH
-        or any(character not in "0123456789abcdef" for character in report_digest)
-    ):
+    if not isinstance(report_digest, str) or len(report_digest) != SHA256_HEX_LENGTH:
         raise ValueError(
-            "selected target geometry_report_sha256 must be a lowercase 64-character hex digest."
+            "selected target geometry_report_sha256 metadata must be a 64-character digest."
         )
     report_path_value = payload["geometry_report_path"]
     if not isinstance(report_path_value, str) or not report_path_value.strip():
@@ -436,18 +449,20 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
         raise FileNotFoundError(
             f"selected target geometry_report_path {report_path} is not a report file."
         )
-    actual_report_digest = sha256_of_file(report_path)
-    if report_digest != actual_report_digest:
-        raise ValueError(
-            f"selected target geometry_report_sha256 {report_digest} does not match "
-            f"{report_path} ({actual_report_digest})."
-        )
+    report_step = payload.get("geometry_report_step")
+    if report_step is not None and (
+        isinstance(report_step, bool) or not isinstance(report_step, int) or report_step < 0
+    ):
+        raise ValueError("selected target geometry_report_step must be a non-negative integer.")
+    if selected_values is not None and report_step is None:
+        raise ValueError("readable selected targets must include geometry_report_step.")
     return {
         "path": str(target_path),
         "sha256": sha256_of_file(target_path),
         "payload": dict(payload),
         "geometry_report_path": str(report_path),
-        "geometry_report_sha256": actual_report_digest,
+        "geometry_report_sha256": report_digest,
+        "geometry_report_step": report_step,
         "cell": {
             "direction": direction_name,
             "layer": layer,
@@ -473,6 +488,7 @@ def adapter_identity(adapter_dir: Path, *, applied_adapter_weights: int | None) 
         "path": str(resolved),
         "config": adapter_config_identity(resolved),
         "weights_filename": weight_paths[0].name,
+        "weights_size_bytes": weight_paths[0].stat().st_size,
         "weights_sha256": sha256_of_file(weight_paths[0]),
         "applied_adapter_weights": applied_adapter_weights,
     }
@@ -558,7 +574,9 @@ def run_fit_direction(args: argparse.Namespace) -> dict[str, Any]:
     """Fit per-layer diff-of-means directions from one cell and save them with a JSON sidecar."""
     stimuli = load_stimuli(args.stimuli)
     digest = stimuli_digest(stimuli)
-    ladder = load_ladder(args.capture_root, arms=None, steps=None, stimuli_sha256=digest)
+    ladder = load_ladder(
+        args.capture_root, arms=None, steps=None, stimuli=stimuli, stimuli_sha256=digest
+    )
     cell = ladder.cell(args.arm, args.step)
     layout, pairs = fit_pair_indices(
         cell, args.set, positive_side=args.positive_side, pairs=args.pairs
@@ -1815,6 +1833,49 @@ def directions_digest(directions: Mapping[str, Mapping[int, torch.Tensor]]) -> d
     return digests
 
 
+def directions_values(
+    directions: Mapping[str, Mapping[int, torch.Tensor]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return ordered layer names and vector coordinates for a readable resume identity."""
+    return {
+        name: [
+            {"layer": layer, "values": by_layer[layer].detach().float().cpu().tolist()}
+            for layer in sorted(by_layer)
+        ]
+        for name, by_layer in directions.items()
+    }
+
+
+def selected_target_identity(target: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Keep selected-target identity to the named measurement fields, without artifact hashes."""
+    if target is None:
+        return None
+    payload = cast("Mapping[str, Any]", target["payload"])
+    return {
+        "direction": payload["direction"],
+        "direction_values": payload.get("direction_values"),
+        "layer": payload["layer"],
+        "magnitude": payload["magnitude"],
+        "alpha_multiplier": payload["alpha_multiplier"],
+        "calibration_metric": payload["calibration_metric"],
+        "calibration_rationale": payload["calibration_rationale"],
+        "expected_effect": payload["expected_effect"],
+        "expectation_recorded_before_intervention": payload[
+            "expectation_recorded_before_intervention"
+        ],
+        "geometry_report_path": payload["geometry_report_path"],
+        "geometry_report_step": payload.get("geometry_report_step"),
+        "exploratory": payload["exploratory"],
+    }
+
+
+def adapter_resume_identity(adapter: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Use adapter location, config and applied step as identity; retain tensor hash as metadata."""
+    if adapter is None:
+        return None
+    return {key: value for key, value in adapter.items() if key != "weights_sha256"}
+
+
 def generation_identity(  # noqa: PLR0913 - an identity is every argument a record depends on
     args: argparse.Namespace,
     conditions: Sequence[GenerationCondition],
@@ -1830,15 +1891,14 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     weights_identity: str,
     deltanet_kernel: Mapping[str, str],
     subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None = None,
-    banned_tokens_sha256: str | None = None,
+    banned_token_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Everything a generation record depends on, for the resume ledger to compare against.
 
     Deliberately excludes ``--conditions`` and ``--deadline``: those select which conditions RUN,
     never what a record contains, so a gap-fill or a deadline-cut run is the same measurement.
-    The rendered prompts enter as a digest rather than a count: the rows come off the prompt
-    renderer at whatever commit the relaunch runs, and a renderer that moved between two commits
-    would otherwise resume the same number of different prompts into one file.
+    Prompt text and rendered rows are stored directly in this gitignored run artifact, so identity
+    drift names the prompt field that changed instead of only a digest.
 
     The base model enters twice, as the name the flags gave and as what that name resolves to
     (a hub revision or a local digest, :func:`resolve_weights_identity`): a hub id whose revision
@@ -1863,25 +1923,23 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
         "seed": args.seed,
         "placebo_seed": placebo_seed,
         "n_prompts": len(prompts),
-        "prompts_sha256": digest_of_strings(prompts),
-        "rendered_rows_sha256": rendered_rows_digest(rows),
-        "rows_sha256": rendered_rows_digest(rows),
+        "prompt_texts": list(prompts),
+        "rendered_rows": [dict(row) for row in rows],
         "sample_indices": list(sample_indices),
         "n_samples": args.n_samples,
-        "selected_target": None if selected_target is None else dict(selected_target),
-        "adapter": None if adapter is None else dict(adapter),
+        "selected_target": selected_target_identity(selected_target),
+        "adapter": adapter_resume_identity(adapter),
         "batch_size": args.batch_size,
         "max_new_tokens": args.max_new_tokens,
         "counterpart_framing": args.counterpart_framing,
         "diagnostic_profile": args.diagnostic_profile,
-        "row_manifest": None if args.row_manifest is None else str(args.row_manifest),
         "condition_keys": [condition_key(condition) for condition in conditions],
         "direction_names": list(directions),
-        "directions_sha256": directions_digest(directions),
-        "subspace_sha256": None
+        "direction_values": directions_values(directions),
+        "subspace_values": None
         if subspace_bundles is None
-        else directions_digest(subspace_bundles),
-        "banned_tokens_sha256": banned_tokens_sha256,
+        else directions_values(subspace_bundles),
+        "banned_token_ids": sorted({int(token_id) for token_id in banned_token_ids}),
         "resolved_sampler": dict(sampler_payload),
     }
     if args.framings:
@@ -1889,6 +1947,168 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     if args.backend != "hf":
         identity["backend"] = args.backend
     return identity
+
+
+def legacy_generation_identity(  # noqa: PLR0913 - mirrors the on-disk identity from prior releases
+    args: argparse.Namespace,
+    conditions: Sequence[GenerationCondition],
+    directions: Mapping[str, Mapping[int, torch.Tensor]],
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    prompts: Sequence[str],
+    sample_indices: Sequence[int],
+    placebo_seed: int,
+    selected_target: Mapping[str, Any] | None,
+    adapter: Mapping[str, Any] | None,
+    sampler_payload: Mapping[str, Any],
+    weights_identity: str,
+    deltanet_kernel: Mapping[str, str],
+    subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None,
+    banned_tokens_sha256: str | None,
+) -> dict[str, Any]:
+    """Rebuild the digest-valued v1 identity so existing ledgers can be checked once."""
+    legacy = generation_identity(
+        args,
+        conditions,
+        directions,
+        rows=rows,
+        prompts=prompts,
+        sample_indices=sample_indices,
+        placebo_seed=placebo_seed,
+        selected_target=selected_target,
+        adapter=adapter,
+        sampler_payload=sampler_payload,
+        weights_identity=weights_identity,
+        deltanet_kernel=deltanet_kernel,
+        subspace_bundles=subspace_bundles,
+    )
+    for field_name in (
+        "prompt_texts",
+        "rendered_rows",
+        "direction_values",
+        "subspace_values",
+        "banned_token_ids",
+    ):
+        legacy.pop(field_name)
+    legacy.update(
+        {
+            "prompts_sha256": digest_of_strings(prompts),
+            "rendered_rows_sha256": rendered_rows_digest(rows),
+            "rows_sha256": rendered_rows_digest(rows),
+            "selected_target": None if selected_target is None else dict(selected_target),
+            "adapter": None if adapter is None else dict(adapter),
+            "row_manifest": None if args.row_manifest is None else str(args.row_manifest),
+            "directions_sha256": directions_digest(directions),
+            "subspace_sha256": (
+                None if subspace_bundles is None else directions_digest(subspace_bundles)
+            ),
+            "banned_tokens_sha256": banned_tokens_sha256,
+        }
+    )
+    return legacy
+
+
+def _legacy_selected_target_identity(
+    target: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project an old selected-target payload onto stable semantic fields, ignoring file hashes."""
+    if target is None:
+        return None
+    payload = cast("Mapping[str, Any]", target["payload"])
+    ignored_payload_fields = {
+        "direction_path",
+        "direction_sha256",
+        "geometry_report_sha256",
+        *SELECTED_TARGET_READABLE_COLUMNS,
+    }
+    return {
+        "payload": {
+            key: value for key, value in payload.items() if key not in ignored_payload_fields
+        },
+        "geometry_report_path": target.get("geometry_report_path"),
+        "cell": target.get("cell"),
+    }
+
+
+def legacy_generation_identity_matches(
+    stored_identity: Mapping[str, Any], expected_legacy_identity: Mapping[str, Any]
+) -> bool:
+    """Check an old ledger against current inputs before upgrading it to readable fields."""
+    stored = normalize_identity(stored_identity)
+    expected = normalize_identity(expected_legacy_identity)
+    stored_target = stored.pop("selected_target", None)
+    expected_target = expected.pop("selected_target", None)
+    return stored == expected and _legacy_selected_target_identity(stored_target) == (
+        _legacy_selected_target_identity(expected_target)
+    )
+
+
+def _changed_rendered_row_ids(
+    stored_rows: Sequence[Mapping[str, Any]],
+    requested_rows: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    """Return prompt IDs whose rendered row fields or row order changed."""
+    stored_by_id = {str(row["prompt_id"]): row for row in stored_rows}
+    requested_by_id = {str(row["prompt_id"]): row for row in requested_rows}
+    changed = {
+        prompt_id
+        for prompt_id in set(stored_by_id) | set(requested_by_id)
+        if stored_by_id.get(prompt_id) != requested_by_id.get(prompt_id)
+    }
+    stored_ids = [str(row["prompt_id"]) for row in stored_rows]
+    requested_ids = [str(row["prompt_id"]) for row in requested_rows]
+    if stored_ids != requested_ids:
+        for prompt_index in range(max(len(stored_ids), len(requested_ids))):
+            if (
+                prompt_index >= len(stored_ids)
+                or prompt_index >= len(requested_ids)
+                or stored_ids[prompt_index] != requested_ids[prompt_index]
+            ):
+                if prompt_index < len(requested_ids):
+                    changed.add(requested_ids[prompt_index])
+                if prompt_index < len(stored_ids):
+                    changed.add(stored_ids[prompt_index])
+    return changed
+
+
+def _changed_prompt_text_ids(
+    stored_prompts: Sequence[str],
+    requested_prompts: Sequence[str],
+    stored_rows: Sequence[Mapping[str, Any]],
+    requested_rows: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    """Map changed prompt-text positions to their readable prompt IDs."""
+    changed: set[str] = set()
+    if stored_prompts == requested_prompts:
+        return changed
+    for prompt_index in range(max(len(stored_prompts), len(requested_prompts))):
+        if (
+            prompt_index >= len(stored_prompts)
+            or prompt_index >= len(requested_prompts)
+            or stored_prompts[prompt_index] != requested_prompts[prompt_index]
+        ):
+            if prompt_index < len(requested_rows):
+                changed.add(str(requested_rows[prompt_index]["prompt_id"]))
+            elif prompt_index < len(stored_rows):
+                changed.add(str(stored_rows[prompt_index]["prompt_id"]))
+    return changed
+
+
+def changed_prompt_ids(
+    stored_identity: Mapping[str, Any], requested_identity: Mapping[str, Any]
+) -> list[str]:
+    """Name changed prompt rows without putting their private text in an exception message."""
+    stored_rows = cast("Sequence[Mapping[str, Any]]", stored_identity.get("rendered_rows", ()))
+    requested_rows = cast(
+        "Sequence[Mapping[str, Any]]", requested_identity.get("rendered_rows", ())
+    )
+    changed = _changed_rendered_row_ids(stored_rows, requested_rows)
+    stored_prompts = cast("Sequence[str]", stored_identity.get("prompt_texts", ()))
+    requested_prompts = cast("Sequence[str]", requested_identity.get("prompt_texts", ()))
+    changed.update(
+        _changed_prompt_text_ids(stored_prompts, requested_prompts, stored_rows, requested_rows)
+    )
+    return sorted(changed)
 
 
 def condition_intervention(  # noqa: PLR0913 - existing steering controls plus optional subspaces
@@ -2572,26 +2792,64 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     condition_seconds: dict[str, float] = {}
     args.out_dir.mkdir(parents=True, exist_ok=True)
     records_path = args.out_dir / GENERATION_RECORDS_FILENAME
+    identity = generation_identity(
+        args,
+        conditions,
+        directions,
+        rows=rows,
+        prompts=prompts,
+        sample_indices=sample_indices,
+        placebo_seed=placebo_seed,
+        selected_target=selected_target,
+        adapter=adapter,
+        sampler_payload=sampler_payload,
+        weights_identity=weights_identity,
+        deltanet_kernel=deltanet_kernel,
+        subspace_bundles=subspace_bundles,
+        banned_token_ids=banned_token_ids,
+    )
+    previous_identity = legacy_generation_identity(
+        args,
+        conditions,
+        directions,
+        rows=rows,
+        prompts=prompts,
+        sample_indices=sample_indices,
+        placebo_seed=placebo_seed,
+        selected_target=selected_target,
+        adapter=adapter,
+        sampler_payload=sampler_payload,
+        weights_identity=weights_identity,
+        deltanet_kernel=deltanet_kernel,
+        subspace_bundles=subspace_bundles,
+        banned_tokens_sha256=banned_tokens_digest,
+    )
+
+    def legacy_identity_compatible(
+        requested_identity: Mapping[str, Any],
+        stored_identity: Mapping[str, Any],
+        completed_records: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        del completed_records
+        prompt_ids = changed_prompt_ids(stored_identity, requested_identity)
+        has_readable_prompt_identity = (
+            "rendered_rows" in stored_identity or "prompt_texts" in stored_identity
+        )
+        if has_readable_prompt_identity and prompt_ids:
+            raise ResumeMismatchError(
+                f"{records_path} identity fields prompt_texts/rendered_rows differ for prompt_ids "
+                f"{prompt_ids}; use a fresh --out-dir for changed prompts."
+            )
+        return normalize_identity(requested_identity) == normalize_identity(
+            identity
+        ) and legacy_generation_identity_matches(stored_identity, previous_identity)
+
     resume_state, ledger = resume_records(
         records_path,
-        identity=generation_identity(
-            args,
-            conditions,
-            directions,
-            rows=rows,
-            prompts=prompts,
-            sample_indices=sample_indices,
-            placebo_seed=placebo_seed,
-            selected_target=selected_target,
-            adapter=adapter,
-            sampler_payload=sampler_payload,
-            weights_identity=weights_identity,
-            deltanet_kernel=deltanet_kernel,
-            subspace_bundles=subspace_bundles,
-            banned_tokens_sha256=banned_tokens_digest,
-        ),
+        identity=identity,
         unit_of=lambda record: str(record["condition_key"]),
         record_key_of=generation_record_key if args.backend == "vllm" else None,
+        legacy_identity_compatible=legacy_identity_compatible,
     )
     records: list[dict[str, Any]] = list(resume_state.kept_records)
     records_by_key = {generation_record_key(record): record for record in records}

@@ -39,7 +39,11 @@ from games.prompt_variants import (
     apply_prompt_variant,
 )
 from games.provenance import git_provenance
-from games.select_prompts import META_RECORD_KIND, SWEEP_RECORD_KIND
+from games.select_prompts import (
+    META_RECORD_KIND,
+    PARTIAL_HEADER_RECORD_KIND,
+    SWEEP_RECORD_KIND,
+)
 from reward_hacking import backend_cli
 from reward_hacking.interp.jacobian import resolve_weights_identity
 
@@ -160,6 +164,32 @@ def _canonical_mapping(value: object, *, context: str) -> dict[str, Any]:
     if not isinstance(canonical, dict) or any(not isinstance(key, str) for key in canonical):
         raise TypeError(f"{context} must be a JSON object")
     return dict(canonical)
+
+
+def _identity_differences(expected: object, found: object, *, field_path: str) -> list[str]:
+    if isinstance(expected, Mapping) and isinstance(found, Mapping):
+        differences: list[str] = []
+        for key in sorted(set(expected) | set(found), key=str):
+            child_path = f"{field_path}.{key}"
+            if key not in expected or key not in found:
+                differences.append(child_path)
+            else:
+                differences.extend(
+                    _identity_differences(expected[key], found[key], field_path=child_path)
+                )
+        return differences
+    if isinstance(expected, list) and isinstance(found, list):
+        differences = []
+        for index in range(max(len(expected), len(found))):
+            child_path = f"{field_path}[{index}]"
+            if index >= len(expected) or index >= len(found):
+                differences.append(child_path)
+            else:
+                differences.extend(
+                    _identity_differences(expected[index], found[index], field_path=child_path)
+                )
+        return differences
+    return [] if expected == found else [field_path]
 
 
 def _prompt_order_digest(rows: Sequence[Row]) -> str:
@@ -335,11 +365,13 @@ def screen_identity(  # noqa: PLR0913 - the identity names each resume axis expl
         grading=str(rows[0]["grading"]),
         rows_sha256=rows_sha256,
     )
+    identity.pop("pool_digest")
+    identity.pop("rows_sha256")
     identity["schema"] = SCREEN_SCHEMA
     identity["model_id"] = config.model_id
     identity["model_weights_identity"] = model_weights_identity
-    identity["prompt_id_order_sha256"] = _prompt_order_digest(rows)
-    identity["prompt_pool_digest"] = select_prompts.pool_digest(rows)
+    identity["prompt_ids"] = [str(row["prompt_id"]) for row in rows]
+    identity["prompt_rows_by_id"] = {str(row["prompt_id"]): dict(row) for row in rows}
     identity["sampler_identity"] = dict(sampler_identity)
     identity["samples_per_prompt"] = config.samples_per_prompt
     identity["training_top_p"] = config.training_top_p
@@ -347,6 +379,118 @@ def screen_identity(  # noqa: PLR0913 - the identity names each resume axis expl
     identity["prompt_variant"] = config.prompt_variant
     identity["sampling_budget"] = config.sampling_budget
     return _canonical_mapping(identity, context="screen identity")
+
+
+def _screen_identity_differences(
+    expected: Mapping[str, Any], found: Mapping[str, Any]
+) -> list[str]:
+    if "prompt_rows_by_id" in found:
+        return _identity_differences(expected, found, field_path="screen_identity")
+    legacy_hash_fields = {
+        "pool_digest",
+        "rows_sha256",
+        "prompt_id_order_sha256",
+        "prompt_pool_digest",
+    }
+    expected_fields = {
+        key: value
+        for key, value in expected.items()
+        if key not in legacy_hash_fields | {"prompt_ids", "prompt_rows_by_id"}
+    }
+    found_fields = {key: value for key, value in found.items() if key not in legacy_hash_fields}
+    return _identity_differences(expected_fields, found_fields, field_path="screen_identity")
+
+
+def _prepare_partial_for_resume(  # noqa: C901, PLR0912, PLR0915 - current and legacy partial trace cases
+    partial: Path, *, identity: Mapping[str, Any], rows: Sequence[Row]
+) -> None:
+    """Upgrade legacy digest-only headers after checking their readable identity and row snapshots."""
+    if not partial.is_file():
+        return
+    raw = partial.read_bytes()
+    header_end = raw.find(b"\n")
+    if header_end < 0:
+        return
+    header = json.loads(raw[:header_end].decode("utf-8"))
+    if not isinstance(header, dict) or header.get("record_kind") != PARTIAL_HEADER_RECORD_KIND:
+        raise ValueError(f"partial screen {partial} has no valid leading identity header")
+    stored_identity = header.get("identity")
+    if not isinstance(stored_identity, Mapping):
+        raise TypeError(f"partial screen {partial} has no structured identity")
+    if _canonical(stored_identity) == _canonical(identity):
+        return
+
+    current_rows_by_id = {str(row["prompt_id"]): row for row in rows}
+    complete_lines = raw[header_end + 1 :].splitlines(keepends=True)
+    row_differences: list[str] = []
+    for line_number, line in enumerate(complete_lines, start=2):
+        if not line.endswith(b"\n"):
+            break
+        if not line.strip():
+            continue
+        record = json.loads(line.decode("utf-8"))
+        if not isinstance(record, dict) or record.get("record_kind") != SWEEP_RECORD_KIND:
+            continue
+        prompt_id = str(record.get("prompt_id", ""))
+        current_row = current_rows_by_id.get(prompt_id)
+        stored_row = record.get("row")
+        if current_row is None:
+            row_differences.append(f"prompt_rows_by_id.{prompt_id} is not in the current corpus")
+        elif not isinstance(stored_row, Mapping):
+            row_differences.append(
+                f"partial line {line_number} has no readable row for {prompt_id}"
+            )
+        else:
+            row_differences.extend(
+                _identity_differences(
+                    current_row,
+                    stored_row,
+                    field_path=f"prompt_rows_by_id.{prompt_id}",
+                )
+            )
+    if row_differences:
+        raise ValueError(
+            f"partial screen {partial} prompt rows differ at " + ", ".join(row_differences[:8])
+        )
+
+    if "prompt_rows_by_id" in stored_identity:
+        differences = _identity_differences(identity, stored_identity, field_path="screen_identity")
+        if differences:
+            raise ValueError(
+                f"partial screen {partial} identity differs at {', '.join(differences[:8])}"
+            )
+        return
+
+    differences = _screen_identity_differences(identity, stored_identity)
+    if differences:
+        raise ValueError(
+            f"partial screen {partial} identity differs at {', '.join(differences[:8])}"
+        )
+    current_pool_digest = select_prompts.pool_digest(rows)
+    for field in ("pool_digest", "prompt_pool_digest"):
+        stored_digest = stored_identity.get(field)
+        if stored_digest is not None and stored_digest != current_pool_digest:
+            raise ValueError(
+                f"legacy partial screen {partial} identity.{field} differs; its unfinished prompt "
+                f"rows have no readable snapshots to identify further"
+            )
+    stored_order_digest = stored_identity.get("prompt_id_order_sha256")
+    if stored_order_digest is not None and stored_order_digest != _prompt_order_digest(rows):
+        raise ValueError(
+            f"legacy partial screen {partial} identity.prompt_id_order_sha256 differs; "
+            "its unfinished prompt IDs have no readable snapshots to identify further"
+        )
+
+    migrated_header = dict(header)
+    migrated_header["identity"] = dict(identity)
+    migrated_header["identity_sha256"] = select_prompts.identity_digest(identity)
+    temporary = partial.with_name(f".{partial.name}.{os.getpid()}.migrating")
+    with temporary.open("wb") as handle:
+        handle.write(json.dumps(migrated_header, ensure_ascii=False).encode("utf-8") + b"\n")
+        handle.write(raw[header_end + 1 :])
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(partial)
 
 
 def _trace_meta(  # noqa: PLR0913 - the trace header records every identity axis explicitly
@@ -406,13 +550,14 @@ def _write_jsonl_atomically(
     temporary.replace(path)
 
 
-def _write_summary_atomically(
+def _write_summary_atomically(  # noqa: PLR0913 - trace, corpus, model, sampler and rows define the audit
     *,
     trace: Path,
     corpus: Path,
     output: Path,
     model_id: str,
     sampler_identity: Mapping[str, Any],
+    expected_rows: Sequence[Row],
 ) -> None:
     """Write the production-scorer post-screen audit without exposing prompt text."""
     if output.exists():
@@ -424,6 +569,7 @@ def _write_summary_atomically(
         temporary,
         expected_model_id=model_id,
         expected_sampler_identity=sampler_identity,
+        expected_rows=expected_rows,
     )
     with temporary.open("rb") as handle:
         os.fsync(handle.fileno())
@@ -434,7 +580,6 @@ def _validate_completed_trace(  # noqa: PLR0913 - all completed trace identities
     *,
     config: ScreenConfig,
     rows: Sequence[Row],
-    rows_sha256: str,
     model_weights_identity: str,
     sampler_identity: Mapping[str, Any],
     identity: Mapping[str, Any],
@@ -447,22 +592,25 @@ def _validate_completed_trace(  # noqa: PLR0913 - all completed trace identities
     meta = entries[0]
     if meta.get("schema") != SCREEN_SCHEMA:
         raise ValueError(f"completed screen trace {trace} has an incompatible schema")
-    checks = {
-        "corpus_sha256": (meta.get("corpus_sha256"), rows_sha256),
-        "prompt_pool_digest": (meta.get("prompt_pool_digest"), select_prompts.pool_digest(rows)),
-        "prompt_id_order_sha256": (meta.get("prompt_id_order_sha256"), _prompt_order_digest(rows)),
-        "model_weights_identity": (meta.get("model_weights_identity"), model_weights_identity),
-        "screen_identity": (meta.get("screen_identity"), dict(identity)),
-    }
-    for name, (found, expected) in checks.items():
-        if _canonical(found) != _canonical(expected):
-            raise ValueError(f"completed screen {name} differs from the requested identity")
+    if meta.get("model_weights_identity") != model_weights_identity:
+        raise ValueError(
+            "completed screen model_weights_identity differs from the requested identity"
+        )
+    stored_identity = meta.get("screen_identity")
+    if not isinstance(stored_identity, Mapping):
+        raise TypeError(f"completed screen trace {trace} has no structured screen identity")
+    differences = _screen_identity_differences(identity, stored_identity)
+    if differences:
+        raise ValueError(
+            "completed screen identity differs from the requested identity at "
+            + ", ".join(differences[:8])
+        )
     return cooperation_corpus.summarize_sweep_trace(
         trace,
         expected_prompt_ids=[str(row["prompt_id"]) for row in rows],
         expected_model_id=config.model_id,
         expected_sampler_identity=sampler_identity,
-        expected_rows_sha256=rows_sha256,
+        expected_rows=rows,
         expected_strata=cooperation_corpus.expected_stratum_keys(rows),
     ).to_json_dict()
 
@@ -471,7 +619,6 @@ def _validate_completed_artifacts(  # noqa: PLR0913 - all completed artifact ide
     *,
     config: ScreenConfig,
     rows: Sequence[Row],
-    rows_sha256: str,
     model_weights_identity: str,
     sampler_identity: Mapping[str, Any],
     identity: Mapping[str, Any],
@@ -482,7 +629,6 @@ def _validate_completed_artifacts(  # noqa: PLR0913 - all completed artifact ide
     expected_summary = _validate_completed_trace(
         config=config,
         rows=rows,
-        rows_sha256=rows_sha256,
         model_weights_identity=model_weights_identity,
         sampler_identity=sampler_identity,
         identity=identity,
@@ -551,7 +697,6 @@ def run_matching_screen(
             _validate_completed_artifacts(
                 config=config,
                 rows=rows,
-                rows_sha256=rows_sha256,
                 model_weights_identity=weights_identity,
                 sampler_identity=sampler_identity,
                 identity=identity,
@@ -562,7 +707,6 @@ def run_matching_screen(
             _validate_completed_trace(
                 config=config,
                 rows=rows,
-                rows_sha256=rows_sha256,
                 model_weights_identity=weights_identity,
                 sampler_identity=sampler_identity,
                 identity=identity,
@@ -574,13 +718,11 @@ def run_matching_screen(
                 output=summary,
                 model_id=config.model_id,
                 sampler_identity=sampler_identity,
+                expected_rows=rows,
             )
         return ScreenResult(trace, summary, partial, len(rows), 0, 0, noop=True)
 
-    if select_prompts.rows_file_digest(config.corpus_path) != rows_sha256:
-        raise RuntimeError(
-            f"frozen training corpus changed while preparing the screen: {config.corpus_path}"
-        )
+    _prepare_partial_for_resume(partial, identity=identity, rows=rows)
     swept = select_prompts.resumable_sweep(
         backend,
         rows,
@@ -595,10 +737,6 @@ def run_matching_screen(
         raise RuntimeError(
             f"matching screen returned {len(swept.records)} records for {len(rows)} frozen rows; "
             "the screen never filters the training corpus"
-        )
-    if select_prompts.rows_file_digest(config.corpus_path) != rows_sha256:
-        raise RuntimeError(
-            f"frozen training corpus changed during the screen: {config.corpus_path}"
         )
     meta = _trace_meta(
         backend=backend,
@@ -619,6 +757,7 @@ def run_matching_screen(
         output=summary,
         model_id=config.model_id,
         sampler_identity=sampler_identity,
+        expected_rows=rows,
     )
     return ScreenResult(
         trace,

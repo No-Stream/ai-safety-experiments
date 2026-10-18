@@ -110,7 +110,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from games.interp_cells import STIMULUS_RENDER_VERBATIM, load_stimuli, short_digest, stimuli_digest
+from games.interp_cells import (
+    STIMULUS_RENDER_VERBATIM,
+    Stimulus,
+    load_stimuli,
+    short_digest,
+    stimuli_digest,
+)
 from games.parsing import THINK_OPEN
 from reward_hacking.harness.tasks_ilcb import PROBLEMS
 from reward_hacking.interp.tmax_directions import load_row_labels
@@ -1073,6 +1079,73 @@ class TwinPrompts:
     n_tokens_by_problem: dict[str, int]
 
 
+def _prompt_snapshots(
+    sidecar: Mapping[str, object], *, sidecar_path: Path
+) -> dict[str, tuple[str, str, str]]:
+    """Read new-format prompt snapshots by id, with their problem and side labels."""
+    snapshots: dict[str, tuple[str, str, str]] = {}
+    seen_ids: set[str] = set()
+    for problem in cast("list[dict[str, object]]", sidecar["problems"]):
+        problem_id = str(problem["problem_id"])
+        for entry in cast("dict[str, dict[str, object]]", problem["stimuli"]).values():
+            stimulus_id = str(entry["stimulus_id"])
+            if stimulus_id in seen_ids:
+                raise GenerationSetError(f"{sidecar_path} repeats stimulus id {stimulus_id!r}")
+            seen_ids.add(stimulus_id)
+            prompt_text = entry.get("text")
+            if prompt_text is None:
+                continue
+            if not isinstance(prompt_text, str) or not prompt_text:
+                raise GenerationSetError(
+                    f"{sidecar_path} stimulus {stimulus_id!r} has invalid text snapshot"
+                )
+            snapshots[stimulus_id] = (problem_id, str(entry["side"]), prompt_text)
+    return snapshots
+
+
+def _assert_stimuli_match_sidecar(
+    stimuli: Sequence[Stimulus],
+    *,
+    sidecar: Mapping[str, object],
+    sidecar_path: Path,
+    stimuli_path: Path,
+) -> None:
+    """Compare readable prompt identity fields, with digest fallback for older sidecars."""
+    text_by_id = {stimulus.stimulus_id: stimulus.text for stimulus in stimuli}
+    stimulus_by_id = {stimulus.stimulus_id: stimulus for stimulus in stimuli}
+    snapshots = _prompt_snapshots(sidecar, sidecar_path=sidecar_path)
+    if not snapshots:
+        digest = stimuli_digest(stimuli)
+        if sidecar["stimuli_sha256"] != digest:
+            raise GenerationSetError(
+                f"{sidecar_path} was written for stimuli "
+                f"{short_digest(str(sidecar['stimuli_sha256']))} but {stimuli_path} digests to "
+                f"{short_digest(digest)}; the two files describe different corpora"
+            )
+        return
+    missing_ids = sorted(set(text_by_id) - set(snapshots))
+    extra_ids = sorted(set(snapshots) - set(text_by_id))
+    if missing_ids or extra_ids:
+        raise GenerationSetError(
+            f"stimulus ids differ from {sidecar_path}: missing {missing_ids[:5]}, "
+            f"extra {extra_ids[:5]}"
+        )
+    for stimulus_id, (problem_id, side, expected_text) in snapshots.items():
+        stimulus = stimulus_by_id[stimulus_id]
+        differences: list[str] = []
+        if stimulus.side != side:
+            differences.append(f"side: sidecar {side!r}, stimulus {stimulus.side!r}")
+        if stimulus.pair_id != problem_id:
+            differences.append(f"pair_id: sidecar {problem_id!r}, stimulus {stimulus.pair_id!r}")
+        if stimulus.text != expected_text:
+            differences.append("text")
+        if differences:
+            raise GenerationSetError(
+                f"stimulus {stimulus_id!r} differs from its readable sidecar fields: "
+                + "; ".join(differences)
+            )
+
+
 def load_twin_prompts(stimuli_path: Path, sidecar_path: Path, *, side: str) -> TwinPrompts:
     """Read one side's prompts off the twin corpus, holding the sidecar to the stimuli file."""
     stimuli = load_stimuli(stimuli_path)
@@ -1083,13 +1156,9 @@ def load_twin_prompts(stimuli_path: Path, sidecar_path: Path, *, side: str) -> T
             f"append a completion to an already-templated prompt, which needs "
             f"{STIMULUS_RENDER_VERBATIM!r}"
         )
-    digest = stimuli_digest(stimuli)
-    if sidecar["stimuli_sha256"] != digest:
-        raise GenerationSetError(
-            f"{sidecar_path} was written for stimuli {short_digest(str(sidecar['stimuli_sha256']))} "
-            f"but {stimuli_path} digests to {short_digest(digest)}; the two files describe different "
-            f"corpora"
-        )
+    _assert_stimuli_match_sidecar(
+        stimuli, sidecar=sidecar, sidecar_path=sidecar_path, stimuli_path=stimuli_path
+    )
     text_by_id = {stimulus.stimulus_id: stimulus.text for stimulus in stimuli}
     texts: dict[str, str] = {}
     counts: dict[str, int] = {}

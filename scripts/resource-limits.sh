@@ -40,8 +40,11 @@
 #                       stalls in D-state indefinitely without ever reaching
 #                       --mem-max. Only pass it for page-cache-bound jobs. See
 #                       docs/resource-limits.md.
+#       --mem-swap-max SZ  hard cap on swap usage; unset by default
 #   -t, --timeout DUR   kill the whole process group after DUR, e.g. 15m
 #       --tasks-max N   max threads+processes                (default 4096)
+#       --preserve-processes-on-oom
+#                       keep surviving processes in the unit after an OOM kill
 #       --nice N        scheduling niceness, higher = yields (default 10)
 #       --threads N     value for the OMP/BLAS/Polars thread family (default 16)
 #       --gpu           refuse to start if another process holds GPU memory,
@@ -82,6 +85,7 @@ readonly OOM_EXIT=137
 cpus=$((TOTAL_CPUS * 3 / 4))
 chdir="$PWD"
 mem_high=""
+mem_swap_max=""
 # Spelled in whole MiB rather than through `numfmt --to=iec`, which keeps three significant digits and
 # on a 31 GiB host rounded 19.56G up to 20G, a 2.25% overshoot of the intended cap.
 mem_max="$((TOTAL_MEM_KIB * 5 / 8 / 1024))M"
@@ -92,6 +96,7 @@ threads=16
 gpu=0
 advisory=0
 no_address_cap=0
+preserve_processes_on_oom=0
 unit_name=""
 
 die() {
@@ -110,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mem-high)
       mem_high="$2"
+      shift 2
+      ;;
+    --mem-swap-max)
+      mem_swap_max="$2"
       shift 2
       ;;
     --mem-max)
@@ -146,6 +155,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-address-cap)
       no_address_cap=1
+      shift
+      ;;
+    --preserve-processes-on-oom)
+      preserve_processes_on_oom=1
       shift
       ;;
     -n | --name)
@@ -279,6 +292,11 @@ esac
 [[ -n "$unit_name" ]] || unit_name="reslimit-$$-$(basename -- "$1")"
 unit_name="${unit_name//[^A-Za-z0-9_.-]/_}"
 
+oom_policy=kill
+if ((preserve_processes_on_oom)); then
+  oom_policy=continue
+fi
+
 properties=(
   -p "CPUQuota=$((cpus * 100))%"
   -p "MemoryMax=$mem_max"
@@ -287,15 +305,16 @@ properties=(
   -p "IOSchedulingClass=best-effort"
   -p "IOSchedulingPriority=7"
   -p "WorkingDirectory=$chdir"
-  # Sets memory.oom.group=1, so exceeding MemoryMax kills every process in the job
-  # together instead of leaving a half-dead job with its workers reaped.
-  -p "OOMPolicy=kill"
+  # `kill` sets memory.oom.group=1; persistent jail units use `continue` so OOM kills only
+  # the actor command selected by oom_score_adj while its namespace supervisor survives.
+  -p "OOMPolicy=$oom_policy"
   # systemd starts user units at a 1024 soft limit regardless of the caller's. Under WSL, CUDA's
   # expandable segments hold one descriptor per mapped chunk, so loading a 12B model under --gpu died
   # as "CUDA driver error: unknown error" here and nowhere else. Keep the caller's limits instead.
   -p "LimitNOFILE=$(ulimit -Sn):$(ulimit -Hn)"
 )
 [[ -n "$mem_high" ]] && properties+=(-p "MemoryHigh=$mem_high")
+[[ -n "$mem_swap_max" ]] && properties+=(-p "MemorySwapMax=$mem_swap_max")
 [[ -n "$timeout" ]] && properties+=(-p "RuntimeMaxSec=$timeout")
 for kv in "${job_env[@]}"; do properties+=(-p "Environment=$kv"); done
 
@@ -343,7 +362,11 @@ case "$result" in
     exit "$TIMEOUT_EXIT"
     ;;
   oom-kill)
-    echo "resource-limits: OOM-KILLED at MemoryMax=$mem_max - the job's cgroup was killed, the box was not" >&2
+    if [[ "$oom_policy" == continue ]]; then
+      echo "resource-limits: OOM-KILLED at MemoryMax=$mem_max - OOMPolicy=continue kept the remaining processes running" >&2
+    else
+      echo "resource-limits: OOM-KILLED at MemoryMax=$mem_max - the job's cgroup was killed, the box was not" >&2
+    fi
     exit "$OOM_EXIT"
     ;;
 esac

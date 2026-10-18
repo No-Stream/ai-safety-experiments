@@ -45,7 +45,7 @@ its own draw of it: 177 minutes per v2-shaped 2B run, a ~12 h cell per arm at 9B
 `--banked-base-cells s3://.../banked-base-cells/` the driver derives the cell's bank key
 (`bank_identity`, `bank_key`: base model, thinking mode, sections, the whole eval config bar the
 machine-local item paths, backend kind and quantization, sampler mode and every sampling knob
-including `max_new_tokens`, and a digest of every prompt the plan renders) and, when the bank holds a
+including `max_new_tokens`, plus readable prompt ids and rendered text) and, when the bank holds a
 complete entry under it, copies that entry's trace and summary into the run's out dir byte for
 byte -- exactly what the track-record-v2 and softpen kits did by hand with `aws s3 cp` -- and
 writes a provenance sidecar beside them (`games.report.banked_provenance_path`: source entry,
@@ -132,7 +132,11 @@ from games.evals import (
     summarise_trace,
 )
 from games.fileio import sha256_of_file
-from games.framing_stimulus import load_dictator_recipient_clauses, load_framings
+from games.framing_stimulus import (
+    RECIPIENT_CONDITIONS,
+    load_dictator_recipient_clauses,
+    load_framings,
+)
 from games.held_out_extension import load_extension
 from games.lora import checkpoint_step, iter_checkpoints, read_adapter_base_model
 from games.preflight import (
@@ -251,7 +255,6 @@ class RunFacts:
     top_k: int | None = None
     max_completion_tokens: int | None = None
     prompt_variant: str = PROMPT_VARIANT_NONE
-    run_config_sha256: str | None = None
 
 
 EMPTY_RUN_FACTS = RunFacts(
@@ -268,7 +271,6 @@ EMPTY_RUN_FACTS = RunFacts(
     top_k=None,
     max_completion_tokens=None,
     prompt_variant=PROMPT_VARIANT_NONE,
-    run_config_sha256=None,
 )
 
 # Which derivation named a plan's trained games, recorded in every trace's meta. The sources are not
@@ -887,8 +889,7 @@ def _read_run_facts(run_dir: Path) -> RunFacts:
     path = run_dir / RUN_CONFIG_FILENAME
     if not path.is_file():
         return EMPTY_RUN_FACTS
-    raw_bytes = path.read_bytes()
-    raw = json.loads(raw_bytes)
+    raw = json.loads(path.read_text(encoding="utf-8"))
     config = raw.get("config") or {}
     thinking = config.get("thinking")
     composition = (raw.get("derived") or {}).get("corpus_composition") or {}
@@ -910,7 +911,6 @@ def _read_run_facts(run_dir: Path) -> RunFacts:
             else int(config["max_completion_tokens"])
         ),
         prompt_variant=str(config.get("prompt_variant", PROMPT_VARIANT_NONE)),
-        run_config_sha256=hashlib.sha256(raw_bytes).hexdigest(),
     )
 
 
@@ -1029,11 +1029,7 @@ def _resolve_prompt_variant(args: argparse.Namespace, facts: RunFacts, *, sample
     explicit = args.prompt_variant
     if explicit is None:
         return facts.prompt_variant
-    if (
-        sampler == "training-run"
-        and facts.run_config_sha256 is not None
-        and explicit != facts.prompt_variant
-    ):
+    if sampler == "training-run" and explicit != facts.prompt_variant:
         raise ValueError(
             f"--prompt-variant {explicit!r} disagrees with the training run's "
             f"prompt variant {facts.prompt_variant!r}."
@@ -1048,7 +1044,7 @@ def _validate_sampler_request(
     sampler = resolve_sampler_mode(args)
     if sampler != "training-run":
         return sampler
-    if run_dir is None or facts.run_config_sha256 is None:
+    if run_dir is None or not (run_dir / RUN_CONFIG_FILENAME).is_file():
         raise ValueError(
             "training-run sampler requires run facts from --run-dir, or --checkpoint inside a "
             f"run directory with {RUN_CONFIG_FILENAME}; it cannot be used with --model."
@@ -1610,7 +1606,6 @@ def _target_meta(
         **(
             {
                 "run_config_path": str(plan.run_dir / RUN_CONFIG_FILENAME),
-                "run_config_sha256": plan.run_facts.run_config_sha256,
             }
             if sampler_mode_meta(args) == "training-run" and plan.run_dir is not None
             else {}
@@ -1843,11 +1838,10 @@ def bank_identity_without_config(
 def prompt_set_digest(
     plan: Sequence[PlannedRequest], *, prompt_variant: str = PROMPT_VARIANT_NONE
 ) -> str:
-    """One sha256 over every SENT prompt, with its section and identity, in plan order.
+    """Return the legacy digest used in old bank paths and retained as metadata.
 
-    The item text behind the survey and DTBench sections lives outside version control, so two
-    machines can build the same `EvalConfig` over different items; the digest is what tells them
-    apart. The count is folded in so a plan cannot collide with a prefix of another.
+    Current bank identity compares the ordered prompt ids and rendered text directly. Keeping this
+    digest lets those readable identities continue to address existing bank entries.
     """
     digest = hashlib.sha256()
     for request in plan:
@@ -1864,6 +1858,23 @@ def prompt_set_digest(
     return digest.hexdigest()
 
 
+def prompt_set_identity(
+    plan: Sequence[PlannedRequest], *, prompt_variant: str = PROMPT_VARIANT_NONE
+) -> dict[str, Any]:
+    """Return ordered prompt ids and rendered text for readable resume comparisons."""
+    return {
+        "count": len(plan),
+        "prompts": [
+            {
+                "section": request.section,
+                "identity": list(request.identity),
+                "prompt": apply_prompt_variant(request.prompt, prompt_variant),
+            }
+            for request in plan
+        ],
+    }
+
+
 def bank_identity(
     args: argparse.Namespace,
     plan: EvalPlan,
@@ -1872,13 +1883,13 @@ def bank_identity(
     sections: Sequence[str],
     config: EvalConfig,
 ) -> dict[str, Any]:
-    """Everything a step-0 cell's measurement depends on, as JSON-safe values; `bank_key` hashes it.
+    """Everything a step-0 cell's measurement depends on, in readable JSON-safe values.
 
     `bank_identity_without_config` plus the whole eval config as recorded on the meta (samples,
     print orders, capability seed, survey selection, prefilled_think, batch width, template kwargs,
     framings, sweep games) minus the machine-local item paths (`RESUME_LOCAL_PATH_CONFIG_FIELDS`),
-    which the prompt-set digest covers by content instead. Two cells whose identities differ in any
-    field are different measurements and never share an entry; two whose identities agree are the
+    which the prompt set records by id and rendered text instead. Two cells whose identities differ
+    in any field are different measurements and never share an entry; two whose identities agree are the
     same draw of the same base under the same prompts and sampler, which is what a shared entry
     claims. Over-keying costs a regeneration; under-keying reports another cell's numbers.
     """
@@ -1887,19 +1898,22 @@ def bank_identity(
         for name, value in config.as_record().items()
         if name not in RESUME_LOCAL_PATH_CONFIG_FIELDS
     }
+    battery_plan = plan_battery(sections, config)
     return {
         **bank_identity_without_config(args, plan, target, sections=sections),
         "eval_config": portable_config,
-        "prompt_set_digest": prompt_set_digest(
-            plan_battery(sections, config), prompt_variant=config.prompt_variant
-        ),
+        "prompt_set": prompt_set_identity(battery_plan, prompt_variant=config.prompt_variant),
+        # Retained as a lookup-key component for old bank paths and metadata. `_identity_drift`
+        # compares `prompt_set` directly for current entries and uses this only to read old ones.
+        "prompt_set_digest": prompt_set_digest(battery_plan, prompt_variant=config.prompt_variant),
     }
 
 
 def bank_key(identity: Mapping[str, Any]) -> str:
-    """Return the bank entry a cell of this identity lives under: sha256 of its canonical JSON."""
+    """Return the content-addressed bank path, preserving the pre-readable prompt identity key."""
+    key_identity = {name: value for name, value in identity.items() if name != "prompt_set"}
     canonical = json.dumps(
-        _json_native(identity), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        _json_native(key_identity), sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -1908,6 +1922,18 @@ def _identity_drift(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> l
     """Name every field of ``expected`` that ``stored`` disagrees with, compared through JSON types."""
     drifted: list[str] = []
     for name, value in expected.items():
+        if name == "prompt_set":
+            stored_prompt_set = stored.get(name)
+            if stored_prompt_set is None and "prompt_set_digest" in stored:
+                if stored.get("prompt_set_digest") != expected.get("prompt_set_digest"):
+                    drifted.append(
+                        "prompt_set_digest: legacy bank content differs from the prompts asked"
+                    )
+                continue
+            drifted.extend(_prompt_set_differences(stored_prompt_set, value))
+            continue
+        if name == "prompt_set_digest" and "prompt_set" in expected:
+            continue
         if name == "eval_config":
             stored_config = stored.get(name, {})
             config_names = sorted(set(stored_config) | set(value))
@@ -1926,6 +1952,44 @@ def _identity_drift(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> l
                 f"{_drift_text(value)} asked"
             )
     return drifted
+
+
+def _prompt_set_differences(stored: Any, expected: Any) -> list[str]:  # noqa: ANN401
+    """Compare prompt count, ordered ids, and text without printing private prompt contents."""
+    if not isinstance(stored, dict) or not isinstance(expected, dict):
+        return [f"prompt_set: {_drift_text(stored)} banked, {_drift_text(expected)} asked"]
+    stored_prompts = stored.get("prompts") or []
+    expected_prompts = expected.get("prompts") or []
+    differences: list[str] = []
+    if stored.get("count") != expected.get("count"):
+        differences.append(
+            f"prompt_set.count: {stored.get('count')!r} banked, {expected.get('count')!r} asked"
+        )
+    if len(stored_prompts) != len(expected_prompts):
+        differences.append(
+            f"prompt_set.prompts: {len(stored_prompts)} ids banked, {len(expected_prompts)} asked"
+        )
+    for index, (stored_prompt, expected_prompt) in enumerate(
+        zip(stored_prompts, expected_prompts, strict=False)
+    ):
+        stored_id = {
+            "section": stored_prompt.get("section"),
+            "identity": stored_prompt.get("identity"),
+        }
+        expected_id = {
+            "section": expected_prompt.get("section"),
+            "identity": expected_prompt.get("identity"),
+        }
+        if _json_native(stored_id) != _json_native(expected_id):
+            differences.append(
+                f"prompt_set.prompts[{index}].id: {_drift_text(stored_id)} banked, "
+                f"{_drift_text(expected_id)} asked"
+            )
+        elif stored_prompt.get("prompt") != expected_prompt.get("prompt"):
+            differences.append(
+                f"prompt text differs for {_drift_text(expected_id)} at position {index}"
+            )
+    return differences
 
 
 def _drift_text(value: Any) -> str:  # noqa: ANN401 - any identity value, rendered for a refusal
@@ -2438,8 +2502,8 @@ def _verify_banked_copy(
     The counterpart of `_peek_existing_trace` for a trace whose meta names another arm on purpose.
     The sidecar's hash of the trace is checked against the file (`read_banked_provenance`), then the
     sidecar has to name this arm and step, its recorded identity has to agree with the request on
-    every field known before the template loads, and the summary beside the trace has to be there
-    and hash to what the sidecar recorded. A copy that fails any of these is refused with the
+    every field known before the template loads, and the summary beside the trace has to match the
+    parsed summary rebuilt from the trace. A copy that fails any of these is refused with the
     paths, exactly as a foreign trace is: skipped as complete it would report another cell.
     """
     provenance = read_banked_provenance(target.out_path)
@@ -2453,18 +2517,29 @@ def _verify_banked_copy(
         drifted.append(f"step: {provenance.get('step')!r} copied for, {target.step!r} asked")
     drifted.extend(_identity_drift(dict(provenance.get("bank_identity") or {}), expected_identity))
     summary_path = summary_path_for(target.out_path)
-    recorded_summary = ((provenance.get("files") or {}).get(summary_path.name) or {}).get("sha256")
     if not summary_path.exists():
         drifted.append(
             f"{summary_path.name}: recorded in the sidecar but missing beside the trace, so the "
             f"copy is torn (delete the trace and the sidecar and relaunch; the bank still holds "
             f"the cell)"
         )
-    elif sha256_of_file(summary_path) != recorded_summary:
-        drifted.append(
-            f"{summary_path.name}: sha256 {sha256_of_file(summary_path)} on disk, "
-            f"{recorded_summary!r} recorded"
-        )
+    else:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        rebuilt = summarise_trace(read_eval_records(target.out_path))
+        if not isinstance(summary, dict):
+            drifted.append(
+                f"{summary_path.name}: parsed summary is {type(summary).__name__}, expected an object"
+            )
+        elif summary != rebuilt:
+            differing_fields = sorted(
+                field
+                for field in set(summary) | set(rebuilt)
+                if field not in summary or field not in rebuilt or summary[field] != rebuilt[field]
+            )
+            drifted.append(
+                f"{summary_path.name}: parsed summary differs from the trace rebuild at "
+                f"{', '.join(differing_fields)}"
+            )
     if drifted:
         raise FileExistsError(
             f"refusing to touch {target.out_path}: the banked copy {sidecar} describes is not this "
@@ -2883,6 +2958,9 @@ def _resolve_eval_config(
     args: argparse.Namespace, *, plan: EvalPlan, sections: Sequence[str], template: TemplateFacts
 ) -> EvalConfig:
     """Turn the parsed flags, the resolved plan and the measured template facts into the battery's config."""
+    trap_cells = (
+        None if args.trap_cells is None else load_dictator_recipient_clauses(args.trap_cells)
+    )
     return EvalConfig(
         open_ended_samples=args.open_ended_samples,
         open_ended_samples_by_item=_parse_open_ended_allocation(args.open_ended_samples_by_item),
@@ -2914,13 +2992,14 @@ def _resolve_eval_config(
         ),
         framing_sweep_games=(_parse_id_list(args.framing_sweep_games) or FRAMING_SWEEP_GAME_IDS),
         trap_cells_file=args.trap_cells,
-        # Digested here rather than inside the section, so the recipient paragraphs the cell
-        # identity claims are the ones present when the plan was resolved: the planner re-reads the
-        # file and refuses a digest that has moved since.
-        trap_cells_digest=(
-            ""
-            if args.trap_cells is None
-            else load_dictator_recipient_clauses(args.trap_cells).digest
+        trap_cells_digest="" if trap_cells is None else trap_cells.digest,
+        trap_cells_clauses=(
+            ()
+            if trap_cells is None
+            else tuple(
+                (condition_id, trap_cells.clause_by_condition[condition_id])
+                for condition_id in RECIPIENT_CONDITIONS
+            )
         ),
         # Loaded here rather than at parse time so one refusal covers every path into a battery,
         # `--summarise-only` included; the load is a small JSON read and validates the whole file.

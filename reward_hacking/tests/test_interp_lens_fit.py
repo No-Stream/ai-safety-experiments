@@ -413,9 +413,14 @@ def test_run_fit_uses_real_jlens_and_validates_complete_artifact(
     )
     assert cast("dict[str, Any]", run_fit(options))["identity"] == report_payload["identity"]
 
-    lens_path.write_bytes(b"changed")
-    with pytest.raises(ValueError, match="missing or has changed"):
-        run_fit(options)
+    lens_payload = torch.load(lens_path, weights_only=True)
+    torch.save(lens_payload, lens_path, _use_new_zipfile_serialization=False)
+    assert cast("dict[str, Any]", run_fit(options))["identity"] == report_payload["identity"]
+
+    changed_identity = dict(cast("dict[str, object]", report_payload["identity"]))
+    changed_identity["max_seq_len"] = 49
+    with pytest.raises(ValueError, match="max_seq_len"):
+        lens_fit._assert_completed_artifact(options.out_dir, changed_identity)
 
 
 def test_run_fit_refuses_requested_dim_batch_before_fit_when_memory_bound_is_too_small(

@@ -47,8 +47,8 @@ were captured raw in the earlier direction work; a raw convention is not one
 module's. The games render check refuses a bare stem under `verbatim` and a templated row under
 `templated_here`, so passing the wrong convention for a corpus is an error rather than a different
 measurement. One corpus per capture run: the stimulus-file digest is the cells' identity, and the twin
-sidecar is held to the whole file, so the twin, sentence and generation cells are three runs into three
-capture roots.
+sidecar's stimulus ids and token ids are checked against the current corpus, so the twin, sentence and
+generation cells are three runs into three capture roots.
 
 Resumable at cell granularity, like the adapter driver: a cell whose manifest is on disk is skipped,
 and the manifest is written after the tensors. When every cell on the agenda is on disk the ladder is
@@ -208,10 +208,11 @@ def assert_ids_match_sidecar(
     re-rendered row -- moves every span silently, so equality is required id for id.
     """
     missing = sorted(set(rendered) - set(table.input_ids))
-    if missing:
+    extra = sorted(set(table.input_ids) - set(rendered))
+    if missing or extra:
         raise FullWeightsCellError(
-            f"{len(missing)} stimuli have no entry in the span sidecar "
-            f"({missing[:ERROR_EXAMPLE_COUNT]})"
+            f"stimulus ids differ from the span sidecar: missing ids {missing[:ERROR_EXAMPLE_COUNT]}, "
+            f"extra ids {extra[:ERROR_EXAMPLE_COUNT]}"
         )
     for stimulus_id, text in rendered.items():
         ids = tuple(cast("list[int]", tokenizer(text)["input_ids"]))
@@ -538,7 +539,6 @@ def resolve_spans(
     *,
     tokenizer: PreTrainedTokenizerBase,
     rendered: Mapping[str, str],
-    digest: str,
 ) -> tuple[SpanTable | None, list[str]]:
     """Read the span sidecar, hold it to this corpus and tokenizer, and pick the spans to derive."""
     if args.spans_sidecar is None:
@@ -546,11 +546,6 @@ def resolve_spans(
             raise FullWeightsCellError("--span-names needs --spans-sidecar")
         return None, []
     table = load_span_sidecar(args.spans_sidecar)
-    if table.stimuli_sha256 != digest:
-        raise FullWeightsCellError(
-            f"the span sidecar was built for corpus {short_digest(table.stimuli_sha256)} but the "
-            f"stimuli file digests to {short_digest(digest)}; its spans index another corpus"
-        )
     if table.stimulus_render != args.stimulus_render:
         raise FullWeightsCellError(
             f"the span sidecar records render {table.stimulus_render!r}; --stimulus-render is "
@@ -595,9 +590,7 @@ def prepare_corpus(args: argparse.Namespace) -> PreparedCorpus:
         [rendered[stimulus.stimulus_id] for stimulus in stimuli],
         max_prompt_tokens=args.max_prompt_tokens,
     )
-    span_table, span_names = resolve_spans(
-        args, tokenizer=tokenizer, rendered=rendered, digest=digest
-    )
+    span_table, span_names = resolve_spans(args, tokenizer=tokenizer, rendered=rendered)
     corpus = PreparedCorpus(
         stimuli=stimuli,
         digest=digest,

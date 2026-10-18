@@ -19,7 +19,7 @@ import json
 import logging
 import shutil
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -101,6 +101,7 @@ from reward_hacking.hatch_probe_cli import (
     _dry_run_plan,
     _parse_args,
     _refuse_below_batch_floor,
+    _refuse_resumed_handle_mismatch,
     _resolve_batch_wait,
     _resolve_prefilled_think,
     batch_handle_path_for,
@@ -1720,6 +1721,8 @@ class StubBatchBackend:
             record_count=len(prompts),
             prompt_digest=prompt_digest(prompts),
             cell_digest=cell_digest(list(metadata or [])),
+            submitted_prompts=list(prompts),
+            submitted_cells=None if metadata is None else [dict(item) for item in metadata],
             input_uri="s3://stub-bucket/batch/input.jsonl",
             output_uri="s3://stub-bucket/batch/output/",
             region="us-west-2",
@@ -1835,7 +1838,9 @@ class TestOneBatchJobForEveryCell:
             },
             "chat_template_kwargs": {},
         }
-        with pytest.raises(RuntimeError, match="cell digest"):
+        with pytest.raises(
+            RuntimeError, match=r"cells\[0\]\.run_identity\.hint_identity\.hint_variant"
+        ):
             sample_all_cells_in_one_batch(
                 cast("BedrockBatchBackend", stub),
                 inputs,
@@ -1929,7 +1934,7 @@ class TestBatchHandleSurvivesTheProcess:
             sample_all_cells(first, handle_path)
         drifted_ids = [f"lcbhard_8{index:02d}" for index in range(len(BATCH_PROBLEM_IDS))]
         fresh = StubBatchBackend()
-        with pytest.raises(RuntimeError, match="digest"):
+        with pytest.raises(RuntimeError, match=r"prompt\[0\] differs"):
             sample_all_cells(fresh, handle_path, problem_ids=drifted_ids)
         assert fresh.submitted == [], "a mismatched resume must not quietly submit a new job either"
 
@@ -2257,6 +2262,41 @@ class TestMainDrivesTheBatchResume:
         with pytest.raises(RuntimeError, match="refused"):
             hatch_probe_cli.main(argv)
         assert records_path.read_text(encoding="utf-8") == interrupted
+
+
+class TestBatchHandleContentIdentity:
+    def test_changed_digest_provenance_does_not_reject_matching_content(self, tmp_path: Path):
+        backend = StubBatchBackend()
+        prompts = ["synthetic prompt one", "synthetic prompt two"]
+        metadata: list[dict[str, object]] = [
+            {"cell": "control", "sample": 0},
+            {"cell": "treatment", "sample": 0},
+        ]
+        handle = backend.submit(prompts, metadata=metadata)
+        handle = replace(handle, prompt_digest="old prompt digest", cell_digest="old cell digest")
+
+        _refuse_resumed_handle_mismatch(
+            handle,
+            cast("BedrockBatchBackend", backend),
+            repeated=prompts,
+            metadata=metadata,
+            handle_path=tmp_path / "batch-handle.json",
+        )
+
+    def test_cell_change_is_refused_by_its_named_field(self, tmp_path: Path):
+        backend = StubBatchBackend()
+        prompts = ["synthetic prompt"]
+        metadata: list[dict[str, object]] = [{"cell": "control", "sample": 0}]
+        handle = backend.submit(prompts, metadata=metadata)
+
+        with pytest.raises(RuntimeError, match=r"cells\[0\]\.cell differs"):
+            _refuse_resumed_handle_mismatch(
+                handle,
+                cast("BedrockBatchBackend", backend),
+                repeated=prompts,
+                metadata=[{"cell": "treatment", "sample": 0}],
+                handle_path=tmp_path / "batch-handle.json",
+            )
 
 
 class TestGiveUpLevelRendering:
@@ -2708,7 +2748,7 @@ class TestJailedDoubleGrading:
 
 
 class TestRecordsCarryTheirResumeIdentityAndTelemetry:
-    """The prompt digest is what a resume checks; the five accounting fields are what a cost re-pricing
+    """Stored prompt text is what a resume checks; the five accounting fields are what a cost re-pricing
     and a barrier analysis read. Both were absent from every production corpus, so ``from_json_dict``
     must load an old line with them ``None`` rather than refuse it."""
 
@@ -2724,6 +2764,7 @@ class TestRecordsCarryTheirResumeIdentityAndTelemetry:
         assert record.prompt_digest != prompt_digest_for_record(
             render_cell_prompt(problems[0], cell())
         ), "another cell's prompt digests differently, or the check cannot see a redraft"
+        assert record.prompt_text == render_cell_prompt(problems[0], the_cell)
 
     def test_the_telemetry_lands_on_the_record_from_the_response(self):
         problems = [synthetic_problem(SPLIT_ONEOFF)]
@@ -2948,9 +2989,7 @@ class TestLiveResumeReadsBackOnlyThisRunsFinishedCells:
             )
 
     def test_a_record_whose_prompt_no_longer_renders_is_refused(self, tmp_path: Path):
-        """SABOTAGE target: skipping the digest. An edited hatch paragraph, framing sentence or
-        problem statement renders new prompts under the old cell labels; resuming onto the old
-        replies would report the edit finished while the file held the old text's answers."""
+        """Directly compare stored prompt text, even when its old digest was refreshed."""
         records_path, _, _ = _finished_cells_on_disk(tmp_path, [PROBE_CELLS[0]])
         redrafted = cell_inputs_by_label(
             paired_problems(
@@ -2958,17 +2997,47 @@ class TestLiveResumeReadsBackOnlyThisRunsFinishedCells:
                 statements={"lcbhard_901": "def solve_901(a, b):\n    return a * b\n"},
             )
         )
-        with pytest.raises(ValueError, match=r"refusing to resume.*prompt_digest="):
+        rows = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+        for row in rows:
+            row["prompt_digest"] = prompt_digest_for_record(
+                redrafted[PROBE_CELLS[0].label].prompts[row["group_index"]]
+            )
+        records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with pytest.raises(ValueError, match=r"refusing to resume.*prompt_text"):
             load_resumable_cells(records_path, redrafted, context=_context(), cells=PROBE_CELLS)
 
-    def test_a_record_predating_resume_cannot_be_resumed(self, tmp_path: Path):
+    def test_changed_digest_does_not_refuse_matching_stored_prompt_text(self, tmp_path: Path):
+        records_path, inputs, _ = _finished_cells_on_disk(tmp_path, [PROBE_CELLS[0]])
+        rows = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+        for row in rows:
+            row["prompt_digest"] = "edited provenance digest"
+        records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        resumed = load_resumable_cells(records_path, inputs, context=_context(), cells=PROBE_CELLS)
+
+        assert set(resumed) == {PROBE_CELLS[0].label}
+
+    def test_a_record_without_a_digest_can_resume_from_its_stored_prompt_text(self, tmp_path: Path):
         records_path, inputs, _ = _finished_cells_on_disk(tmp_path, [PROBE_CELLS[0]])
         rows = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
         for row in rows:
             del row["prompt_digest"]
         records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        with pytest.raises(ValueError, match="predates resume"):
-            load_resumable_cells(records_path, inputs, context=_context(), cells=PROBE_CELLS)
+
+        resumed = load_resumable_cells(records_path, inputs, context=_context(), cells=PROBE_CELLS)
+
+        assert set(resumed) == {PROBE_CELLS[0].label}
+
+    def test_a_legacy_digest_only_record_still_loads_and_resumes(self, tmp_path: Path):
+        records_path, inputs, _ = _finished_cells_on_disk(tmp_path, [PROBE_CELLS[0]])
+        rows = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+        for row in rows:
+            row.pop("prompt_text")
+        records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        resumed = load_resumable_cells(records_path, inputs, context=_context(), cells=PROBE_CELLS)
+
+        assert set(resumed) == {PROBE_CELLS[0].label}
 
     def test_a_record_filed_under_a_different_problem_at_its_group_is_refused(self, tmp_path: Path):
         records_path, _, _ = _finished_cells_on_disk(tmp_path, [PROBE_CELLS[0]])

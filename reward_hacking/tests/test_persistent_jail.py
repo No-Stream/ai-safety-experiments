@@ -81,6 +81,22 @@ def test_direct_signal_exit_uses_shell_convention(persistent_jail: PersistentJai
     assert result.timed_out is False
 
 
+def test_command_is_an_oom_victim_and_sigkill_does_not_end_the_episode(
+    persistent_jail: PersistentJail,
+) -> None:
+    score = persistent_jail.run("cat /proc/self/oom_score_adj")
+    assert score.ok
+    assert score.stdout.strip() == "1000"
+
+    killed = persistent_jail.run("kill -KILL $$")
+    assert killed.exit_code == 137
+    assert killed.timed_out is False
+    oom_note = "[command exited 137 (SIGKILL or cgroup OOM); episode supervisor remains available]"
+    assert oom_note in killed.stderr
+    assert oom_note in jailed_poc.strip_resource_limits_banner(killed.stderr)
+    assert persistent_jail.run("printf supervisor-alive").stdout == "supervisor-alive"
+
+
 def test_timeout_cleans_detached_background_descendants(persistent_jail: PersistentJail) -> None:
     result = persistent_jail.run(
         "setsid sh -c 'sleep 1; touch /work/leaked' & sleep 30", timeout="0.1s"

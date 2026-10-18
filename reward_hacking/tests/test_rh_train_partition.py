@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from reward_hacking import train_partition
 from reward_hacking.train_partition import (
     DEFAULT_PARTITION_PATH,
     HELD_OUT_SIDE,
@@ -45,6 +46,8 @@ def toy_partition(**overrides: object) -> HeldOutPartition:
         "held_out_fraction": 0.4,
         "pool_fingerprint": "deadbeef",
         "pool_size": 4,
+        "pool_schema": 1,
+        "pool_problem_ids": ("a", "b", "c", "d"),
         "training_problem_ids": ("a", "b"),
         "held_out_problem_ids": ("c", "d"),
     }
@@ -139,19 +142,44 @@ class TestStoredPartitionFile:
         with pytest.raises(FileNotFoundError, match="train_partition --write"):
             load_partition(tmp_path / "absent.json")
 
-    def test_a_moved_pool_is_refused_rather_than_silently_accepted(self, tmp_path: Path):
-        """The sabotage this file exists for: a partition drawn from a pool that has since changed.
-
-        Simulated by rewriting the recorded fingerprint, which is exactly what a regenerated case
-        file would produce -- the ids all still exist while the pool they were drawn from differs.
-        """
+    def test_a_changed_recorded_fingerprint_does_not_change_the_partition(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "partition.json"
         write_partition(build_partition(seed=0), path)
         payload = json.loads(path.read_text())
         payload["pool_fingerprint"] = "0" * 64
         path.write_text(json.dumps(payload))
-        with pytest.raises(RuntimeError, match="pool moved"):
+
+        loaded = load_partition(path)
+        assert loaded.pool_problem_ids is not None
+        assert loaded.pool_problem_ids == tuple(payload["pool_problem_ids"])
+
+    def test_a_moved_pool_names_added_and_removed_problem_ids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "partition.json"
+        partition = build_partition(seed=0)
+        write_partition(partition, path)
+        assert partition.pool_problem_ids is not None
+        old_id = partition.pool_problem_ids[-1]
+        added_id = "synthetic-new-problem"
+        live_pool = (*partition.pool_problem_ids[:-1], added_id)
+        monkeypatch.setattr(train_partition, "problem_pool", lambda: live_pool)
+
+        with pytest.raises(RuntimeError, match=rf"added.*{added_id}.*removed.*{old_id}"):
             load_partition(path)
+
+    def test_legacy_digest_only_partition_still_loads(self, tmp_path: Path) -> None:
+        partition = build_partition(seed=0)
+        path = tmp_path / "partition.json"
+        write_partition(partition, path)
+        payload = json.loads(path.read_text())
+        payload.pop("pool_problem_ids")
+        payload.pop("pool_schema")
+        path.write_text(json.dumps(payload))
+
+        assert load_partition(path).to_json_dict() == payload
 
 
 class TestSideAssertion:

@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from reward_hacking.backend_types import BedrockCompletion, TokenUsage
 from reward_hacking.bedrock_batch import BatchJobHandle, cell_digest, prompt_digest
 from reward_hacking.jagged import sweep
 from reward_hacking.jagged.items import Item
@@ -181,12 +182,159 @@ def _stub_handle(
         record_count=len(prompts),
         prompt_digest=prompt_digest(prompts),
         cell_digest=cell_digest(metadata),
+        submitted_prompts=list(prompts),
+        submitted_cells=[dict(entry) for entry in metadata],
         input_uri="s3://bucket/run/input.jsonl",
         output_uri="s3://bucket/run/output/",
         region="us-west-2",
         profile="stub-profile",
         submitted_at="2026-08-17T00:00:00+00:00",
     )
+
+
+def _collect_args(handle_dir: Path) -> Any:
+    return parse_args(
+        ["collect", "--items", f"{CORPUS_MODULE}:ITEMS", "--handle-dir", str(handle_dir)]
+    )
+
+
+def _submission_snapshot() -> tuple[list[str], list[dict[str, object]]]:
+    cells = sweep.render_cells(resolve_items(f"{CORPUS_MODULE}:ITEMS"))
+    prompts = [cell.prompt for cell in cells]
+    return prompts, sweep._metadata(cells)
+
+
+def _install_collect_backend(
+    monkeypatch: pytest.MonkeyPatch, collected_handles: list[BatchJobHandle]
+) -> None:
+    class CollectingBackend:
+        transport = "stub-batch"
+
+        def __init__(self, model_id: str, *, region: str, profile: str | None) -> None:
+            self.model_id = model_id
+            self.region = region
+            self.profile = profile
+
+        def collect(
+            self,
+            handle: BatchJobHandle,
+            *,
+            poll_seconds: int,
+            timeout_seconds: int,
+        ) -> list[BedrockCompletion]:
+            del poll_seconds, timeout_seconds
+            collected_handles.append(handle)
+            return [
+                BedrockCompletion(
+                    text="synthetic reply",
+                    reasoning="",
+                    usage=TokenUsage(),
+                    stop_reason="end_turn",
+                )
+                for _ in range(handle.record_count)
+            ]
+
+    monkeypatch.setattr(sweep, "BedrockBatchBackend", CollectingBackend)
+
+
+@pytest.mark.usefixtures("corpus_module")
+class TestCollectSubmissionIdentity:
+    def _save_handle(self, handle_dir: Path, *, legacy: bool = False, oldest: bool = False) -> Path:
+        prompts, metadata = _submission_snapshot()
+        handle = _stub_handle(NOVA_MICRO, prompts, metadata)
+        path = handle_dir / "handle.json"
+        handle.save(path)
+        if legacy:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload.pop("submitted_prompts")
+            payload.pop("submitted_cells")
+            if oldest:
+                payload.pop("cell_digest")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_a_prompt_edit_is_named_before_the_paid_job_is_collected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._save_handle(tmp_path)
+        module = sys.modules[CORPUS_MODULE]
+        monkeypatch.setattr(
+            module,
+            "ITEMS",
+            (replace(build_item(0), task="Use a synthetic replacement task."), build_item(1)),
+        )
+        monkeypatch.setattr(
+            sweep,
+            "BedrockBatchBackend",
+            lambda *_args, **_kwargs: pytest.fail("the stale paid job must not be collected"),
+        )
+
+        with pytest.raises(RuntimeError, match=r"prompt\[0\]"):
+            sweep.collect(_collect_args(tmp_path))
+
+    def test_a_label_edit_with_unchanged_prompt_names_the_changed_cell_field(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        prompts, _metadata = _submission_snapshot()
+        self._save_handle(tmp_path)
+        module = sys.modules[CORPUS_MODULE]
+        relabelled = replace(build_item(0), dimension="counting")
+        monkeypatch.setattr(module, "ITEMS", (relabelled, build_item(1)))
+        current_prompts, current_metadata = _submission_snapshot()
+        # The source item must differ only in its aggregation label for this test to isolate the
+        # prompt-to-cell distinction the cell identity protects.
+        assert current_prompts == prompts
+        assert current_metadata[0]["dimension"] == "counting"
+        monkeypatch.setattr(
+            sweep,
+            "BedrockBatchBackend",
+            lambda *_args, **_kwargs: pytest.fail("the stale paid job must not be collected"),
+        )
+
+        with pytest.raises(RuntimeError, match=r"cells\[0\]\.dimension"):
+            sweep.collect(_collect_args(tmp_path))
+
+    def test_readable_submission_matches_ignore_digest_only_drift(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        prompts, metadata = _submission_snapshot()
+        handle = replace(
+            _stub_handle(NOVA_MICRO, prompts, metadata),
+            prompt_digest="old-provenance-value",
+            cell_digest="different-provenance-value",
+        )
+        handle.save(tmp_path / "handle.json")
+        collected_handles: list[BatchJobHandle] = []
+        _install_collect_backend(monkeypatch, collected_handles)
+
+        assert sweep.collect(_collect_args(tmp_path)) == 0
+        assert len(collected_handles) == 1
+
+    def test_a_legacy_digest_only_handle_still_collects_when_the_grid_matches(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._save_handle(tmp_path, legacy=True)
+        collected_handles: list[BatchJobHandle] = []
+        _install_collect_backend(monkeypatch, collected_handles)
+
+        assert sweep.collect(_collect_args(tmp_path)) == 0
+        assert len(collected_handles) == 1
+
+    def test_the_oldest_handle_warns_when_it_cannot_check_cell_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._save_handle(tmp_path, legacy=True, oldest=True)
+        collected_handles: list[BatchJobHandle] = []
+        _install_collect_backend(monkeypatch, collected_handles)
+
+        with caplog.at_level(logging.WARNING, logger=sweep.logger.name):
+            assert sweep.collect(_collect_args(tmp_path)) == 0
+
+        assert len(collected_handles) == 1
+        assert "cell metadata" in caplog.text
 
 
 PAID_FOR_HANDLE_CELL = [

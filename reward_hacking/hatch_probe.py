@@ -805,13 +805,7 @@ class ProbeRunContext:
 
 
 def prompt_digest_for_record(prompt: str) -> str:
-    """Digest one rendered prompt the way every record stores it, as the live path's resume identity.
-
-    Records deliberately carry no prompt text, so the digest is the only thing that ties a stored
-    record to the exact prompt it answered: a resume compares it against a fresh rendering, and an
-    edited hatch paragraph, framing sentence or problem statement then refuses to resume onto the
-    old records rather than filing two experiments under one cell.
-    """
+    """Digest a rendered prompt for provenance and digest-only legacy record compatibility."""
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
@@ -821,8 +815,9 @@ class HatchProbeRecord:
 
     The trailing defaulted fields were added after the first production corpora were written, so a
     stored record without them reads ``None`` through :meth:`from_json_dict` rather than failing to
-    load. ``prompt_digest`` is the resume identity (:func:`prompt_digest_for_record`); the other
-    five are the per-call accounting the live path reports and the batch path cannot (see
+    load. ``prompt_text`` is the live resume identity. ``prompt_digest`` is retained as provenance
+    and supports older records that do not carry prompt text. The other five are the per-call
+    accounting the live path reports and the batch path cannot (see
     ``RawResponse``): the prompt-cache split of the input count and the call's latency telemetry.
     """
 
@@ -855,6 +850,7 @@ class HatchProbeRecord:
     sampler: Mapping[str, object]
     recorded_at: str
     prompt_digest: str | None = None
+    prompt_text: str | None = None
     cache_read_input_tokens: int | None = None
     cache_write_input_tokens: int | None = None
     elapsed_seconds: float | None = None
@@ -931,6 +927,7 @@ class HatchProbeRecord:
             "sampler": dict(self.sampler),
             "recorded_at": self.recorded_at,
             "prompt_digest": self.prompt_digest,
+            "prompt_text": self.prompt_text,
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_write_input_tokens": self.cache_write_input_tokens,
             "elapsed_seconds": self.elapsed_seconds,
@@ -991,6 +988,7 @@ class HatchProbeRecord:
             sampler=dict(row["sampler"]),
             recorded_at=str(row["recorded_at"]),
             prompt_digest=row.get("prompt_digest"),
+            prompt_text=row.get("prompt_text"),
             cache_read_input_tokens=row.get("cache_read_input_tokens"),
             cache_write_input_tokens=row.get("cache_write_input_tokens"),
             elapsed_seconds=row.get("elapsed_seconds"),
@@ -1179,6 +1177,7 @@ def build_cell_records(
         zip(responses, stripped, solutions, dispositions, strict=True)
     ):
         problem = problems[index // context.samples_per_prompt]
+        prompt_text = render_cell_prompt(problem, cell, leakage_hint=context.leakage_hint)
         grades = grades_by_index.get(index, ())
         records.append(
             HatchProbeRecord(
@@ -1222,9 +1221,8 @@ def build_cell_records(
                 hint_sha256=context.hint_identity["hint_sha256"],
                 chat_template_kwargs=context.chat_template_kwargs,
                 # Re-rendered with the same pure function ``cell_inputs_by_label`` used: no drift.
-                prompt_digest=prompt_digest_for_record(
-                    render_cell_prompt(problem, cell, leakage_hint=context.leakage_hint)
-                ),
+                prompt_digest=prompt_digest_for_record(prompt_text),
+                prompt_text=prompt_text,
                 cache_read_input_tokens=response.cache_read_input_tokens,
                 cache_write_input_tokens=response.cache_write_input_tokens,
                 elapsed_seconds=response.elapsed_seconds,
@@ -1490,10 +1488,10 @@ def load_resumable_cells(
     Refusals, each because skipping would file two experiments under one artifact: a record whose
     cell is not one of this run's (a different design under the same ``--out``); a cell with a
     partial count (records were lost or misfiled -- ``probe_summary`` refuses the same shape); a
-    record whose ``model_id``, ``transport`` or ``sampler`` is not this run's; a record whose
-    ``prompt_digest`` is not the digest of the prompt this run renders for its problem (an edited
-    hatch paragraph, framing sentence or corpus); and a record with no digest at all, which
-    predates resume and cannot be checked. Every refusal names the cell and the field.
+    record whose ``model_id``, ``transport`` or ``sampler`` is not this run's; and a record whose
+    stored prompt text differs from the prompt this run renders for its problem (an edited hatch
+    paragraph, framing sentence or corpus). Older digest-only records retain their digest check;
+    records without either field load and resume on the remaining identity fields.
     """
     if not records_path.exists():
         return {}
@@ -1552,21 +1550,23 @@ def _record_drift(
     if stored_sampler != run_sampler:
         drifted.append(f"sampler={stored_sampler!r} on disk but {run_sampler!r} here")
     drifted.extend(_run_identity_drift(record, context))
-    if record.prompt_digest is None:
-        drifted.append("prompt_digest is absent: the record predates resume and cannot be checked")
-        return drifted
     if not 0 <= record.group_index < len(inputs.problems):
         drifted.append(
             f"group_index={record.group_index} is outside this run's {len(inputs.problems)} problems"
         )
         return drifted
-    expected_digest = prompt_digest_for_record(inputs.prompts[record.group_index])
-    if record.prompt_digest != expected_digest:
-        drifted.append(
-            f"prompt_digest={record.prompt_digest} on disk but {expected_digest} for the prompt "
-            f"this run renders"
-        )
-    elif record.problem_id != inputs.problems[record.group_index].task_id:
+    expected_prompt = inputs.prompts[record.group_index]
+    if record.prompt_text is not None:
+        if record.prompt_text != expected_prompt:
+            drifted.append("prompt_text differs from the prompt this run renders")
+    elif record.prompt_digest is not None:
+        expected_digest = prompt_digest_for_record(expected_prompt)
+        if record.prompt_digest != expected_digest:
+            drifted.append(
+                f"prompt_digest={record.prompt_digest} on a legacy record but {expected_digest} "
+                "for the prompt this run renders"
+            )
+    if record.problem_id != inputs.problems[record.group_index].task_id:
         drifted.append(
             f"problem_id={record.problem_id!r} on disk but "
             f"{inputs.problems[record.group_index].task_id!r} at group {record.group_index} here"

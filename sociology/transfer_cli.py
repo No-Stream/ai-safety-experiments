@@ -83,6 +83,7 @@ from sociology.cli_helpers import (
     submit_summary_path,
 )
 from sociology.decoupled_scans import refuse_pooled_stimulus_mixture
+from sociology.judge_loop import identity_differences, prompt_identity_mismatches
 from sociology.model_stub import ScriptedDetailedBackend
 from sociology.records import (
     append_replies,
@@ -90,7 +91,6 @@ from sociology.records import (
     load_replies,
     make_live_backend_factory,
     record_prompt_digest,
-    refuse_changed_resume,
     run_live_calls,
     write_summary,
 )
@@ -257,8 +257,8 @@ def reply_record(
 ) -> dict[str, Any]:
     """Build one reply record: every planned label, the sampler stamp, the reply, and completeness.
 
-    The prompt text is not stored -- it is re-derivable from the labels plus the stimulus file -- but its
-    digest and length are, so a record can be proved to answer the prompt this code renders today.
+    The rendered prompt and call labels stay in the gitignored run artifact so a resumed key can be
+    checked against the exact text and cell identity it answered. The digest and length remain metadata.
 
     ``stimulus_digest`` carries the stimulus PROMPT digest (:attr:`TransferStimulus.prompt_digest`), not
     the whole-file one: the field keeps its name so every reader joins on the same column, but it now
@@ -289,6 +289,8 @@ def reply_record(
         "stimulus_digest": stimulus.prompt_digest,
         "prompt_digest": record_prompt_digest(call.prompt),
         "prompt_chars": len(call.prompt),
+        "rendered_prompt": call.prompt,
+        "call_identity": call.metadata(),
         "reply": completion.text,
         "reasoning": completion.reasoning,
         "stop_reason": completion.stop_reason,
@@ -300,6 +302,80 @@ def reply_record(
         **completion_telemetry(completion),
         "recorded_at": datetime.now(UTC).isoformat(),
     }
+
+
+def _batch_prompt_identity(
+    calls: Sequence[PlannedCall], backend: BedrockBatchBackend
+) -> dict[str, Any]:
+    """Readable prompt and cell identity for one submitted batch leg."""
+    return {
+        "model_id": backend.model_id,
+        "sampling": {
+            "max_tokens": backend.sampling.max_tokens,
+            "reasoning_effort": backend.sampling.reasoning_effort,
+        },
+        "calls": [
+            {"key": call.key, "metadata": call.metadata(), "prompt": call.prompt} for call in calls
+        ],
+    }
+
+
+def _batch_prompt_identity_path(run_dir: Path, leg: Leg) -> Path:
+    """Keep rendered prompt text beside its run's other gitignored artifacts."""
+    return run_dir / "prompt-identities" / f"{leg.file_stem}.json"
+
+
+def _check_batch_prompt_identity(path: Path, expected: Mapping[str, Any]) -> bool:
+    """Compare a saved batch identity, returning false for an older handle without one."""
+    if not path.exists():
+        logger.warning(
+            "saved batch identity %s is absent; this legacy handle has no rendered prompt text to compare",
+            path,
+        )
+        return False
+    recorded = json.loads(path.read_text(encoding="utf-8"))
+    differences = identity_differences(expected, recorded)
+    if differences:
+        raise RuntimeError(
+            f"saved batch prompt identity at {path} differs in {differences}; this invocation would "
+            "submit different prompts or cell labels. Use a fresh run directory."
+        )
+    return True
+
+
+def _write_batch_prompt_identity(path: Path, identity: Mapping[str, Any]) -> None:
+    refuse_tracked_trace_path(path, carries="rendered prompts and cell labels")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+
+
+def _refuse_changed_readable_resume(
+    existing: Mapping[str, Mapping[str, Any]], calls: Sequence[PlannedCall], *, path: Path
+) -> None:
+    """Check readable prompt and cell fields before skipping a key from a prior run."""
+    legacy_keys: list[str] = []
+    for call in calls:
+        row = existing.get(call.key)
+        if row is None:
+            continue
+        if "rendered_prompt" not in row or "call_identity" not in row:
+            legacy_keys.append(call.key)
+            continue
+        expected = {"rendered_prompt": call.prompt, "call_identity": call.metadata()}
+        actual = {"rendered_prompt": row["rendered_prompt"], "call_identity": row["call_identity"]}
+        differences = identity_differences(expected, actual)
+        if differences:
+            raise ValueError(
+                f"refusing to resume {call.key} from {path}: {differences} differ. A resumed key must "
+                "answer the same rendered prompt with the same cell labels; use a fresh run directory."
+            )
+    if legacy_keys:
+        logger.warning(
+            "%d existing reply rows in %s use the digest-only format; their hash fields are not used "
+            "as a semantic gate",
+            len(legacy_keys),
+            path,
+        )
 
 
 def _leg_sampling(leg: Leg) -> BedrockSamplingConfig:
@@ -512,9 +588,9 @@ def _refuse_resumed_handle_mismatch(
 
     Cell membership is positional, so collecting someone else's job against these locally rendered inputs
     would file real responses under the wrong cells or sampler labels -- every count plausible and wrong.
-    Five things are compared, and each has failed somewhere in this repo's history: the model id, the
-    record count, the prompt digest, the cell digest, and the sampling labels (which matter because the
-    records' sampler stamp comes from this invocation's config, not the handle's).
+    The handle's model, record count and sampler are compared here. Rendered prompts and cell labels are
+    compared through the readable sidecar saved beside the handle; legacy handles without that sidecar
+    remain loadable and report that their prompt text was unavailable for comparison.
     """
     mismatches: list[str] = []
     if handle.model_id != backend.model_id:
@@ -523,10 +599,6 @@ def _refuse_resumed_handle_mismatch(
         mismatches.append(
             f"{handle.record_count} records on the handle vs {len(calls)} rendered here"
         )
-    if handle.prompt_digest != prompt_digest([call.prompt for call in calls]):
-        mismatches.append("the prompt digest (the rendered prompt text differs)")
-    if handle.cell_digest != cell_digest([call.metadata() for call in calls]):
-        mismatches.append("the cell digest (the prompts match but their cell labels moved)")
     mismatches.extend(
         handle.sampling_label_mismatches(
             max_tokens=backend.sampling.max_tokens,
@@ -648,6 +720,14 @@ def submit_batch(  # noqa: PLR0913 - one keyword per guard; the last two are the
         return summary
     backend = _batch_backend(leg, run_dir)
     resumed = path.exists()
+    if resumed:
+        _prepare_run_stimulus_identity(
+            run_dir, stimulus_prompt_identity(stimulus), allow_create=False
+        )
+    call_identity_path = _batch_prompt_identity_path(run_dir, leg)
+    call_identity = _batch_prompt_identity(calls, backend)
+    if resumed:
+        _check_batch_prompt_identity(call_identity_path, call_identity)
     digest_recorded_at_submit = True
     if resumed:
         handle = BatchJobHandle.load(path)
@@ -671,6 +751,10 @@ def submit_batch(  # noqa: PLR0913 - one keyword per guard; the last two are the
             calls_per_group=canary_calls,
             backend_factory=canary_backend_factory,
         )
+        _prepare_run_stimulus_identity(
+            run_dir, stimulus_prompt_identity(stimulus), allow_create=True
+        )
+        _write_batch_prompt_identity(call_identity_path, call_identity)
         handle = backend.submit(
             [call.prompt for call in calls], metadata=[call.metadata() for call in calls]
         )
@@ -683,8 +767,10 @@ def submit_batch(  # noqa: PLR0913 - one keyword per guard; the last two are the
         "job_name": handle.job_name,
         "stimulus_digest": stimulus.digest,
         "stimulus_prompt_digest": stimulus.prompt_digest,
+        "stimulus_prompt_identity": stimulus_prompt_identity(stimulus),
         "resumed_handle": resumed,
         "stimulus_prompt_digest_recorded_at_submit": digest_recorded_at_submit,
+        "stimulus_prompt_identity_recorded_at_submit": digest_recorded_at_submit,
         "refusal_canary": canary,
     }
     write_summary(run_dir, submit_summary_label(leg), summary)
@@ -695,7 +781,7 @@ def submit_batch(  # noqa: PLR0913 - one keyword per guard; the last two are the
 def _refuse_resumed_submit_under_a_different_stimulus(
     run_dir: Path, leg: Leg, stimulus: TransferStimulus
 ) -> bool:
-    """Refuse to rewrite a submit summary with a stimulus prompt digest the job never ran under.
+    """Refuse to rewrite a submit summary with prompt material the job never ran under.
 
     ``submit-batch`` against an existing handle submits nothing and rewrites the summary, which is the
     documented repair for a lost summary and, unguarded, the one way to launder the collect-time guard:
@@ -704,23 +790,26 @@ def _refuse_resumed_submit_under_a_different_stimulus(
     The five-way handle check cannot see it either, because a prompt-affecting field this leg never
     renders leaves every one of its prompts byte-identical.
 
-    Returns whether the digest really was recorded at submit time. A summary that is simply absent
-    carries no evidence in either direction, so the repair still runs and the rewritten summary records
-    that its digest was reconstructed rather than claiming a provenance it does not have.
+    Returns whether the readable identity was recorded at submit time. A summary that is simply absent
+    carries no evidence in either direction, so the repair still runs and records that identity was
+    reconstructed rather than claiming provenance it does not have.
     """
     path = submit_summary_path(run_dir, leg)
     if not path.exists():
         return False
-    recorded = json.loads(path.read_text(encoding="utf-8")).get("stimulus_prompt_digest")
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    recorded = summary.get("stimulus_prompt_identity")
     if recorded is None:
+        logger.warning(
+            "%s has only legacy stimulus digest metadata; it is not used as a semantic gate", path
+        )
         return False
-    if recorded != stimulus.prompt_digest:
+    differences = identity_differences(stimulus_prompt_identity(stimulus), recorded)
+    if differences:
         raise RuntimeError(
-            f"leg {leg.leg_id} was submitted under stimulus prompt digest {recorded!r} (per {path}) and "
-            f"this invocation loaded {stimulus.prompt_digest!r}. Rewriting the summary would make the "
-            f"collect-time stimulus check compare the new digest with itself and pass, stamping rows "
-            f"sampled under one stimulus as answers to another. Restore the stimulus file the submit "
-            f"used, or point --run-dir somewhere fresh and submit (and pay for) a new job."
+            f"leg {leg.leg_id} was submitted with different stimulus prompt fields in {differences} "
+            f"(per {path}). Rewriting the summary would label its replies with new prompt material. "
+            "Restore the stimulus fields used at submit, or use a fresh run directory."
         )
     return True
 
@@ -728,7 +817,7 @@ def _refuse_resumed_submit_under_a_different_stimulus(
 def _refuse_collect_under_a_different_stimulus(
     run_dir: Path, leg: Leg, stimulus: TransferStimulus, *, stimulus_unchanged_since_submit: bool
 ) -> None:
-    """Refuse to collect a job whose submit recorded a different stimulus prompt digest.
+    """Refuse to collect a job whose submit recorded different prompt material.
 
     Every collected row is stamped with the prompt digest of the stimulus loaded NOW, so a stimulus whose
     prompt material moved between submit and collect would label rows sampled under one file as answers
@@ -753,12 +842,22 @@ def _refuse_collect_under_a_different_stimulus(
             f"already saved it submits nothing new and only rewrites the summary."
         )
     summary = json.loads(path.read_text(encoding="utf-8"))
-    recorded_at_submit = summary.get("stimulus_prompt_digest_recorded_at_submit")
+    recorded = summary.get("stimulus_prompt_identity")
+    if recorded is None:
+        logger.warning(
+            "%s has no readable stimulus prompt identity; its legacy digest is not a semantic gate",
+            path,
+        )
+        return
+    recorded_at_submit = summary.get(
+        "stimulus_prompt_identity_recorded_at_submit",
+        summary.get("stimulus_prompt_digest_recorded_at_submit"),
+    )
     if recorded_at_submit is False and not stimulus_unchanged_since_submit:
         raise RuntimeError(
-            f"{path} says its stimulus prompt digest was NOT recorded at submit time: the summary was "
+            f"{path} says its stimulus prompt identity was NOT recorded at submit time: the summary was "
             f"rebuilt by the repair path (`submit-batch` against a saved handle), which loaded the "
-            f"digest as it stands now rather than as the job was submitted under. The check below would "
+            f"identity as it stands now rather than as the job was submitted under. The check below would "
             f"then compare that value with itself and agree, so it proves nothing here. Pass "
             f"--stimulus-unchanged-since-submit if you know the prompt-affecting fields have not moved "
             f"since this job was submitted -- that is an operator statement about the file's history, "
@@ -766,18 +865,17 @@ def _refuse_collect_under_a_different_stimulus(
         )
     if recorded_at_submit is None:
         logger.warning(
-            "%s carries no stimulus_prompt_digest_recorded_at_submit, so whether its digest was "
+            "%s carries no stimulus_prompt_identity_recorded_at_submit, so whether its identity was "
             "observed at submit or reconstructed by a repair is unknown; it was written before that "
-            "field existed. The digest comparison below still runs.",
+            "field existed. Legacy digest metadata is not used as a semantic gate.",
             path,
         )
-    recorded = summary.get("stimulus_prompt_digest")
-    if recorded != stimulus.prompt_digest:
+    differences = identity_differences(stimulus_prompt_identity(stimulus), recorded)
+    if differences:
         raise RuntimeError(
-            f"leg {leg.leg_id} was submitted under stimulus prompt digest {recorded!r} (per {path}) "
-            f"and this invocation loaded {stimulus.prompt_digest!r}. Collecting would stamp rows sampled "
-            f"under one stimulus as answers to another. Restore the stimulus file the submit used, or "
-            f"point --run-dir somewhere fresh and submit (and pay for) a new job."
+            f"leg {leg.leg_id} was submitted with different stimulus prompt fields in {differences} "
+            f"(per {path}). Collecting would label rows sampled under one stimulus as answers to another. "
+            "Restore the stimulus fields used at submit, or use a fresh run directory."
         )
 
 
@@ -807,19 +905,18 @@ def collect_batch(
     path = handle_path(run_dir, leg)
     handle = BatchJobHandle.load(path)
     backend = _batch_backend(leg, run_dir)
+    _prepare_run_stimulus_identity(run_dir, stimulus_prompt_identity(stimulus), allow_create=False)
+    _check_batch_prompt_identity(
+        _batch_prompt_identity_path(run_dir, leg), _batch_prompt_identity(calls, backend)
+    )
     _refuse_resumed_handle_mismatch(handle, backend, calls=calls, path=path)
     _refuse_collect_under_a_different_stimulus(
         run_dir, leg, stimulus, stimulus_unchanged_since_submit=stimulus_unchanged_since_submit
     )
-    completions = backend.collect(handle, timeout_seconds=timeout_seconds)
     out_path = reply_path(run_dir, leg)
     existing = load_replies(out_path)
-    refuse_changed_resume(
-        existing,
-        calls,
-        path=out_path,
-        resume_identity=lambda call: _resume_identity(call, stimulus),
-    )
+    _refuse_changed_readable_resume(existing, calls, path=out_path)
+    completions = backend.collect(handle, timeout_seconds=timeout_seconds)
     records: list[dict[str, Any]] = []
     resumed = 0
     incomplete = 0
@@ -888,20 +985,21 @@ def _run_live_calls(  # noqa: PLR0913 - one argument per seam; the last one is t
 ) -> dict[str, int]:
     """Run planned calls through the shared resume loop with this pass's row schema.
 
-    ``resume_identity`` is what makes the resume safe rather than merely cheap: a key already on disk is
-    skipped only if its record was produced for this same prompt from this same prompt material. An
-    edited frame or clause renders new prompts under the OLD keys, and without this the second pass would
-    skip every one of them and report itself complete. The stimulus side compares the PROMPT digest, not
-    the whole-file one: a rubric or validation-reply edit changes what the judge reads and nothing a reply
-    row answered, and refusing every resume for it was the failure this split removed.
+    Existing rows with readable prompt text are checked before the shared loop skips their keys. Older
+    digest-only rows remain loadable; their digest fields are metadata and cannot stand in for a readable
+    semantic comparison.
     """
+    existing = load_replies(out_path)
+    _prepare_run_stimulus_identity(
+        out_path.parent, stimulus_prompt_identity(stimulus), allow_create=True
+    )
+    _refuse_changed_readable_resume(existing, calls, path=out_path)
     return run_live_calls(
         calls,
         out_path,
         concurrency=concurrency,
         chunk_size=chunk_size,
         make_record=lambda call, completion: reply_record(call, completion, stimulus),
-        resume_identity=lambda call: _resume_identity(call, stimulus),
         backend_factory=(
             backend_factory
             if backend_factory is not None
@@ -911,18 +1009,32 @@ def _run_live_calls(  # noqa: PLR0913 - one argument per seam; the last one is t
     )
 
 
-def _resume_identity(call: PlannedCall, stimulus: TransferStimulus) -> dict[str, Any]:
-    """Say what a record on disk has to carry before its key may be skipped as already answered.
-
-    One function for both transports rather than a lambda inside the live loop, because a skipped key
-    means the same thing on either: this call was already answered. The batch collect used to skip on the
-    key alone, so a reply file that outlived its handle and its submit summary could be re-collected
-    under an edited stimulus and every surviving row counted as resumed.
-    """
-    return {
-        "stimulus_digest": stimulus.prompt_digest,
-        "prompt_digest": record_prompt_digest(call.prompt),
-    }
+def _prepare_run_stimulus_identity(
+    run_dir: Path, identity: Mapping[str, Any], *, allow_create: bool
+) -> None:
+    """Persist one readable stimulus identity for the run and compare it on later sampling."""
+    path = run_dir / "prompt-identities" / "stimulus.json"
+    if path.exists():
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+        differences = identity_differences(identity, recorded)
+        if differences:
+            raise ValueError(
+                f"refusing to sample in {run_dir}: readable stimulus fields {differences} "
+                "changed; use a fresh run directory."
+            )
+    elif any(reply_path.stat().st_size for reply_path in run_dir.glob("replies--*.jsonl")):
+        logger.warning(
+            "run directory %s has reply rows but no readable stimulus identity; legacy digest metadata "
+            "is not a semantic gate",
+            run_dir,
+        )
+    elif allow_create:
+        _write_batch_prompt_identity(path, identity)
+    else:
+        logger.warning(
+            "run directory %s has no readable stimulus identity; legacy digest metadata is not a semantic gate",
+            run_dir,
+        )
 
 
 def scan(run_dir: Path) -> dict[str, Any]:
@@ -935,6 +1047,42 @@ def rubric_digests(stimulus: TransferStimulus) -> dict[str, str]:
     return {
         game_id: judge_module.judge_digest(stimulus, game_id)
         for game_id in judge_module.VERDICT_SCHEMA_BY_GAME
+    }
+
+
+def judge_prompt_identity(stimulus: TransferStimulus) -> dict[str, Any]:
+    """Readable identity for every rubric and fixed section of the judge prompt."""
+    return {
+        "version": judge_module.JUDGE_PROMPT_VERSION,
+        "sections": list(judge_module.PROMPT_SCAFFOLD),
+        "rubrics": {
+            game_id: stimulus.judge_instructions[game_id]
+            for game_id in judge_module.VERDICT_SCHEMA_BY_GAME
+        },
+    }
+
+
+def intent_prompt_identity(stimulus: TransferStimulus) -> dict[str, Any]:
+    """Readable identity for the intent-check rubric and fixed prompt sections."""
+    return {
+        "version": judge_module.INTENT_CHECK_PROMPT_VERSION,
+        "sections": list(judge_module.INTENT_PROMPT_SCAFFOLD),
+        "rubric": stimulus.intent_instructions,
+    }
+
+
+def stimulus_prompt_identity(stimulus: TransferStimulus) -> dict[str, Any]:
+    """Store each prompt-affecting stimulus section under its readable field name."""
+    return {
+        "version": STIMULUS_VERSION,
+        "scenarios": repr(stimulus.scenarios),
+        "clause_templates": repr(stimulus.clause_templates),
+        "singular_clause_templates": repr(stimulus.singular_clause_templates),
+        "board_lead_in": stimulus.board_lead_in,
+        "unrelated_tasks": repr(stimulus.unrelated_tasks),
+        "boards": repr(stimulus.boards),
+        "track_record_sentences": repr(stimulus.track_record_sentences),
+        "paraphrase_instruction": stimulus.paraphrase_instruction,
     }
 
 
@@ -961,8 +1109,6 @@ def refuse_unvalidated_judge(run_dir: Path, stimulus: TransferStimulus, *, skip_
         )
         return True
     path = run_dir / JUDGE_VALIDATION_SUMMARY
-    digests = rubric_digests(stimulus)
-    shape = judge_module.judge_prompt_shape_digest()
     if not path.exists():
         raise RuntimeError(
             f"{path} does not exist, so this run has never validated its judge. Run "
@@ -971,22 +1117,15 @@ def refuse_unvalidated_judge(run_dir: Path, stimulus: TransferStimulus, *, skip_
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
     problems: list[str] = []
-    if payload.get("judge_prompt_digests") != digests:
-        problems.append(
-            f"it validated rubric digests {payload.get('judge_prompt_digests')}, not this run's "
-            f"{digests}"
+    problems.extend(
+        prompt_identity_mismatches(
+            payload,
+            identity_field="judge_prompt_identity",
+            version_field="judge_prompt_version",
+            expected=judge_prompt_identity(stimulus),
+            path=path,
         )
-    if payload.get("judge_prompt_version") != judge_module.JUDGE_PROMPT_VERSION:
-        problems.append(
-            f"it validated prompt version {payload.get('judge_prompt_version')!r}, not this run's "
-            f"{judge_module.JUDGE_PROMPT_VERSION!r}"
-        )
-    if payload.get("judge_prompt_shape_digest") != shape:
-        problems.append(
-            f"it validated prompt-shape digest {payload.get('judge_prompt_shape_digest')!r}, not this "
-            f"run's {shape!r}: the asked-for headers or another code-side section of the prompt has "
-            f"changed since that validation"
-        )
+    )
     if payload.get("misses"):
         problems.append(f"it reported {len(payload['misses'])} field misses")
     if payload.get("unparsed"):
@@ -1071,6 +1210,7 @@ def judge_validate(run_dir: Path) -> dict[str, Any]:
             "judge_prompt_version": judge_module.JUDGE_PROMPT_VERSION,
             "judge_prompt_digests": rubric_digests(stimulus),
             "judge_prompt_shape_digest": judge_module.judge_prompt_shape_digest(),
+            "judge_prompt_identity": judge_prompt_identity(stimulus),
             "stimulus_digest": stimulus.digest,
             "stimulus_prompt_digest": stimulus.prompt_digest,
             **report,
@@ -1196,8 +1336,6 @@ def refuse_unvalidated_intent_check(
         )
         return True
     path = run_dir / INTENT_VALIDATION_SUMMARY
-    digest = judge_module.intent_digest(stimulus)
-    shape = judge_module.intent_prompt_shape_digest()
     if not path.exists():
         raise RuntimeError(
             f"{path} does not exist, so this run has never validated its intent-check rubric. Run "
@@ -1206,22 +1344,15 @@ def refuse_unvalidated_intent_check(
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
     problems: list[str] = []
-    if payload.get("intent_prompt_digest") != digest:
-        problems.append(
-            f"it validated rubric digest {payload.get('intent_prompt_digest')!r}, not this run's "
-            f"{digest!r}"
+    problems.extend(
+        prompt_identity_mismatches(
+            payload,
+            identity_field="intent_prompt_identity",
+            version_field="intent_prompt_version",
+            expected=intent_prompt_identity(stimulus),
+            path=path,
         )
-    if payload.get("intent_prompt_version") != judge_module.INTENT_CHECK_PROMPT_VERSION:
-        problems.append(
-            f"it validated prompt version {payload.get('intent_prompt_version')!r}, not this run's "
-            f"{judge_module.INTENT_CHECK_PROMPT_VERSION!r}"
-        )
-    if payload.get("intent_prompt_shape_digest") != shape:
-        problems.append(
-            f"it validated prompt-shape digest {payload.get('intent_prompt_shape_digest')!r}, not this "
-            f"run's {shape!r}: the rules paragraphs, the rung clauses or another code-side section of "
-            f"the prompt has changed since that validation"
-        )
+    )
     if payload.get("misses"):
         problems.append(f"it reported {len(payload['misses'])} field misses")
     if payload.get("unparsed"):
@@ -1254,6 +1385,7 @@ def intent_check_validate(run_dir: Path) -> dict[str, Any]:
             "intent_prompt_version": judge_module.INTENT_CHECK_PROMPT_VERSION,
             "intent_prompt_digest": judge_module.intent_digest(stimulus),
             "intent_prompt_shape_digest": judge_module.intent_prompt_shape_digest(),
+            "intent_prompt_identity": intent_prompt_identity(stimulus),
             "stimulus_digest": stimulus.digest,
             "stimulus_prompt_digest": stimulus.prompt_digest,
             **report,
@@ -1343,12 +1475,14 @@ def _rows_under_the_current_intent_rubric(
     digest. The same predicate the per-row resume uses, so this figure and what the next pass would re-read
     cannot drift apart.
     """
-    digest = judge_module.intent_digest(stimulus)
     return sum(
         1
         for row in rows
         if judge_module.judged_under_current_rubric(
-            row, digest, prompt_version=judge_module.INTENT_CHECK_PROMPT_VERSION
+            row,
+            stimulus.intent_instructions,
+            prompt_version=judge_module.INTENT_CHECK_PROMPT_VERSION,
+            sections=judge_module.INTENT_CHECK_SCHEMA.scaffold,
         )
     )
 

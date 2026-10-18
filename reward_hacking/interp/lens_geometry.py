@@ -245,6 +245,7 @@ class GateProvenance:
     skip_first: int
     jlens_commit: str
     load_path: str
+    fit_id: str | None = None
     layer_convention: str = LAYER_CONVENTION_POST_BLOCK
 
     def as_payload(self) -> dict[str, object]:
@@ -257,13 +258,15 @@ class GateProvenance:
     def from_payload(cls, payload: Mapping[str, Any], *, source: Path) -> GateProvenance:
         """Rebuild from the JSON block, refusing one that lacks a field."""
         fields = {field.name for field in cls.__dataclass_fields__.values()}
-        missing = sorted(fields - set(payload))
+        optional_fields = {"fit_id"}
+        missing = sorted((fields - optional_fields) - set(payload))
         if missing:
             raise GateProvenanceError(
                 f"{source} carries no {missing}; a gate without full provenance cannot be held to a "
                 f"lens or to weights, so it is not read"
             )
-        values = {name: payload[name] for name in fields}
+        values = {name: payload[name] for name in fields if name in payload}
+        values.setdefault("fit_id", None)
         values["anchor_rows"] = tuple(
             (str(item_id), int(position)) for item_id, position in payload["anchor_rows"]
         )
@@ -490,7 +493,7 @@ class StoredDecodeGate:
 
 
 def assert_gate_matches_lens_file(gate: StoredDecodeGate, lens_path: Path) -> str:
-    """Refuse a gate whose anchors were recorded beside a different lens artifact; return the digest."""
+    """Check a legacy gate against the recorded lens digest; return the digest."""
     if gate.provenance is None:
         raise GateProvenanceError(
             f"gate {gate.lens_name!r} carries no provenance to hold to a lens"
@@ -506,19 +509,69 @@ def assert_gate_matches_lens_file(gate: StoredDecodeGate, lens_path: Path) -> st
 
 
 def assert_gate_matches_weights(
-    gate: StoredDecodeGate, weights_fingerprint: str, *, what: str
+    gate: StoredDecodeGate,
+    *,
+    model_label: str,
+    weights_identity: str,
+    what: str,
+    weights_fingerprint: str | None = None,
 ) -> None:
-    """Refuse a gate recorded on weights other than ``what``'s (a lens, a captured cell), by name."""
+    """Hold a gate to named model and revision fields, with a legacy local-weight fallback."""
     if gate.provenance is None:
         raise GateProvenanceError(
             f"gate {gate.lens_name!r} carries no provenance to hold to weights"
         )
-    if gate.provenance.weights_fingerprint != weights_fingerprint:
+    differences: dict[str, tuple[str, str]] = {}
+    if gate.provenance.model_label != model_label:
+        differences["model_label"] = (gate.provenance.model_label, model_label)
+    if gate.provenance.weights_identity != weights_identity:
+        legacy_local_identity_matches = (
+            gate.provenance.weights_identity.startswith("fingerprint:")
+            and weights_fingerprint is not None
+            and gate.provenance.weights_fingerprint == weights_fingerprint
+        )
+        if not legacy_local_identity_matches:
+            differences["weights_identity"] = (gate.provenance.weights_identity, weights_identity)
+    if differences:
         raise GateProvenanceError(
-            f"gate {gate.lens_name!r} was recorded on weights "
-            f"{gate.provenance.weights_fingerprint[:12]} ({gate.provenance.model_label}) but {what} "
-            f"serves weights {weights_fingerprint[:12]}; anchors from one checkpoint cannot gate "
-            f"residuals from another"
+            f"gate {gate.lens_name!r} cannot gate residuals from another checkpoint; "
+            + "; ".join(
+                f"{key}: gate {have!r}, {what} {wanted!r}"
+                for key, (have, wanted) in differences.items()
+            )
+        )
+
+
+def assert_gate_matches_lens_identity(
+    gate: StoredDecodeGate,
+    *,
+    fit_id: str | None,
+    model_label: str,
+    weights_identity: str,
+) -> None:
+    """Hold a gate to the readable fit identity recorded with its lens."""
+    if gate.provenance is None:
+        raise GateProvenanceError(
+            f"gate {gate.lens_name!r} carries no provenance to hold to a lens"
+        )
+    expected = {
+        "fit_id": fit_id,
+        "model_label": model_label,
+        "weights_identity": weights_identity,
+    }
+    actual = {
+        "fit_id": gate.provenance.fit_id,
+        "model_label": gate.provenance.model_label,
+        "weights_identity": gate.provenance.weights_identity,
+    }
+    differences = [
+        f"{field}: gate {actual[field]!r}, lens {expected[field]!r}"
+        for field in expected
+        if actual[field] != expected[field]
+    ]
+    if differences:
+        raise GateProvenanceError(
+            f"gate {gate.lens_name!r} and lens provenance differ: " + "; ".join(differences)
         )
 
 

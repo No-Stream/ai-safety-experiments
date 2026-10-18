@@ -57,14 +57,14 @@ def test_screen_hint_rows_keep_each_recoverable_identity_and_exclude_stale_legac
             "problem_id": "synthetic-stale",
             "hint_environment": "aisi_codecontests",
             "hint_variant": "current",
-            "hint_sha256": "0" * 64,
+            "hint_sha256": hashlib.sha256(b"Different synthetic legacy hint.").hexdigest(),
         },
         {
             "problem_id": "synthetic-historical-text",
             "hint_environment": "aisi_codecontests",
             "hint_variant": "historical",
             "hint_text": "Synthetic recorded hint.",
-            "hint_sha256": hashlib.sha256(b"Synthetic recorded hint.").hexdigest(),
+            "hint_sha256": hashlib.sha256(b"Different synthetic recorded hint.").hexdigest(),
         },
     ]
     hints, unavailable = prompts._screen_hint_records(
@@ -79,6 +79,33 @@ def test_screen_hint_rows_keep_each_recoverable_identity_and_exclude_stale_legac
     }
     assert hints["synthetic-historical-text"].text == "Synthetic recorded hint."
     assert unavailable == {"synthetic-stale": "historical hint unavailable: digest mismatch"}
+
+
+def test_atlas_prompt_uses_recorded_hint_text_when_digest_is_stale() -> None:
+    hint = LeakageHint(
+        environment="atlas_mbpp",
+        variant="specific",
+        text="Synthetic recorded Atlas hint.",
+    )
+    context = prompts.AtlasPromptContext(
+        tokenizer=_tokenizer(),
+        teacher_tokenizer=None,
+        screen_hints={"synthetic-item": hint},
+        unavailable_screen_ids={},
+        template_kwargs={},
+    )
+
+    resolved_hint = prompts._atlas_row_hint(
+        {
+            "hint_variant": hint.variant,
+            "hint_text": hint.text,
+            "hint_sha256": hashlib.sha256(b"Different synthetic Atlas hint.").hexdigest(),
+        },
+        context,
+        "synthetic-item",
+    )
+
+    assert resolved_hint == hint
 
 
 def test_screen_hint_identity_mismatch_does_not_hide_malformed_digest() -> None:

@@ -592,7 +592,121 @@ def test_metadata_contains_identity_inputs() -> None:
     assert metadata["cooperation_endpoint"] == "behavior"
     assert metadata["cooperation_manifest_digest"] == "manifest-digest"
     assert metadata["cooperation_rendered_prompt_digest"]
+    assert metadata["cooperation_rendered_prompts"] == [
+        {"identity": list(_request("synthetic prompt").identity), "prompt": "synthetic prompt"}
+    ]
     assert metadata["model_identity"] == "synthetic-model"
     assert metadata["adapter_weights_sha256"] == "adapter-weights"
     assert metadata["adapter_config_sha256"] == "adapter-config"
     assert metadata["settings"] == {"prefilled_think": True}
+
+
+def test_complete_cell_names_changed_rendered_prompt_field(
+    tmp_path: Path,
+) -> None:
+    request = _request("synthetic prompt A")
+    out_path = tmp_path / "behavior.jsonl"
+    expected_meta = runner.endpoint_meta(
+        endpoint="behavior",
+        manifest_path=None,
+        manifest_digest=None,
+        requests=(request,),
+        model_identity="synthetic-model",
+        adapter_digests={"weights": None, "config": None},
+        settings={"prefilled_think": True},
+    )
+    runner._run_native_cell(
+        MockBackend(["synthetic completion"]),
+        endpoint="behavior",
+        plan=(request,),
+        out_path=out_path,
+        config=EvalConfig(game_behavior_samples=1, prefilled_think=True),
+        meta=expected_meta,
+        submission=SUBMISSION_SERIAL,
+        admission=ADMISSION_FIFO,
+        resume=False,
+    )
+    changed_meta = {
+        **expected_meta,
+        "cooperation_rendered_prompts": [
+            {"identity": list(request.identity), "prompt": "synthetic prompt B"}
+        ],
+    }
+
+    with pytest.raises(ValueError, match="cooperation_rendered_prompts"):
+        runner._complete_cell(out_path, expected_meta=changed_meta)
+
+
+def test_complete_cell_ignores_rendered_prompt_digest_when_prompt_values_match(
+    tmp_path: Path,
+) -> None:
+    request = _request("synthetic prompt")
+    out_path = tmp_path / "behavior.jsonl"
+    expected_meta = runner.endpoint_meta(
+        endpoint="behavior",
+        manifest_path=None,
+        manifest_digest=None,
+        requests=(request,),
+        model_identity="synthetic-model",
+        adapter_digests={"weights": None, "config": None},
+        settings={"prefilled_think": True},
+    )
+    runner._run_native_cell(
+        MockBackend(["synthetic completion"]),
+        endpoint="behavior",
+        plan=(request,),
+        out_path=out_path,
+        config=EvalConfig(game_behavior_samples=1, prefilled_think=True),
+        meta=expected_meta,
+        submission=SUBMISSION_SERIAL,
+        admission=ADMISSION_FIFO,
+        resume=False,
+    )
+
+    changed_digest_meta = {**expected_meta, "cooperation_rendered_prompt_digest": "changed"}
+
+    assert runner._complete_cell(out_path, expected_meta=changed_digest_meta) is not None
+
+
+def test_complete_cell_compares_manifest_fields_and_ignores_manifest_digest(
+    tmp_path: Path,
+) -> None:
+    request = _request("synthetic prompt")
+    manifest_identity = {"version": 1, "scenario_ids": ["synthetic-scenario"]}
+    out_path = tmp_path / "behavior.jsonl"
+    expected_meta = runner.endpoint_meta(
+        endpoint="behavior",
+        manifest_path=tmp_path / "synthetic-manifest.json",
+        manifest_digest="original-digest",
+        requests=(request,),
+        model_identity="synthetic-model",
+        adapter_digests={"weights": None, "config": None},
+        settings={"prefilled_think": True},
+        manifest_identity=manifest_identity,
+        input_digests={"behavior_manifest": "original-digest"},
+    )
+    runner._run_native_cell(
+        MockBackend(["synthetic completion"]),
+        endpoint="behavior",
+        plan=(request,),
+        out_path=out_path,
+        config=EvalConfig(game_behavior_samples=1, prefilled_think=True),
+        meta=expected_meta,
+        submission=SUBMISSION_SERIAL,
+        admission=ADMISSION_FIFO,
+        resume=False,
+    )
+
+    changed_digest_meta = {
+        **expected_meta,
+        "cooperation_manifest_digest": "reformatted-file-digest",
+        "cooperation_input_digests": {"behavior_manifest": "reformatted-file-digest"},
+    }
+    assert runner._complete_cell(out_path, expected_meta=changed_digest_meta) is not None
+
+    changed_manifest_meta = {
+        **expected_meta,
+        "cooperation_manifest_identity": {"version": 1, "scenario_ids": ["edited-scenario"]},
+    }
+    with pytest.raises(ValueError, match="cooperation_manifest_identity"):
+        runner._complete_cell(out_path, expected_meta=changed_manifest_meta)

@@ -19,7 +19,6 @@ ran before anything checked its rubric, and a writer pointed at a git-tracked pa
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import replace
@@ -33,8 +32,6 @@ from reward_hacking.bedrock_batch import (
     BATCH_BUCKET_OWNER_ENV,
     BATCH_PROFILE_ENV,
     BATCH_ROLE_ARN_ENV,
-    cell_digest,
-    prompt_digest,
 )
 from reward_hacking.model_backend import BedrockCompletion, TokenUsage
 from reward_hacking.trace import _repo_root
@@ -308,7 +305,7 @@ class TestLiveResume:
         moved = load_stimulus(
             write_synthetic_deference_stimulus(tmp_path / "edited.json", scenarios=scenarios)
         )
-        with pytest.raises(ValueError, match="refusing to resume"):
+        with pytest.raises(ValueError, match="readable stimulus fields"):
             cli._run_live_calls(
                 planned_calls_for_leg(leg_for(LIVE_LEG_ID), moved)[:2],
                 out,
@@ -318,6 +315,34 @@ class TestLiveResume:
                 chunk_size=1,
                 backend_factory=scripted_factory("<action>listed-order</action>"),
             )
+
+    def test_fake_row_digests_do_not_block_resume(
+        self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
+    ) -> None:
+        out = self.reply_file(tmp_path)
+        cli._run_live_calls(
+            self.calls(pinned_stimulus, 1),
+            out,
+            bound(pinned_stimulus),
+            pinned_stimulus,
+            concurrency=1,
+            chunk_size=1,
+            backend_factory=scripted_factory("<action>listed-order</action>"),
+        )
+        row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+        row["stimulus_digest"] = "0" * 16
+        row["prompt_digest"] = "f" * 16
+        out.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        resumed = cli._run_live_calls(
+            self.calls(pinned_stimulus, 1),
+            out,
+            bound(pinned_stimulus),
+            pinned_stimulus,
+            concurrency=1,
+            chunk_size=1,
+            backend_factory=scripted_factory("<action>listed-order</action>"),
+        )
+        assert resumed["resumed"] == 1
 
     def test_an_incomplete_record_is_flagged_kept_and_counted(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
@@ -446,6 +471,11 @@ class TestTheJudgeGates:
                 "judge_prompt_version": judge_module.JUDGE_PROMPT_VERSION,
                 "judge_prompt_digest": judge_module.DEFERENCE_JUDGE.judge_digest(stimulus),
                 "judge_prompt_shape_digest": judge_module.DEFERENCE_JUDGE.judge_shape_digest(),
+                "judge_prompt_identity": cli._judge_prompt_identity(
+                    stimulus.judge_instructions,
+                    judge_module.DEFERENCE_JUDGE.verdict.prompt_version,
+                    judge_module.DEFERENCE_JUDGE.verdict.scaffold,
+                ),
                 "misses": [],
                 "unparsed": [],
             },
@@ -458,7 +488,7 @@ class TestTheJudgeGates:
         with pytest.raises(RuntimeError, match="never validated its judge"):
             cli.judge(tmp_path, bound(pinned_stimulus))
 
-    def test_a_validation_of_another_rubric_does_not_clear_this_run(
+    def test_a_legacy_fake_digest_does_not_gate_the_current_prompt(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
     ) -> None:
         write_summary(
@@ -472,26 +502,35 @@ class TestTheJudgeGates:
                 "unparsed": [],
             },
         )
-        with pytest.raises(RuntimeError, match="does not clear this run"):
-            cli.judge(tmp_path, bound(pinned_stimulus))
+        assert not cli.refuse_unvalidated_judge(
+            tmp_path, pinned_stimulus, bound(pinned_stimulus), skip_gate=False
+        )
 
-    def test_a_validation_made_before_a_code_side_prompt_edit_does_not_clear_this_run(
+    def test_a_readable_rubric_change_does_not_clear_this_run(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
     ) -> None:
-        """The rubric digest covers the authored text alone; the scaffold and the version live in code."""
-        write_summary(
-            tmp_path,
-            cli.JUDGE_VALIDATION_LABEL,
-            {
-                "judge_prompt_version": judge_module.JUDGE_PROMPT_VERSION,
-                "judge_prompt_digest": judge_module.DEFERENCE_JUDGE.judge_digest(pinned_stimulus),
-                "judge_prompt_shape_digest": "0000000000000000",
-                "misses": [],
-                "unparsed": [],
-            },
-        )
-        with pytest.raises(RuntimeError, match="prompt-shape digest"):
-            cli.judge(tmp_path, bound(pinned_stimulus))
+        self.clean_validation(tmp_path, pinned_stimulus)
+        path = tmp_path / cli.JUDGE_VALIDATION_SUMMARY
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["judge_prompt_identity"]["rubric"] = "SYNTHETIC-OTHER-RUBRIC"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(RuntimeError, match=r"judge_prompt_identity\.rubric"):
+            cli.refuse_unvalidated_judge(
+                tmp_path, pinned_stimulus, bound(pinned_stimulus), skip_gate=False
+            )
+
+    def test_a_named_section_change_does_not_clear_this_run(
+        self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
+    ) -> None:
+        self.clean_validation(tmp_path, pinned_stimulus)
+        path = tmp_path / cli.JUDGE_VALIDATION_SUMMARY
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["judge_prompt_identity"]["sections"][0] = "SYNTHETIC-OTHER-SECTION"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(RuntimeError, match=r"judge_prompt_identity\.sections"):
+            cli.refuse_unvalidated_judge(
+                tmp_path, pinned_stimulus, bound(pinned_stimulus), skip_gate=False
+            )
 
     def test_a_validation_that_reported_misses_does_not_clear_this_run(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
@@ -591,7 +630,7 @@ class TestTheJudgeGates:
         crossed = cli.cross_judge(tmp_path, bound(pinned_stimulus), n=2)
         assert crossed["judged"] == 2
 
-    def test_pooling_replies_from_two_stimuli_refuses_before_any_judge_call(
+    def test_fake_row_stimulus_digest_does_not_gate_pooling(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus
     ) -> None:
         """A mid-run frame edit lands two stimuli in one directory with no shared key to refuse on."""
@@ -603,8 +642,7 @@ class TestTheJudgeGates:
             "".join(f"{json.dumps(row)}\n" for row in rows),
             encoding="utf-8",
         )
-        with pytest.raises(ValueError, match="different stimulus prompt digests"):
-            cli._records_on_disk(tmp_path, model=None)
+        assert len(cli._records_on_disk(tmp_path, model=None)) == len(rows)
 
     def test_the_whole_file_totals_say_how_many_rows_the_current_rubric_covers(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, monkeypatch: pytest.MonkeyPatch
@@ -705,20 +743,70 @@ class TestTheBatchPath:
         with pytest.raises(RuntimeError, match="does not describe the job"):
             cli.collect_batch(BATCH_LEG_ID, tmp_path, bound(pinned_stimulus), timeout_seconds=1.0)
 
-    def test_a_collect_under_a_different_stimulus_refuses(
+    def test_fake_handle_digests_are_metadata(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
     ) -> None:
         del aws
         self.submit(tmp_path, pinned_stimulus)
+        path = cli.handle_path(tmp_path, leg_for(BATCH_LEG_ID))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["prompt_digest"] = "0" * 64
+        payload["cell_digest"] = "f" * 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert self.submit(tmp_path, pinned_stimulus)["resumed_handle"] is True
+
+    def test_readable_handle_identity_mismatch_refuses(
+        self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
+    ) -> None:
+        del aws
+        leg = leg_for(BATCH_LEG_ID)
+        self.submit(tmp_path, pinned_stimulus)
+        identity_path = cli._batch_prompt_identity_path(tmp_path, leg)
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["calls"][0]["metadata"]["cell"] = "SYNTHETIC-CHANGED-CELL"
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="saved batch prompt identity"):
+            self.submit(tmp_path, pinned_stimulus)
+
+    def test_a_fake_stimulus_digest_does_not_block_collect(
+        self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
+    ) -> None:
+        _bedrock, s3 = aws
+        self.submit(tmp_path, pinned_stimulus)
+        handle = json.loads(
+            (tmp_path / "handles" / f"{leg_for(BATCH_LEG_ID).file_stem}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fulfil_job(s3, handle)
         path = cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID))
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["stimulus_prompt_digest"] = "0000000000000000"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        assert pinned_stimulus.prompt_digest != "0000000000000000"
-        with pytest.raises(RuntimeError, match="was submitted under stimulus prompt digest"):
+        collected = cli.collect_batch(
+            BATCH_LEG_ID, tmp_path, bound(pinned_stimulus), timeout_seconds=1.0
+        )
+        assert collected["collected"] == BATCH_RECORDS
+
+    def test_a_readable_stimulus_edit_refuses_collect(
+        self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
+    ) -> None:
+        _, s3 = aws
+        self.submit(tmp_path, pinned_stimulus)
+        handle = json.loads(
+            (tmp_path / "handles" / f"{leg_for(BATCH_LEG_ID).file_stem}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fulfil_job(s3, handle)
+        path = cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["stimulus_prompt_identity"]["peer_count"] += 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="different stimulus prompt fields"):
             cli.collect_batch(BATCH_LEG_ID, tmp_path, bound(pinned_stimulus), timeout_seconds=1.0)
 
-    def test_a_resubmit_under_a_different_stimulus_refuses_rather_than_rewriting_the_digest(
+    def test_a_fake_stimulus_digest_does_not_block_handle_reuse(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
     ) -> None:
         """Rewriting it would make the collect-time check compare the new digest with itself."""
@@ -728,9 +816,8 @@ class TestTheBatchPath:
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["stimulus_prompt_digest"] = "0000000000000000"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        assert pinned_stimulus.prompt_digest != "0000000000000000"
-        with pytest.raises(RuntimeError, match="compare the new digest with itself"):
-            self.submit(tmp_path, pinned_stimulus)
+        resumed = self.submit(tmp_path, pinned_stimulus)
+        assert resumed["resumed_handle"] is True
 
     def test_a_resubmit_that_reconstructs_a_lost_summary_says_the_digest_was_not_recorded(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
@@ -738,13 +825,13 @@ class TestTheBatchPath:
         """The documented repair still runs; what it cannot claim is that the digest is the job's own."""
         del aws
         first = self.submit(tmp_path, pinned_stimulus)
-        assert first["stimulus_prompt_digest_recorded_at_submit"] is True
+        assert first["stimulus_prompt_identity_recorded_at_submit"] is True
         cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID)).unlink()
         again = self.submit(tmp_path, pinned_stimulus)
         assert again["resumed_handle"] is True
-        assert again["stimulus_prompt_digest_recorded_at_submit"] is False
+        assert again["stimulus_prompt_identity_recorded_at_submit"] is False
 
-    def test_a_re_collect_of_rows_sampled_under_another_stimulus_refuses_by_key(
+    def test_a_fake_digest_does_not_block_recollect_resume(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
     ) -> None:
         """A key already on disk is skipped only if its record answers THIS prompt under THIS material.
@@ -770,10 +857,8 @@ class TestTheBatchPath:
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["stimulus_prompt_digest"] = elsewhere.prompt_digest
         path.write_text(json.dumps(payload), encoding="utf-8")
-        with pytest.raises(ValueError, match="refusing to resume") as raised:
-            cli.collect_batch(BATCH_LEG_ID, tmp_path, bound(elsewhere), timeout_seconds=1.0)
-        assert "stimulus_digest" in str(raised.value)
-        assert len(scans_module.load_run_replies(tmp_path)) == BATCH_RECORDS
+        collected = cli.collect_batch(BATCH_LEG_ID, tmp_path, bound(elsewhere), timeout_seconds=1.0)
+        assert collected["resumed"] == BATCH_RECORDS
 
     def test_a_collect_on_a_rebuilt_summary_refuses_until_the_operator_says_so(
         self, tmp_path: Path, pinned_stimulus: DeferenceStimulus, aws: tuple[FakeBedrock, FakeS3]
@@ -794,7 +879,7 @@ class TestTheBatchPath:
         fulfil_job(s3, handle)
         cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID)).unlink()
         rebuilt = self.submit(tmp_path, pinned_stimulus)
-        assert rebuilt["stimulus_prompt_digest_recorded_at_submit"] is False
+        assert rebuilt["stimulus_prompt_identity_recorded_at_submit"] is False
         with pytest.raises(RuntimeError, match="stimulus-unchanged-since-submit"):
             cli.collect_batch(BATCH_LEG_ID, tmp_path, bound(pinned_stimulus), timeout_seconds=1.0)
         assert scans_module.load_run_replies(tmp_path) == {}
@@ -830,7 +915,7 @@ class TestTheBatchPath:
         fulfil_job(s3, handle)
         path = cli.submit_summary_path(tmp_path, leg_for(BATCH_LEG_ID))
         payload = json.loads(path.read_text(encoding="utf-8"))
-        del payload["stimulus_prompt_digest_recorded_at_submit"]
+        del payload["stimulus_prompt_identity_recorded_at_submit"]
         path.write_text(json.dumps(payload), encoding="utf-8")
         with caplog.at_level(logging.WARNING, logger=cli.__name__):
             collected = cli.collect_batch(
@@ -945,7 +1030,7 @@ class TestTheParser:
 
 
 class TestTheDeferencePassIsUnchangedByThePassBinding:
-    """Pin the whole rendered and digested surface of the deference pass against sampled values.
+    """Keep the rendered size, readable call identity and judge prompt sections explicit.
 
     The ``--pass`` refactor moved this pass's loader, plan table, audits and judge schemas behind a binding,
     and its production run directory is on disk with 3,840 collected records in it: a resume compares the
@@ -958,16 +1043,7 @@ class TestTheDeferencePassIsUnchangedByThePassBinding:
     derived its expectation from the code it is pinning would agree with any change.
     """
 
-    RENDER_SHA = "003394d91942930d0b990d4206d8613b"
     RENDER_CHARS = 1_348
-    STIMULUS_DIGEST = "efd6c460f1533680"
-    STIMULUS_PROMPT_DIGEST = "a856f32075d64cb9"
-    LEG_PROMPT_DIGEST = "e2426c860d77729b861694629cee424d81e6442339b4813fc1b3687f67612ba2"
-    LEG_CELL_DIGEST = "0c855fef12b06071480a51f9dd5d15adbea200a10141b8ed687e965398f570f6"
-    JUDGE_DIGEST = "6332fd4510d502c1"
-    INTENT_DIGEST = "8c21f943e00db011"
-    JUDGE_SHAPE_DIGEST = "d45ec4ed15a60153"
-    INTENT_SHAPE_DIGEST = "a23635bf120fa556"
     FIRST_KEY = (
         "floor|breaking|same-checkpoint-chose|synthetic-ledger|canonical|"
         "qwen.qwen3-235b-a22b-2507-v1:0|effort=default|sitting=B|draw=0"
@@ -987,17 +1063,8 @@ class TestTheDeferencePassIsUnchangedByThePassBinding:
             stimulus=pinned_stimulus,
         )
         assert len(prompt) == self.RENDER_CHARS
-        assert hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:32] == self.RENDER_SHA
 
-    def test_both_stimulus_digests_are_what_the_landed_run_was_sampled_under(
-        self, pinned_stimulus: DeferenceStimulus
-    ) -> None:
-        assert pinned_stimulus.digest == self.STIMULUS_DIGEST
-        assert pinned_stimulus.prompt_digest == self.STIMULUS_PROMPT_DIGEST
-
-    def test_a_legs_batch_identity_and_its_two_digests_are_unmoved(
-        self, pinned_stimulus: DeferenceStimulus
-    ) -> None:
+    def test_a_legs_batch_identity_is_readable(self, pinned_stimulus: DeferenceStimulus) -> None:
         leg = leg_for(BATCH_LEG_ID)
         calls = planned_calls_for_leg(leg, pinned_stimulus)
         assert len(calls) == BATCH_RECORDS
@@ -1006,21 +1073,32 @@ class TestTheDeferencePassIsUnchangedByThePassBinding:
         assert (
             leg.batch_job_name == "jagged-qwen-qwen3-235b-a22b-2507-dfr-qwen3-235b-default-b-floor"
         )
-        assert prompt_digest([call.prompt for call in calls]) == self.LEG_PROMPT_DIGEST
-        assert cell_digest([call.metadata() for call in calls]) == self.LEG_CELL_DIGEST
         assert calls[0].key == self.FIRST_KEY
         assert calls[0].prompt_id == self.FIRST_PROMPT_ID
 
-    def test_every_digest_the_judge_resume_compares_is_unmoved(
+    def test_judge_versions_and_section_headers_are_explicit(
         self, pinned_stimulus: DeferenceStimulus
     ) -> None:
         judge = cli.DEFERENCE_BINDING.judge
-        assert judge.judge_digest(pinned_stimulus) == self.JUDGE_DIGEST
-        assert judge.intent_digest(pinned_stimulus) == self.INTENT_DIGEST
-        assert judge.judge_shape_digest() == self.JUDGE_SHAPE_DIGEST
-        assert judge.intent_shape_digest() == self.INTENT_SHAPE_DIGEST
         assert judge.verdict.prompt_version == "deference-judge-v1"
         assert judge.intent.prompt_version == "deference-intent-check-v1"
+        assert tuple(
+            section for section in judge.verdict.scaffold if section.startswith("===")
+        ) == (
+            "=== THE TWO OPTIONS AVAILABLE IN THIS SITUATION ===",
+            "=== REPLY (verbatim) ===",
+            "=== END OF REPLY ===",
+            "=== VISIBLE REASONING (verbatim, emitted before the reply) ===",
+            "=== END OF VISIBLE REASONING ===",
+        )
+        assert tuple(section for section in judge.intent.scaffold if section.startswith("===")) == (
+            "=== THE TWO OPTIONS AVAILABLE IN THIS SITUATION ===",
+            "=== WHAT THIS REPLY WAS ASKED TO WRITE ===",
+            "=== REPLY (verbatim) ===",
+            "=== END OF REPLY ===",
+            "=== VISIBLE REASONING (verbatim, emitted before the reply) ===",
+            "=== END OF VISIBLE REASONING ===",
+        )
         assert judge.bool_fields == (
             "constraint_noticed",
             "mirror",

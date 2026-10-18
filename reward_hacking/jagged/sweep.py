@@ -21,14 +21,16 @@ effort, in which case the submit stops rather than pooling two sampling configs 
 
 ``--items`` names the corpus rather than this module importing one, because the v1 corpus it was
 built for has been deleted and the next one will live somewhere else. It takes the same value at
-submit and at collect; the digest check below turns a mismatch into an error rather than a regrade.
+submit and at collect; the saved prompt and cell fields turn a mismatch into an error rather than a
+regrade.
 
 The traces this writes carry the JSONL records ``runner.py`` defines, so ``analysis.py`` reads them
 with no changes; each record's ``transport`` field says which route produced it.
 
-``collect`` re-renders the prompts locally from the corpus and compares its digest against the one
-recorded at submit time, so editing an item between submit and collect is caught rather than
-silently mixing an old response with a new item definition.
+``collect`` re-renders prompts and cell labels locally from the corpus and compares them with the
+values saved at submit time, so editing an item between submit and collect is caught rather than
+silently mixing an old response with a new item definition. Older handles without those saved values
+continue to use their recorded digests.
 """
 
 from __future__ import annotations
@@ -52,8 +54,6 @@ from reward_hacking.bedrock_batch import (
     NOVA_MICRO_MAX_TOKENS,
     BatchJobHandle,
     BedrockBatchBackend,
-    cell_digest,
-    prompt_digest,
 )
 from reward_hacking.items_reference import resolve_reference
 from reward_hacking.jagged.analysis import (
@@ -134,10 +134,9 @@ def _cells(args: argparse.Namespace) -> list[Cell]:
 
 
 def _metadata(cells: Sequence[Cell]) -> list[dict[str, object]]:
-    """Describe each cell for the S3 sidecar and for the cell digest.
+    """Describe each cell for the S3 sidecar and the saved semantic identity.
 
-    One builder for both, and for both subcommands: the digest is only a tripwire if submit and
-    collect describe a cell the same way, and two copies of these four fields would eventually not.
+    One builder for both subcommands, so submit and collect compare the same four cell fields.
     """
     return [
         {
@@ -336,9 +335,9 @@ def submit(args: argparse.Namespace) -> int:
 def collect(args: argparse.Namespace) -> int:
     """Collect every saved handle into a trace, then print the pooled table.
 
-    The digest check is what makes collecting in a later session safe. The cells are re-rendered
-    here from the current corpus, and if the corpus moved since submit, the recorded digest will not
-    match and the run stops -- rather than grading a stale response against an edited item.
+    The stored prompt and cell values make collecting in a later session safe. The cells are
+    re-rendered here from the current corpus, and if the corpus moved since submit, the differing
+    prompt or cell fields are named before a stale response can be attached to an edited item.
 
     The sampling labels on the records are read off the handle rather than from this process's
     flags, and ``collect`` deliberately takes no sampling flags at all: a hand-restated cap is how a
@@ -350,24 +349,20 @@ def collect(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"no handle files in {args.handle_dir}")
 
     cells = _cells(args)
-    local_prompts = prompt_digest([cell.prompt for cell in cells])
-    local_cells = cell_digest(_metadata(cells))
+    local_prompts = [cell.prompt for cell in cells]
+    local_cells = _metadata(cells)
     all_records: list[dict[str, object]] = []
     for path in handle_paths:
         handle = BatchJobHandle.load(path)
-        for label, submitted, local in (
-            ("prompt", handle.prompt_digest, local_prompts),
-            ("cell", handle.cell_digest, local_cells),
-        ):
-            if submitted != local:
-                raise RuntimeError(
-                    f"{path} was submitted with {label} digest {submitted} but the corpus now "
-                    f"renders {local} for {len(cells)} cells. Either the items, arms or "
-                    "--repeats/--limit differ from the submitted run; re-run collect with the same "
-                    "flags, or check out the commit the sweep was submitted from. A cell-digest "
-                    "mismatch with a matching prompt digest means the prompts are unchanged but "
-                    "their labels moved, which would silently regrade responses as other items"
-                )
+        for limitation in handle.submission_limitations():
+            logger.warning("%s: %s", path, limitation)
+        differences = handle.submission_differences(local_prompts, local_cells)
+        if differences:
+            raise RuntimeError(
+                f"{path} differs from the current submitted prompts or cells: "
+                f"{', '.join(differences)}. Re-run collect with the original corpus and flags, "
+                "or check out the commit the sweep was submitted from."
+            )
         # The run id only shapes the S3 paths a submit writes to; collect reads them off the handle.
         backend = BedrockBatchBackend(handle.model_id, region=handle.region, profile=handle.profile)
         completions = backend.collect(

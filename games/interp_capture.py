@@ -1886,6 +1886,7 @@ def _capture_cell_outputs(
         prefix_stimulus_ids=(
             tuple(stimulus.stimulus_id for stimulus in run.stimuli) if prefix_activations else None
         ),
+        stimuli=run.stimuli,
     )
     if natural_stimuli is not None:
         _write_natural_prefix_cell(

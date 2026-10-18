@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 from conftest import needs_jail
 
-from reward_hacking import aisi_oneoff_contracts, aisi_rh_envs_data
+from reward_hacking import aisi_rh_envs_data
 from reward_hacking.aisi_oneoff_contracts import derive_oneoff_registry
 from reward_hacking.aisi_rh_envs_data import (
     AISI_SOURCES,
@@ -234,21 +234,15 @@ def test_derived_reader_rejects_invalid_rows_before_oneoff_filtering(
         load_problems(path, variant="oneoff")
 
 
-def test_derived_contract_digest_mismatch_is_logged_then_row_recompute_refuses(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_derived_contract_digest_mismatch_is_refused_by_row_recompute(tmp_path: Path) -> None:
     payload = copy.deepcopy(_derived_payload())
     problems = cast("list[dict[str, object]]", payload["problems"])
     cast("dict[str, object]", problems[0]["output_mutation"])["contract_sha256"] = "0" * 64
     path = tmp_path / "stale-contract-digest.json"
     _write_payload(path, payload)
 
-    with (
-        caplog.at_level(logging.WARNING, logger=aisi_oneoff_contracts.logger.name),
-        pytest.raises(ValueError, match="does not match its contract"),
-    ):
+    with pytest.raises(ValueError, match="does not match its contract"):
         load_problems(path, variant="oneoff")
-    assert "derived mutation contract records sha256" in caplog.text
 
 
 def test_derived_reader_rejects_stale_unsupported_output_before_filtering(
@@ -278,7 +272,7 @@ def test_derived_reader_rejects_unsupported_registry_algorithm(tmp_path: Path) -
         load_problems(path, variant="oneoff")
 
 
-def test_derived_registry_catalog_digest_mismatch_is_logged_and_the_registry_still_loads(
+def test_derived_registry_catalog_digest_only_difference_is_silent_and_still_loads(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     payload = copy.deepcopy(_derived_payload())
@@ -287,9 +281,23 @@ def test_derived_registry_catalog_digest_mismatch_is_logged_and_the_registry_sti
     path = tmp_path / "stale-catalog-digest.json"
     _write_payload(path, payload)
 
-    with caplog.at_level(logging.WARNING, logger=aisi_oneoff_contracts.logger.name):
+    with caplog.at_level(logging.WARNING):
         assert load_problems(path, variant="oneoff")
-    assert "derived mutation catalog records sha256" in caplog.text
+    assert caplog.records == []
+
+
+def test_derived_registry_rejects_changed_source_fields_by_readable_path(tmp_path: Path) -> None:
+    payload = copy.deepcopy(_derived_payload())
+    problems = cast("list[dict[str, object]]", payload["problems"])
+    problems[0]["statement"] = "Changed synthetic task statement."
+    path = tmp_path / "changed-source-field.json"
+    _write_payload(path, payload)
+
+    with pytest.raises(
+        ValueError,
+        match=r"derived registry source fields changed at problems\.apps:synthetic-0\.statement",
+    ):
+        load_problems(path)
 
 
 def test_derived_contract_metadata_is_not_rendered_into_actor_task(tmp_path: Path) -> None:

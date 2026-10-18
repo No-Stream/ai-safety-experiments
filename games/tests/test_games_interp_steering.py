@@ -1110,6 +1110,7 @@ def write_selected_target(
         "direction": "decision",
         "direction_path": str(directions_path.resolve()),
         "direction_sha256": hashlib.sha256(directions_path.read_bytes()).hexdigest(),
+        "direction_values": direction.tolist(),
         "layer": 18,
         "magnitude": 0.5 * float(direction.norm()),
         "alpha_multiplier": 0.5,
@@ -1119,6 +1120,7 @@ def write_selected_target(
         "expectation_recorded_before_intervention": True,
         "geometry_report_path": str(report_path.resolve()),
         "geometry_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "geometry_report_step": 7,
         "exploratory": True,
     }
     if extra:
@@ -1738,7 +1740,8 @@ class TestCustomDiagnosticGeneration:
         identity = json.loads(ledger_path_for(args.out_dir / "steering_records.jsonl").read_text())[
             "identity"
         ]
-        assert identity["rendered_rows_sha256"] == summary["rendered_rows_sha256"]
+        assert identity["rendered_rows"] == rows
+        assert "rendered_rows_sha256" not in identity
         assert identity["sample_indices"] == [sample for _ in rows for sample in (0, 1)]
         assert identity["condition_keys"] == [
             "none",
@@ -1785,7 +1788,7 @@ class TestCustomDiagnosticGeneration:
             )
             + "\n"
         )
-        with pytest.raises(ResumeMismatchError, match="rendered_rows_sha256"):
+        with pytest.raises(ResumeMismatchError, match="prompt_texts/rendered_rows"):
             run_generate(args)
 
     def test_a_changed_placebo_seed_refuses_resume(
@@ -2216,7 +2219,9 @@ class TestSelectedCalibrationTarget:
         )
         assert len((args.out_dir / "steering_records.jsonl").read_text().splitlines()) == 48
         ledger = json.loads(ledger_path_for(args.out_dir / "steering_records.jsonl").read_text())
-        assert ledger["identity"]["selected_target"] == summary["selected_target"]
+        assert ledger["identity"]["selected_target"] == interp_steering.selected_target_identity(
+            summary["selected_target"]
+        )
 
     def test_selected_target_rejects_heldout_fields_before_model_load(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2243,18 +2248,22 @@ class TestSelectedCalibrationTarget:
                 )
             )
 
-    def test_selected_target_requires_direction_file_digest_and_magnitude(
+    def test_selected_target_compares_direction_values_with_loaded_tensor(
         self, tmp_path: Path, directions_path: Path
     ) -> None:
+        directions = torch.load(directions_path, map_location="cpu", weights_only=True)
+        direction = directions[18]
+        rotated_direction = torch.roll(direction, shifts=1)
+        assert torch.linalg.vector_norm(rotated_direction) == pytest.approx(
+            torch.linalg.vector_norm(direction)
+        )
         target_path = write_selected_target(
             tmp_path / "selected-target.json",
             directions_path,
-            extra={"direction_sha256": "b" * 64},
+            extra={"direction_values": rotated_direction.tolist()},
         )
-        with pytest.raises(ValueError, match="direction_sha256"):
-            interp_steering.load_selected_target(
-                target_path, {"decision": {18: torch.ones(HIDDEN)}}
-            )
+        with pytest.raises(ValueError, match="direction_values"):
+            interp_steering.load_selected_target(target_path, {"decision": directions})
 
     def test_selected_target_requires_declared_construct_to_match_direction(
         self, tmp_path: Path, directions_path: Path
@@ -2269,31 +2278,64 @@ class TestSelectedCalibrationTarget:
                 target_path, {"decision": torch.load(directions_path, weights_only=True)}
             )
 
-    def test_selected_target_rejects_stale_geometry_report_before_model_load(
-        self,
-        tmp_path: Path,
-        directions_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_selected_target_records_report_path_without_pinning_report_bytes(
+        self, tmp_path: Path, directions_path: Path
     ) -> None:
         target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
         report_path = tmp_path / "cooperation_interp.json"
         report_path.write_text('{"synthetic_report": false}\n')
-        monkeypatch.setattr(
-            interp_steering,
-            "HFBackend",
-            lambda *_args, **_kwargs: pytest.fail("stale target reached model load"),
+        selected = interp_steering.load_selected_target(
+            target_path,
+            {"decision": torch.load(directions_path, map_location="cpu", weights_only=True)},
         )
 
-        with pytest.raises(ValueError, match="geometry_report_sha256"):
-            run_generate(
-                generate_args(
-                    tmp_path,
-                    directions_path,
-                    cells=None,
-                    selected_target=target_path,
-                    conditions="none",
-                )
-            )
+        assert selected["geometry_report_path"] == str(report_path.resolve())
+        assert selected["geometry_report_step"] == 7
+
+    def test_selected_target_resume_identity_includes_report_step_but_ignores_hashes(
+        self, tmp_path: Path, directions_path: Path
+    ) -> None:
+        target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
+        target = interp_steering.load_selected_target(
+            target_path,
+            {"decision": torch.load(directions_path, map_location="cpu", weights_only=True)},
+        )
+        changed_hashes = {
+            **target,
+            "geometry_report_sha256": "x" * 64,
+            "payload": {
+                **target["payload"],
+                "geometry_report_sha256": "y" * 64,
+                "direction_sha256": "z" * 64,
+            },
+        }
+        changed_step = {
+            **target,
+            "payload": {**target["payload"], "geometry_report_step": 8},
+        }
+
+        assert interp_steering.selected_target_identity(target) == (
+            interp_steering.selected_target_identity(changed_hashes)
+        )
+        assert interp_steering.selected_target_identity(target) != (
+            interp_steering.selected_target_identity(changed_step)
+        )
+
+    def test_legacy_selected_target_without_readable_direction_values_still_loads(
+        self, tmp_path: Path, directions_path: Path
+    ) -> None:
+        target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
+        payload = json.loads(target_path.read_text())
+        payload.pop("direction_values")
+        payload.pop("geometry_report_step")
+        target_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        selected = interp_steering.load_selected_target(
+            target_path,
+            {"decision": torch.load(directions_path, map_location="cpu", weights_only=True)},
+        )
+
+        assert selected["geometry_report_step"] is None
 
     def test_selected_target_rejects_missing_geometry_report_before_model_load(
         self,
@@ -2379,7 +2421,12 @@ class TestAdapterBackedGeneration:
         assert model is adapted_model
         assert identity is not None
         assert identity["applied_adapter_weights"] == 7
+        assert identity["weights_size_bytes"] == len(b"synthetic adapter")
         assert identity["weights_sha256"] == hashlib.sha256(b"synthetic adapter").hexdigest()
+        changed_hash_identity = {**identity, "weights_sha256": "changed-provenance-hash"}
+        assert interp_steering.adapter_resume_identity(identity) == (
+            interp_steering.adapter_resume_identity(changed_hash_identity)
+        )
 
 
 class TestDecoderLayerContract:
@@ -2597,6 +2644,43 @@ class TestGenerateResume:
         assert resumed["n_records_resumed"] == 32
         assert records_path.read_bytes() == original_bytes
 
+    def test_a_digest_identity_ledger_migrates_after_readable_fields_match(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_streaming_vllm(
+            monkeypatch, _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        )
+        args = generate_args(tmp_path, directions_path, backend="vllm", conditions="none")
+        run_generate(args)
+        records_path = args.out_dir / "steering_records.jsonl"
+        original_bytes = records_path.read_bytes()
+        ledger_path = ledger_path_for(records_path)
+        ledger = json.loads(ledger_path.read_text())
+        identity = ledger["identity"]
+        rows = identity.pop("rendered_rows")
+        prompts = identity.pop("prompt_texts")
+        identity.pop("direction_values")
+        identity.pop("subspace_values")
+        identity.pop("banned_token_ids")
+        identity["prompts_sha256"] = interp_steering.digest_of_strings(prompts)
+        identity["rendered_rows_sha256"] = interp_steering.rendered_rows_digest(rows)
+        identity["rows_sha256"] = interp_steering.rendered_rows_digest(rows)
+        identity["directions_sha256"] = interp_steering.directions_digest(
+            {"decision": torch.load(directions_path, map_location="cpu", weights_only=True)}
+        )
+        identity["subspace_sha256"] = None
+        identity["banned_tokens_sha256"] = None
+        identity["row_manifest"] = None
+        ledger_path.write_text(json.dumps(ledger) + "\n")
+
+        resumed = run_generate(args)
+
+        migrated_identity = json.loads(ledger_path.read_text())["identity"]
+        assert resumed["n_records_resumed"] == 32
+        assert records_path.read_bytes() == original_bytes
+        assert "prompt_texts" in migrated_identity
+        assert "prompts_sha256" not in migrated_identity
+
     @staticmethod
     def _records(out_dir: Path) -> bytes:
         return (out_dir / "steering_records.jsonl").read_bytes()
@@ -2695,12 +2779,15 @@ class TestGenerateResume:
     def test_a_relaunch_with_other_direction_vectors_is_refused(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Same names, same keys, different fitted vectors: the digest is what tells them apart."""
+        """Same names and norms can still describe a different fitted direction."""
         self._patch(monkeypatch, _neutral_completions)
         run_generate(generate_args(tmp_path, directions_path, conditions="none"))
         other = tmp_path / "other.pt"
-        torch.save({layer: torch.randn(HIDDEN) for layer in range(24)}, other)
-        with pytest.raises(ResumeMismatchError, match="directions_sha256"):
+        original = torch.load(directions_path, map_location="cpu", weights_only=True)
+        torch.save(
+            {layer: torch.roll(vector, shifts=1) for layer, vector in original.items()}, other
+        )
+        with pytest.raises(ResumeMismatchError, match="direction_values"):
             run_generate(generate_args(tmp_path, other))
 
     def test_records_without_a_ledger_are_refused(
@@ -2785,5 +2872,6 @@ class TestGenerationIdentityPinsThePrompts:
             ]
 
         monkeypatch.setattr(interp_steering, "generation_rows", reworded_rows)
-        with pytest.raises(ResumeMismatchError, match="prompts_sha256"):
+        with pytest.raises(ResumeMismatchError, match="prompt_texts/rendered_rows") as error:
             run_generate(generate_args(tmp_path, directions_path))
+        assert "reworded" not in str(error.value)

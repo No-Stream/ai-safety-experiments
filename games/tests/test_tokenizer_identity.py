@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from games.tokenizer_identity import tokenizer_content_sha256
+from games.tokenizer_identity import tokenizer_content_sha256, tokenizer_identity_payload
 
 
 @dataclass
 class FakeTokenizer:
     vocabulary: dict[str, int]
+    name_or_path: str = "Qwen/example"
+    revision: str = "commit-a"
     padding_side: str = "right"
     truncation_side: str = "right"
     model_max_length: int = 512
@@ -44,3 +46,30 @@ def test_source_commit_is_excluded_from_content_identity() -> None:
     baseline = FakeTokenizer({"alpha": 0}, init_kwargs={"legacy": False, "_commit_hash": "a"})
     other_commit = FakeTokenizer({"alpha": 0}, init_kwargs={"legacy": False, "_commit_hash": "b"})
     assert tokenizer_content_sha256(baseline) == tokenizer_content_sha256(other_commit)
+
+
+def test_readable_identity_names_tokenizer_revision_size_and_special_tokens() -> None:
+    tokenizer = FakeTokenizer(
+        {"alpha": 0, "beta": 1},
+        special_tokens_map={"eos_token": "<eos>", "pad_token": "<pad>"},
+        init_kwargs={"revision": "release-1", "_commit_hash": "resolved-commit"},
+    )
+
+    assert tokenizer_identity_payload(tokenizer) == {
+        "name": "Qwen/example",
+        "revision": "release-1",
+        "vocab_size": 2,
+        "vocab": {"alpha": 0, "beta": 1},
+        "special_tokens": {"eos_token": "<eos>", "pad_token": "<pad>"},
+    }
+
+
+def test_readable_identity_ignores_non_semantic_resolved_commit_metadata() -> None:
+    first = FakeTokenizer(
+        {"alpha": 0}, init_kwargs={"revision": "release-1", "_commit_hash": "resolved-a"}
+    )
+    second = FakeTokenizer(
+        {"alpha": 0}, init_kwargs={"revision": "release-1", "_commit_hash": "resolved-b"}
+    )
+
+    assert tokenizer_identity_payload(first) == tokenizer_identity_payload(second)

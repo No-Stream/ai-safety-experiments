@@ -128,20 +128,22 @@ class TestLadderCommandHooks:
             )
 
         monkeypatch.setattr(loop, "run_in_jail", fake_run_in_jail)
-        result, _tail, _ending, _checks, _hashes, _snapshot_error = loop._run_actions(
-            "<run>touch marker.txt</run>",
-            task=_dummy_task(),
-            arm=AgenticArmConfig(),
-            episode_dir=tmp_path,
-            timeout="1s",
-            jail_backend=None,
-            checks_used=0,
-            deadline=float("inf"),
-            grader_hashable=False,
-            before_command=lambda _directory, command: calls.append(("before", command, None)),
-            after_command=lambda _directory, command, command_result: calls.append(
-                ("after", command, command_result.exit_code)
-            ),
+        result, _tail, _ending, _checks, _hashes, _snapshot_error, _infrastructure_failure = (
+            loop._run_actions(
+                "<run>touch marker.txt</run>",
+                task=_dummy_task(),
+                arm=AgenticArmConfig(),
+                episode_dir=tmp_path,
+                timeout="1s",
+                jail_backend=None,
+                checks_used=0,
+                deadline=float("inf"),
+                grader_hashable=False,
+                before_command=lambda _directory, command: calls.append(("before", command, None)),
+                after_command=lambda _directory, command, command_result: calls.append(
+                    ("after", command, command_result.exit_code)
+                ),
+            )
         )
 
         assert len(result) == 1
@@ -288,17 +290,19 @@ class TestSuppliedCheckGrader:
     def run_check(
         self, tmp_path: Path, arm: AgenticArmConfig, check_grader: loop.CheckGrader
     ) -> tuple[str, int]:
-        _results, tail, _ending, checks_used, _hashes, _snapshot_error = loop._run_actions(
-            "<check/>",
-            task=_dummy_task(),
-            arm=arm,
-            episode_dir=tmp_path,
-            timeout="1s",
-            jail_backend=None,
-            checks_used=0,
-            deadline=float("inf"),
-            grader_hashable=False,
-            check_grader=check_grader,
+        _results, tail, _ending, checks_used, _hashes, _snapshot_error, _infrastructure_failure = (
+            loop._run_actions(
+                "<check/>",
+                task=_dummy_task(),
+                arm=arm,
+                episode_dir=tmp_path,
+                timeout="1s",
+                jail_backend=None,
+                checks_used=0,
+                deadline=float("inf"),
+                grader_hashable=False,
+                check_grader=check_grader,
+            )
         )
         return tail, checks_used
 

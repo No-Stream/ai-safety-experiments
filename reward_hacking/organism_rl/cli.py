@@ -202,6 +202,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--num-generations", type=int)
     parser.add_argument("--prompts-per-step", type=int, default=1)
     parser.add_argument(
+        "--dynamic-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="refill each step with prompt groups that have nonzero reward variance",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-max-groups",
+        type=int,
+        help="maximum groups sampled per step; defaults to three times prompts-per-step",
+    )
+    parser.add_argument("--dynamic-sampling-skip-after", type=int, default=2)
+    parser.add_argument(
         "--max-sequence-tokens", "--max-model-len", dest="max_sequence_tokens", type=int
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -285,6 +297,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     args = parser.parse_args(argv)
     resolve_leak_options(args, parser, partition="train")
     args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
+    if args.dynamic_sampling_max_groups is None:
+        args.dynamic_sampling_max_groups = 3 * args.prompts_per_step
     _validate_training_args(args, parser)
     memory_options_from_args(args)
     return args
@@ -383,6 +397,10 @@ def _validate_owned_server_args(args: argparse.Namespace, parser: argparse.Argum
 def _validate_sampling_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.max_sequence_tokens is not None and args.max_sequence_tokens < 1:
         parser.error("max-sequence-tokens must be positive")
+    if args.dynamic_sampling_max_groups < 1:
+        parser.error("dynamic-sampling-max-groups must be positive")
+    if args.dynamic_sampling_skip_after < 1:
+        parser.error("dynamic-sampling-skip-after must be positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0 or args.importance_ratio_cap < 1:
         parser.error("invalid sampling temperature, top-p, or importance ratio cap")
 
@@ -498,7 +516,13 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "expected_peak_context_tokens",
         "kv_capacity_tokens",
     }
-    return {key: value for key, value in flags.items() if key not in operational}
+    normalized = dict(flags)
+    normalized.setdefault("dynamic_sampling", False)
+    normalized.setdefault(
+        "dynamic_sampling_max_groups", 3 * cast("int", normalized.get("prompts_per_step", 1))
+    )
+    normalized.setdefault("dynamic_sampling_skip_after", 2)
+    return {key: value for key, value in normalized.items() if key not in operational}
 
 
 def _effective_device_settings(device: dict[str, object]) -> dict[str, object]:
@@ -687,6 +711,32 @@ def write_provenance(  # noqa: C901 - explicit resume identity checks
     return path
 
 
+def _prepare_prefetched_step_resume(
+    args: argparse.Namespace,
+    source: TaskEpisodeSource | MixedEpisodeSource,
+) -> None:
+    if args.dynamic_sampling and args.resume_from_checkpoint is None:
+        completed_checkpoints = [
+            checkpoint
+            for checkpoint in args.output_dir.glob("checkpoint-*")
+            if checkpoint.is_dir() and (checkpoint / "complete.json").is_file()
+        ]
+        if completed_checkpoints:
+            raise ValueError(
+                "dynamic sampling output directory contains completed checkpoints; "
+                "pass --resume-from-checkpoint to continue"
+            )
+    if not args.step_pipelining or args.resume_from_checkpoint is None:
+        return
+    validate_checkpoint(args.resume_from_checkpoint)
+    if args.dynamic_sampling:
+        return
+    checkpoint_state = json.loads(
+        (args.resume_from_checkpoint / "trainer_state.json").read_text(encoding="utf-8")
+    )
+    source.discard_prefetched_step(int(checkpoint_state["global_step"]))
+
+
 def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device settings
     args: argparse.Namespace,
     *,
@@ -766,6 +816,11 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             episode_concurrency=rollout_concurrency,
             admission=source.backend.request_admission,
             step_pipelining=args.step_pipelining,
+            dynamic_sampling=args.dynamic_sampling,
+            dynamic_sampling_max_groups=args.dynamic_sampling_max_groups,
+            dynamic_sampling_skip_after=args.dynamic_sampling_skip_after,
+            dynamic_sampling_dir=args.output_dir / "dynamic-sampling",
+            dynamic_sampling_tasks=task_ids,
         )
         trainer = OrganismGRPOTrainer(
             model=model,
@@ -795,12 +850,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             raise TypeError("organism RL requires a torch optimizer")
         assert_fp32_training_state(trainer.model, trainer.optimizer)
         record_precision_provenance(args.output_dir, trainer.model, trainer.optimizer)
-        if args.step_pipelining and args.resume_from_checkpoint is not None:
-            validate_checkpoint(args.resume_from_checkpoint)
-            checkpoint_state = json.loads(
-                (args.resume_from_checkpoint / "trainer_state.json").read_text(encoding="utf-8")
-            )
-            source.discard_prefetched_step(int(checkpoint_state["global_step"]))
+        _prepare_prefetched_step_resume(args, source)
         trainer.train(
             resume_from_checkpoint=str(args.resume_from_checkpoint)
             if args.resume_from_checkpoint

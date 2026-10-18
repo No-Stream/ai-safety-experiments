@@ -10,6 +10,7 @@ persistence require a separate deployment check.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 # JSON values vary by source; serialization validates this boundary.
@@ -51,6 +53,61 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def compare_identity_fields(expected: Any, observed: Any, prefix: str = "identity") -> list[str]:
+    """Return readable JSON field paths whose values differ between two records."""
+    if type(expected) is dict and type(observed) is dict:
+        differences: list[str] = []
+        for key in sorted(set(expected) | set(observed)):
+            field = f"{prefix}.{key}"
+            if key not in expected or key not in observed:
+                differences.append(field)
+            else:
+                differences.extend(compare_identity_fields(expected[key], observed[key], field))
+        return differences
+    if type(expected) is list and type(observed) is list:
+        differences = []
+        for index in range(max(len(expected), len(observed))):
+            field = f"{prefix}[{index}]"
+            if index >= len(expected) or index >= len(observed):
+                differences.append(field)
+            else:
+                differences.extend(compare_identity_fields(expected[index], observed[index], field))
+        return differences
+    if type(expected) is bytes or type(observed) is bytes:
+        return [] if expected == observed else [prefix]
+    return [] if _encode(expected) == _encode(observed) else [prefix]
+
+
+def _same_json_value(expected: Any, observed: Any) -> bool:
+    return not compare_identity_fields(expected, observed)
+
+
+def _assessment_identity_content(identity: Mapping[str, Any]) -> dict[str, Any]:
+    content = {key: value for key, value in identity.items() if key != "raw_episode_digest"}
+    if "automatic_assessment_identity" in content:
+        content.pop("automatic_assessment_digest", None)
+    return content
+
+
+def _readable_blob(data: bytes) -> dict[str, str]:
+    try:
+        return {"text": data.decode("utf-8")}
+    except UnicodeDecodeError:
+        return {"base64": base64.b64encode(data).decode("ascii")}
+
+
+def _action_intent(request_id: str, status: str, intent: dict[str, Any]) -> ActionIntent:
+    return ActionIntent(
+        request_id=request_id,
+        status=status,
+        payload=intent["payload"],
+        prior_state_digest=intent["prior_state_digest"],
+        prior_head_digest=intent["prior_head_digest"],
+        prior_state=intent.get("prior_state"),
+        prior_head_sequence=intent.get("prior_head_sequence"),
+    )
+
+
 @dataclass(frozen=True)
 class ActionIntent:
     """Persisted action reservation bound to a specific pre-execution state."""
@@ -60,6 +117,8 @@ class ActionIntent:
     payload: dict[str, Any]
     prior_state_digest: str
     prior_head_digest: str
+    prior_state: Any
+    prior_head_sequence: int | None
 
 
 class EpisodeJournal:
@@ -124,10 +183,14 @@ class EpisodeJournal:
                 or _encode(saved_identity[key]) != _encode(generation_identity[key])
             )
             raise ValueError("generation identity changed: " + ", ".join(changed))
-        elif initial_state is not _OMITTED and _digest(_encode(initial_state)) != self._meta(
-            "initial_state"
-        ):
-            raise ValueError("initial state changed")
+        elif initial_state is not _OMITTED:
+            saved_initial_state = self.read_json(self._meta("initial_state"))
+            changed = compare_identity_fields(initial_state, saved_initial_state, "initial_state")
+            if changed:
+                raise ValueError("initial state changed: " + ", ".join(changed))
+        if self._meta("head_sequence") is None:
+            latest_event = self.connection.execute("SELECT MAX(sequence) FROM events").fetchone()[0]
+            self._set_meta("head_sequence", 0 if latest_event is None else latest_event)
 
     def __enter__(self) -> Self:
         """Keep the writer reservation for this context."""
@@ -184,8 +247,9 @@ class EpisodeJournal:
     def _event(self, event: dict[str, Any]) -> str:
         event["previous_head"] = self._meta("head")
         digest = self.put_json(event)
-        self.connection.execute("INSERT INTO events(digest) VALUES (?)", (digest,))
+        cursor = self.connection.execute("INSERT INTO events(digest) VALUES (?)", (digest,))
         self._set_meta("head", digest)
+        self._set_meta("head_sequence", cursor.lastrowid)
         return digest
 
     def save_completion(  # noqa: PLR0913, PLR0917
@@ -210,8 +274,15 @@ class EpisodeJournal:
         }
         saved = self.get_completion(turn_index)
         if saved is not None:
-            if saved["digest"] != _digest(_encode(payload)):
-                raise ValueError("completion already saved with different payload")
+            differences = compare_identity_fields(
+                payload,
+                {key: value for key, value in saved.items() if key != "digest"},
+                "completion",
+            )
+            if differences:
+                raise ValueError(
+                    "completion already saved with changed fields: " + ", ".join(differences)
+                )
             return str(saved["digest"])
         if self._meta("closed"):
             raise ValueError("episode is closed")
@@ -239,6 +310,92 @@ class EpisodeJournal:
             return None
         return {"digest": row[0], **self.read_json(row[0])}
 
+    def _completion_turn(self, digest: str) -> int:
+        row = self.connection.execute(
+            "SELECT turn FROM completions WHERE digest=?", (digest,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("action requires saved completion")
+        return int(row[0])
+
+    def _action_payload_content(self, payload: dict[str, Any]) -> dict[str, Any]:
+        completion_digest = str(payload["completion_digest"])
+        completion_turn = self._completion_turn(completion_digest)
+        saved_completion_turn = payload.get("completion_turn")
+        if saved_completion_turn is not None and saved_completion_turn != completion_turn:
+            raise ValueError("action completion turn does not match its saved completion")
+        return {
+            **{
+                key: value
+                for key, value in payload.items()
+                if key not in {"completion_digest", "completion_turn"}
+            },
+            "completion_turn": completion_turn,
+        }
+
+    def _event_sequence(self, digest: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT sequence FROM events WHERE digest=?", (digest,)
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def _readable_head_content(self, digest: str) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
+        while True:
+            head = self.read_json(digest)
+            sequence = self._event_sequence(digest)
+            if sequence is None:
+                if "kind" in head:
+                    raise ValueError("action head has no event sequence")
+                return {
+                    "generation": head["generation"],
+                    "initial_state": head["initial_state"],
+                    "events": list(reversed(events)),
+                }
+
+            if head["kind"] == "completion":
+                completion_turn = self._completion_turn(head["digest"])
+                completion = self.get_completion(completion_turn)
+                if completion is None:
+                    raise ValueError("action head references a missing completion")
+                record = {key: value for key, value in completion.items() if key != "digest"}
+            else:
+                committed = self.read_json(head["digest"])
+                intent = self.read_json(committed["intent_digest"])
+                prior_state = intent.get("prior_state")
+                if "prior_state" not in intent:
+                    prior_state = self.read_json(intent["prior_state_digest"])
+                prior_head_sequence = intent.get("prior_head_sequence")
+                if prior_head_sequence is None:
+                    prior_head_sequence = self._event_sequence(intent["prior_head_digest"]) or 0
+                record = {
+                    "request_id": committed["request_id"],
+                    "intent": {
+                        "payload": self._action_payload_content(intent["payload"]),
+                        "prior_state": prior_state,
+                        "prior_head_sequence": prior_head_sequence,
+                    },
+                    "result": committed["result"],
+                    "state": self.read_json(committed["state_digest"]),
+                    "check": committed["check"],
+                    "close": committed["close"],
+                }
+            events.append({"sequence": sequence, "kind": head["kind"], "record": record})
+            previous_head = head.get("previous_head")
+            if previous_head is None:
+                raise ValueError("action event has no previous head")
+            digest = previous_head
+
+    def _action_intent_content(self, intent: dict[str, Any]) -> dict[str, Any]:
+        prior_state = intent.get("prior_state")
+        if prior_state is None:
+            prior_state = self.read_json(intent["prior_state_digest"])
+        return {
+            "payload": self._action_payload_content(intent["payload"]),
+            "prior_state": prior_state,
+            "prior_head": self._readable_head_content(intent["prior_head_digest"]),
+        }
+
     def begin_action(
         self,
         request_id: str,
@@ -259,10 +416,17 @@ class EpisodeJournal:
             "SELECT * FROM actions WHERE request_id=?", (request_id,)
         ).fetchone()
         if row is not None:
-            if row[1] != payload_digest:
-                raise ValueError("request ID reused with changed payload")
             intent = self.read_json(row[2])
-            return ActionIntent(request_id, "pending" if row[3] is None else "committed", **intent)
+            expected_payload = self._action_payload_content(payload)
+            saved_payload = self._action_payload_content(intent["payload"])
+            differences = compare_identity_fields(expected_payload, saved_payload, "action")
+            if differences:
+                raise ValueError(
+                    "request ID reused with changed payload fields: " + ", ".join(differences)
+                )
+            if "prior_state" not in intent:
+                intent["prior_state"] = self.read_json(intent["prior_state_digest"])
+            return _action_intent(request_id, "pending" if row[3] is None else "committed", intent)
         if self._meta("closed"):
             raise ValueError("episode is closed")
         if self.connection.execute(
@@ -276,11 +440,15 @@ class EpisodeJournal:
             is None
         ):
             raise ValueError("action requires saved completion")
-        self._validate_action_order(completion_digest, call_index, tool_name)
+        completion_turn = self._completion_turn(completion_digest)
+        payload["completion_turn"] = completion_turn
+        self._validate_action_order(completion_turn, call_index, tool_name)
         intent: dict[str, Any] = {
             "payload": payload,
             "prior_state_digest": self._meta("state"),
             "prior_head_digest": self._meta("head"),
+            "prior_state": self.state(),
+            "prior_head_sequence": self._meta("head_sequence"),
         }
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -288,22 +456,25 @@ class EpisodeJournal:
             self.connection.execute(
                 "INSERT INTO actions VALUES (?,?,?,NULL)", (request_id, payload_digest, digest)
             )
-        return ActionIntent(request_id, "pending", **intent)
+        return _action_intent(request_id, "pending", intent)
 
-    def _validate_action_order(
-        self, completion_digest: str, call_index: int, tool_name: str
-    ) -> None:
+    def _validate_action_order(self, completion_turn: int, call_index: int, tool_name: str) -> None:
         latest = self.connection.execute(
-            "SELECT digest FROM completions ORDER BY turn DESC LIMIT 1"
+            "SELECT turn FROM completions ORDER BY turn DESC LIMIT 1"
         ).fetchone()[0]
-        if completion_digest != latest:
-            raise ValueError("action requires latest completion")
+        if completion_turn != latest:
+            raise ValueError(
+                f"action requires latest completion turn {latest}, got {completion_turn}"
+            )
         prior_calls = [
             self.read_json(intent_digest)["payload"]
             for (intent_digest,) in self.connection.execute("SELECT intent_digest FROM actions")
         ]
+        for call in prior_calls:
+            if "completion_turn" not in call:
+                call["completion_turn"] = self._completion_turn(str(call["completion_digest"]))
         calls_for_completion = [
-            call for call in prior_calls if call["completion_digest"] == completion_digest
+            call for call in prior_calls if call["completion_turn"] == completion_turn
         ]
         if tool_name == "termination":
             if call_index != HOST_TERMINATION_INDEX:
@@ -319,6 +490,26 @@ class EpisodeJournal:
             "SELECT committed_digest FROM actions WHERE request_id=?", (request_id,)
         ).fetchone()
         return None if row is None or row[0] is None else self.read_json(row[0])
+
+    def _committed_action_differences(
+        self,
+        saved: dict[str, Any],
+        expected: dict[str, Any],
+    ) -> list[str]:
+        saved_intent = self.read_json(saved["intent_digest"])
+        expected_commit = {
+            **{key: value for key, value in expected.items() if key != "intent"},
+            "intent": self._action_intent_content(expected["intent"]),
+        }
+        saved_commit = {
+            "request_id": saved["request_id"],
+            "intent": self._action_intent_content(saved_intent),
+            "result": saved["result"],
+            "state": self.read_json(saved["state_digest"]),
+            "check": saved["check"],
+            "close": saved["close"],
+        }
+        return compare_identity_fields(expected_commit, saved_commit, "action")
 
     def commit_action(
         self,
@@ -345,15 +536,26 @@ class EpisodeJournal:
             "close": close,
         }
         if row[1] is not None:
-            if self.read_blob(row[1]) != _encode(committed):
-                raise ValueError("committed action payload changed")
+            saved = self.read_json(row[1])
+            expected = {
+                "request_id": request_id,
+                "intent": intent,
+                "result": result,
+                "state": state,
+                "check": check,
+                "close": close,
+            }
+            differences = self._committed_action_differences(saved, expected)
+            if differences:
+                raise ValueError(
+                    "committed action payload changed fields: " + ", ".join(differences)
+                )
             return self.read_json(row[1])
         if self._meta("closed"):
             raise ValueError("episode is closed")
-        if intent["prior_head_digest"] != self._meta("head") or intent[
-            "prior_state_digest"
-        ] != self._meta("state"):
-            raise ValueError("action prior state/head changed")
+        differences = self._action_prior_differences(intent)
+        if differences:
+            raise ValueError("action prior state/head changed: " + ", ".join(differences))
         checks = self._meta("checks") + int(check)
         if checks > MAX_CHECKS:
             raise ValueError("check budget exceeded")
@@ -380,6 +582,21 @@ class EpisodeJournal:
                 self._set_meta("closed", value=True)
         return committed
 
+    def _action_prior_differences(self, intent: dict[str, Any]) -> list[str]:
+        current_state = self.state()
+        prior_head_sequence = intent.get("prior_head_sequence")
+        if prior_head_sequence is None:
+            prior_head_sequence = self._event_sequence(intent["prior_head_digest"]) or 0
+        current_head_sequence = self._meta("head_sequence")
+        differences = (
+            [] if prior_head_sequence == current_head_sequence else ["action.prior_head_sequence"]
+        )
+        previous_state = intent.get("prior_state")
+        if "prior_state" not in intent:
+            previous_state = self.read_json(intent["prior_state_digest"])
+        differences.extend(compare_identity_fields(previous_state, current_state, "action.state"))
+        return differences
+
     def raw_episode_digest(self) -> str:
         """Return immutable closure identity; open episodes have no final digest."""
         if self._meta("closed") is not True:
@@ -389,16 +606,30 @@ class EpisodeJournal:
         manifest = closure["raw_manifest"]
         for blob_digest in manifest["blobs"]:
             self.read_blob(blob_digest)
-        if _encode(manifest) != _encode(self._raw_manifest(blob_digests=manifest["blobs"])):
-            raise ValueError("raw episode manifest digest mismatch")
+        saved_manifest = self.readable_episode_identity(manifest)
+        current_manifest = self.readable_episode_identity(
+            self._raw_manifest(blob_digests=manifest["blobs"])
+        )
+        differences = compare_identity_fields(
+            current_manifest, saved_manifest, "raw_episode_manifest"
+        )
+        if differences:
+            raise ValueError("raw episode manifest changed: " + ", ".join(differences))
         expected_progress = {
-            "head": self._meta("head"),
-            "state_digest": self._meta("state"),
+            "head": self._readable_head_content(self._meta("head")),
+            "state": self.state(),
             "checks": self._meta("checks"),
         }
-        saved_progress = {key: closure[key] for key in expected_progress}
-        if _encode(saved_progress) != _encode(expected_progress):
-            raise ValueError("raw episode closure digest mismatch")
+        saved_progress = {
+            "head": self._readable_head_content(closure["head"]),
+            "state": self.read_json(closure["state_digest"]),
+            "checks": closure["checks"],
+        }
+        differences = compare_identity_fields(
+            expected_progress, saved_progress, "raw_episode_closure"
+        )
+        if differences:
+            raise ValueError("raw episode closure changed: " + ", ".join(differences))
         return digest
 
     def _raw_manifest(self, *, blob_digests: list[str] | None = None) -> dict[str, Any]:
@@ -439,19 +670,37 @@ class EpisodeJournal:
             raise ValueError("manual awareness review requires rubric and reviewer identity")
         if "mechanism_evidence" not in assessment:
             raise ValueError("explicit mechanism_evidence required")
+        raw_episode_digest = self.raw_episode_digest()
+        raw_episode_manifest = self.read_json(raw_episode_digest)["raw_manifest"]
+        readable_episode_manifest = self.readable_episode_identity(raw_episode_manifest)
         payload = {
-            "raw_episode_digest": self.raw_episode_digest(),
+            "raw_episode_digest": raw_episode_digest,
+            "raw_episode_manifest": raw_episode_manifest,
             "identity": identity,
             "assessment": assessment,
         }
         identity_digest = _digest(_encode(identity))
-        existing = self.connection.execute(
-            "SELECT digest FROM assessments WHERE identity_digest=?", (identity_digest,)
-        ).fetchone()
-        if existing is not None:
-            if self.read_blob(existing[0]) != _encode(payload):
-                raise ValueError("assessment identity already has a different payload")
-            return str(existing[0])
+        current_identity = _assessment_identity_content(identity)
+        for (existing_digest,) in self.connection.execute("SELECT digest FROM assessments"):
+            existing_payload = self.read_json(existing_digest)
+            if not _same_json_value(
+                _assessment_identity_content(existing_payload["identity"]), current_identity
+            ):
+                continue
+            existing_manifest = self._assessment_manifest(existing_payload)
+            differences = compare_identity_fields(
+                readable_episode_manifest, existing_manifest, "raw_episode_manifest"
+            )
+            if differences:
+                continue
+            differences = compare_identity_fields(
+                assessment, existing_payload["assessment"], "assessment"
+            )
+            if differences:
+                raise ValueError(
+                    "assessment identity already has a different payload: " + ", ".join(differences)
+                )
+            return str(existing_digest)
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             digest = self.put_json(payload)
@@ -462,33 +711,139 @@ class EpisodeJournal:
 
     def load_assessment(self, identity: dict[str, Any]) -> dict[str, Any] | None:
         """Return only an assessment bound to the requested evaluator and closure."""
-        row = self.connection.execute(
-            "SELECT digest FROM assessments WHERE identity_digest=?", (_digest(_encode(identity)),)
-        ).fetchone()
-        if row is None:
-            return None
-        payload = self.read_json(row[0])
-        if (
-            _encode(payload["identity"]) != _encode(identity)
-            or payload["raw_episode_digest"] != self.raw_episode_digest()
-        ):
-            raise ValueError("stale assessment identity")
-        return payload["assessment"]
+        requested_identity = _assessment_identity_content(identity)
+        raw_manifest = self.read_json(self.raw_episode_digest())["raw_manifest"]
+        current_manifest = self.readable_episode_identity(raw_manifest)
+        for (digest,) in self.connection.execute("SELECT digest FROM assessments"):
+            payload = self.read_json(digest)
+            if not _same_json_value(
+                _assessment_identity_content(payload["identity"]), requested_identity
+            ):
+                continue
+            differences = compare_identity_fields(
+                current_manifest, self._assessment_manifest(payload), "raw_episode_manifest"
+            )
+            if differences:
+                raise ValueError("stale assessment identity: " + ", ".join(differences))
+            return payload["assessment"]
+        return None
 
     def list_assessments(self) -> tuple[dict[str, Any], ...]:
         """Return all immutable sidecars bound to this validated raw closure."""
-        raw_digest = self.raw_episode_digest()
+        raw_manifest = self.read_json(self.raw_episode_digest())["raw_manifest"]
+        current_manifest = self.readable_episode_identity(raw_manifest)
         entries: list[dict[str, Any]] = []
-        for identity_digest, digest in self.connection.execute(
-            "SELECT identity_digest,digest FROM assessments ORDER BY identity_digest"
-        ):
+        for (digest,) in self.connection.execute("SELECT digest FROM assessments ORDER BY digest"):
             payload = self.read_json(digest)
-            if _digest(_encode(payload["identity"])) != identity_digest:
-                raise ValueError("stale assessment identity digest")
-            if payload["raw_episode_digest"] != raw_digest:
-                raise ValueError("stale assessment episode digest")
+            differences = compare_identity_fields(
+                current_manifest, self._assessment_manifest(payload), "raw_episode_manifest"
+            )
+            if differences:
+                raise ValueError("stale assessment episode: " + ", ".join(differences))
             entries.append({"digest": digest, **payload})
         return tuple(entries)
+
+    def _assessment_manifest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "raw_episode_manifest" in payload:
+            raw_manifest = payload["raw_episode_manifest"]
+        else:
+            closure = self.read_json(payload["raw_episode_digest"])
+            raw_manifest = closure["raw_manifest"]
+        return self.readable_episode_identity(raw_manifest)
+
+    def readable_episode_identity(self, raw_manifest: dict[str, Any]) -> dict[str, Any]:
+        """Resolve journal references into the readable content of an episode."""
+        blob_digests = set(raw_manifest["blobs"])
+        completion_records = {
+            digest: {"turn": turn, "completion": self.read_json(digest)}
+            for turn, digest in raw_manifest["completions"]
+        }
+        committed_records: dict[str, dict[str, Any]] = {}
+        action_records: list[dict[str, Any]] = []
+        for request_id, _payload_digest, intent_digest, committed_digest in raw_manifest["actions"]:
+            intent = self.read_json(intent_digest)
+            action_payload = dict(intent["payload"])
+            completion = completion_records[action_payload.pop("completion_digest")]
+            action_payload["completion_turn"] = completion["turn"]
+            prior_state = intent.get("prior_state")
+            if prior_state is None:
+                prior_state = self.read_json(intent["prior_state_digest"])
+            committed_record = None
+            if committed_digest is not None:
+                committed_record = self.read_json(committed_digest)
+                committed_record = {
+                    **{
+                        key: value
+                        for key, value in committed_record.items()
+                        if key not in {"intent_digest", "state_digest"}
+                    },
+                    "state": self.read_json(committed_record["state_digest"]),
+                }
+                committed_records[committed_digest] = committed_record
+            action_records.append(
+                {
+                    "request_id": request_id,
+                    "payload": action_payload,
+                    "prior_state": prior_state,
+                    "prior_head_sequence": intent.get("prior_head_sequence"),
+                    "committed": committed_record,
+                }
+            )
+
+        event_records: dict[str, dict[str, Any]] = {}
+        for sequence, digest in raw_manifest["events"]:
+            event = self.read_json(digest)
+            if event["kind"] == "completion":
+                record = completion_records.get(event["digest"])
+                if record is None:
+                    completion_turn = self._completion_turn(event["digest"])
+                    record = {
+                        "turn": completion_turn,
+                        "completion": self.read_json(event["digest"]),
+                    }
+            else:
+                record = committed_records[event["digest"]]
+            event_records[digest] = {
+                "sequence": sequence,
+                "kind": event["kind"],
+                "record": record,
+            }
+
+        action_contents: list[dict[str, Any]] = []
+        for row, action_record in zip(raw_manifest["actions"], action_records, strict=True):
+            intent = self.read_json(row[2])
+            prior_head = event_records.get(intent["prior_head_digest"])
+            prior_head_sequence = intent.get("prior_head_sequence")
+            if prior_head_sequence is None:
+                prior_head_sequence = 0 if prior_head is None else prior_head["sequence"]
+            action_contents.append(
+                {
+                    **action_record,
+                    "prior_head_sequence": prior_head_sequence,
+                    "prior_head": prior_head,
+                }
+            )
+
+        readable_manifest = {
+            "generation": raw_manifest["generation"],
+            "initial_state": self.read_json(raw_manifest["initial_state"]),
+            "events": [event_records[digest] for _, digest in raw_manifest["events"]],
+            "completions": sorted(completion_records.values(), key=lambda record: record["turn"]),
+            "actions": action_contents,
+        }
+        return self._resolve_blob_references(readable_manifest, blob_digests)
+
+    def _resolve_blob_references(self, value: Any, blob_digests: set[str]) -> Any:
+        if type(value) is dict:
+            return {
+                key: self._resolve_blob_references(child, blob_digests)
+                for key, child in value.items()
+            }
+        if type(value) is list:
+            return [self._resolve_blob_references(child, blob_digests) for child in value]
+        if type(value) is str and value in blob_digests:
+            return _readable_blob(self.read_blob(value))
+        return value
 
     def readout_eligibility(self, identity: dict[str, Any]) -> str:
         """Keep missing or unresolved manual awareness review pending."""

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -13,7 +12,6 @@ from reward_hacking.spec_gaming.config import (
     SamplingSettings,
     configured_path,
     exact_keys,
-    file_sha256,
     nonempty_string,
     object_value,
     parse_acceptance_config,
@@ -32,8 +30,6 @@ from reward_hacking.spec_gaming.retail_native import RetailNativeBridge
 
 if TYPE_CHECKING:
     from reward_hacking.spec_gaming.episode import EpisodeSettings
-
-logger = logging.getLogger(__name__)
 
 CONFIG_SCHEMA_VERSION = 1
 
@@ -115,14 +111,6 @@ def _source_config(value: object) -> RetailSourceConfig:
         raise ValueError("source.runtime_python must exist as a regular file")
     if not runtime_lockfile.is_file():
         raise ValueError("source runtime lockfile is missing")
-    observed_lockfile_sha256 = file_sha256(runtime_lockfile)
-    if observed_lockfile_sha256 != lockfile_sha256:
-        logger.warning(
-            "source runtime lockfile %s records sha256 %s but observed %s",
-            runtime_lockfile,
-            lockfile_sha256,
-            observed_lockfile_sha256,
-        )
     repository_root = Path(__file__).resolve().parents[2]
     if runtime_python.is_relative_to(repository_root) or runtime_python.resolve().is_relative_to(
         repository_root

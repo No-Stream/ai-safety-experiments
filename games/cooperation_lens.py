@@ -20,6 +20,7 @@ import json
 import logging
 import sys
 import zlib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -50,13 +51,12 @@ from games.interp_lens_ladder import (
     LENS_FILENAME,
     LENS_MODEL_UNMERGED,
     LadderLensModels,
-    adapter_digests,
     lens_cache_key_for_cell,
     pair_divergence_indices,
 )
-from games.lora import assert_one_adapter_config
+from games.lora import adapter_config_identity, assert_one_adapter_config
 from games.provenance import git_sha
-from games.tokenizer_identity import tokenizer_content_sha256
+from games.tokenizer_identity import tokenizer_content_sha256, tokenizer_identity_payload
 from reward_hacking.interp.directions import matched_norm_random_direction
 from reward_hacking.interp.jacobian import (
     DEFAULT_MAX_SEQ_LEN_CEILING,
@@ -77,7 +77,7 @@ from reward_hacking.interp.jacobian import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
     from transformers import PreTrainedTokenizerBase
 
@@ -281,19 +281,37 @@ def validate_construct_capture(
             f"got {sorted(labels)}"
         )
     final_cell = ladder.cell(final_arm, final_step)
-    adapter_sha256, _ = adapter_digests(final_adapter)
-    if final_cell.adapter_weights_sha256 != adapter_sha256:
+    recorded_adapter_path = final_cell.provenance.get("adapter_dir")
+    if isinstance(recorded_adapter_path, str) and Path(recorded_adapter_path).resolve() != (
+        final_adapter.resolve()
+    ):
+        raise ValueError("construct capture final cell names a different adapter path")
+    recorded_adapter_config = final_cell.provenance.get("adapter_config")
+    if isinstance(recorded_adapter_config, Mapping) and dict(recorded_adapter_config) != (
+        adapter_config_identity(final_adapter)
+    ):
+        raise ValueError("construct capture final cell has different adapter config fields")
+    if final_cell.step != final_step:
         raise ValueError(
-            "construct capture final cell used different adapter weights from this lens run"
+            f"construct capture final cell step is {final_cell.step}, expected {final_step}"
         )
+    weights_path = final_adapter / "adapter_model.safetensors"
+    weights_size_bytes = weights_path.stat().st_size
+    recorded_weights_size = final_cell.provenance.get("adapter_weights_size_bytes")
+    if recorded_weights_size is not None and recorded_weights_size != weights_size_bytes:
+        raise ValueError("construct capture final cell records a different adapter weights size")
     return {
         "root": str(root),
         "identity": ladder.identity.to_payload(),
         "cells": [cell.label for cell in ladder.cells],
+        "final_adapter_path": str(final_adapter.resolve()),
+        "final_step": final_step,
+        "final_adapter_weights_size_bytes": weights_size_bytes,
+        "final_adapter_config": adapter_config_identity(final_adapter),
         "adapter_positive_control": (
             "passed: load_ladder refused any adapted cell bit-identical to the base"
         ),
-        "final_adapter_weights_sha256": adapter_sha256,
+        "final_adapter_weights_sha256": final_cell.adapter_weights_sha256,
     }
 
 
@@ -488,7 +506,7 @@ def validate_gradient_gate_binding(  # noqa: PLR0913 - every runtime identity is
     payload: dict[str, Any],
     *,
     base_weights_identity: str,
-    tokenizer_content_identity: str,
+    tokenizer_identity: Mapping[str, object],
     comparison_reference_identity: str,
     fit_stimuli_sha256: str,
     fit_rendered_sha256: str,
@@ -515,16 +533,17 @@ def validate_gradient_gate_binding(  # noqa: PLR0913 - every runtime identity is
         raise ValueError(
             "gradient gate tokenizer identity differs from the base tokenizer snapshot"
         )
-    if model.get("tokenizer_content_sha256") != tokenizer_content_identity:
-        raise ValueError(
-            "gradient gate tokenizer content fingerprint differs from the loaded lens tokenizer"
-        )
+    model_tokenizer_identity = model.get("tokenizer_identity")
+    _validate_tokenizer_identity_binding(
+        tokenizer_identity,
+        model_tokenizer_identity,
+        owner="gradient gate model tokenizer identity",
+    )
     expected_corpus_binding = {
         "fit_stimuli_sha256": fit_stimuli_sha256,
         "fit_rendered_sha256": fit_rendered_sha256,
         "stimulus_render": stimulus_render,
         "enable_thinking": enable_thinking,
-        "tokenizer_content_sha256": tokenizer_content_identity,
     }
     corpus_binding = cast("dict[str, object]", payload.get("cooperation_fit_corpus", {}))
     stale_corpus_fields = [
@@ -537,6 +556,12 @@ def validate_gradient_gate_binding(  # noqa: PLR0913 - every runtime identity is
             "gradient gate cooperation fit corpus/render binding differs from this lens run for "
             f"{stale_corpus_fields}"
         )
+    corpus_tokenizer_identity = corpus_binding.get("tokenizer_identity")
+    _validate_tokenizer_identity_binding(
+        tokenizer_identity,
+        corpus_tokenizer_identity,
+        owner="gradient gate cooperation fit tokenizer identity",
+    )
     if payload.get("max_seq_len") != max_seq_len:
         raise ValueError(
             f"gradient gate max_seq_len={payload.get('max_seq_len')} differs from fit "
@@ -557,6 +582,46 @@ def validate_gradient_gate_binding(  # noqa: PLR0913 - every runtime identity is
             f"gradient gate used jlens commit {commit!r}, not pinned commit {JLENS_COMMIT}"
         )
     return payload
+
+
+def _mapping_differences(
+    expected: Mapping[str, object],
+    found: Mapping[str, object],
+    *,
+    prefix: str,
+) -> list[str]:
+    """Return dotted field paths whose readable identity values differ."""
+    differences: list[str] = []
+    for key in sorted(expected.keys() | found.keys()):
+        field = f"{prefix}.{key}"
+        if key not in expected or key not in found:
+            differences.append(field)
+            continue
+        expected_value = expected[key]
+        found_value = found[key]
+        if isinstance(expected_value, Mapping) and isinstance(found_value, Mapping):
+            differences.extend(
+                _mapping_differences(
+                    cast("Mapping[str, object]", expected_value),
+                    cast("Mapping[str, object]", found_value),
+                    prefix=field,
+                )
+            )
+        elif expected_value != found_value:
+            differences.append(field)
+    return differences
+
+
+def _validate_tokenizer_identity_binding(
+    expected: Mapping[str, object], found: object, *, owner: str
+) -> None:
+    if found is None:
+        return
+    if not isinstance(found, Mapping):
+        raise TypeError(f"{owner} must be an object")
+    differences = _mapping_differences(expected, found, prefix="tokenizer_identity")
+    if differences:
+        raise ValueError(f"{owner} fields differ: {differences}")
 
 
 def _quality_by_layer(quality: Mapping[str, Any]) -> dict[int, dict[str, float]]:
@@ -580,6 +645,15 @@ def _quality_by_layer(quality: Mapping[str, Any]) -> dict[int, dict[str, float]]
         }
         for layer in sorted(jacobian)
     }
+
+
+def _tokenizer_report_identity(
+    tokenizer: object, model_name: str, revision: str | None
+) -> tuple[str, dict[str, object]]:
+    return (
+        tokenizer_content_sha256(tokenizer),
+        tokenizer_identity_payload(tokenizer, name=model_name, revision=revision),
+    )
 
 
 def decode_directions(  # noqa: PLR0913 - one read is lens, model, tokenizer, paths and knobs
@@ -638,6 +712,7 @@ def decode_directions(  # noqa: PLR0913 - one read is lens, model, tokenizer, pa
             layers[str(layer)] = {
                 "quality": layer_quality[layer],
                 "direction_norm": direction_norm,
+                "direction_shape": list(direction.shape),
                 "random_norm": float(random_direction.norm()),
                 "real": rows(direction),
                 "matched_norm_random": rows(random_direction),
@@ -886,11 +961,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     base_identity = resolve_weights_identity(args.base_model, revision=args.base_revision)
     # lens_schedule_gates.load_tokenizer_encoders records resolve_weights_identity verbatim.
     comparison_reference_identity = f"hf:{DEFAULT_BASE_REVISION}"
-    tokenizer_content_identity = tokenizer_content_sha256(tokenizer)
+    tokenizer_content_identity, tokenizer_identity = _tokenizer_report_identity(
+        tokenizer,
+        cast("str", args.base_model),
+        cast("str | None", args.base_revision),
+    )
     validate_gradient_gate_binding(
         gradient_payload,
         base_weights_identity=base_identity,
-        tokenizer_content_identity=tokenizer_content_identity,
+        tokenizer_identity=tokenizer_identity,
         comparison_reference_identity=comparison_reference_identity,
         fit_stimuli_sha256=corpus.fit_stimuli_sha256,
         fit_rendered_sha256=corpus.fit_prompt_sha256,
@@ -910,19 +989,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         base_revision=args.base_revision,
     )
     cache = LensCache(root=str(args.lens_cache or (args.out_dir / "cache")))
+    corpus_payload = {**corpus.as_payload(), "tokenizer_identity": tokenizer_identity}
     report: dict[str, Any] = {
         "git_sha": git_sha(),
         "profile": corpus.profile,
         "base_model": args.base_model,
         "base_revision": args.base_revision,
         "base_weights_identity": base_identity,
+        "tokenizer_identity": tokenizer_identity,
         "tokenizer_content_sha256": tokenizer_content_identity,
         "token_comparison_reference_identity": comparison_reference_identity,
         "final_adapter": str(final_adapter),
         "final_arm": args.final_arm,
         "final_step": args.final_step,
         "construct_capture": capture_validation,
-        "corpus": corpus.as_payload(),
+        "corpus": corpus_payload,
         "corpus_identity_sha256": corpus.identity_sha256,
         "gradient_gate_report": str(gradient_path),
         "gradient_gate_sha256": sha256_of_file(gradient_path),

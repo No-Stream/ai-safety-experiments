@@ -5226,7 +5226,7 @@ def _probe_counterfactuals_if_eligible(
     return scenario.probe_counterfactuals(context.episode_dir, timeout=context.timeout)
 
 
-def _run_one(  # noqa: C901, PLR0913, PLR0917, PLR0915 - explicit orchestration seams aid synthetic tests
+def _run_one(  # noqa: C901, PLR0912, PLR0913, PLR0917, PLR0915 - explicit orchestration seams aid synthetic tests
     config: RunnerConfig,
     scenario: ScenarioLike,
     model: ModelSpec,
@@ -5251,9 +5251,28 @@ def _run_one(  # noqa: C901, PLR0913, PLR0917, PLR0915 - explicit orchestration 
     trace_path = _episode_trace_path(config, key)
     run_result = episode_runner(scenario, backend, arm, sample_index, episode_dir, trace_path)
     trace = run_result.trace if isinstance(run_result, EpisodeRun) else run_result
-    if _trace_summary(trace).get("ended_by") == "thinking_budget_overshoot":
+    trace_summary = _trace_summary(trace)
+    if trace_summary.get("ended_by") == "thinking_budget_overshoot":
         failure_record = _thinking_budget_overshoot_failure_record(config, key, trace_path)
-        failure_record["trace_summary"] = _trace_summary(trace)
+        failure_record["trace_summary"] = trace_summary
+        return failure_record
+    if trace_summary.get("ended_by") == "persistent_jail_supervisor_failure":
+        failure_reason = "persistent_jail_supervisor_failure"
+        if trace_summary.get("failure_reason") != failure_reason:
+            raise ValueError(
+                "persistent jail supervisor failure requires a matching failure reason"
+            )
+        infrastructure_failure = trace_summary.get("infrastructure_failure")
+        if not isinstance(infrastructure_failure, Mapping):
+            raise TypeError("persistent jail supervisor failure requires infrastructure evidence")
+        if infrastructure_failure.get("reason") != failure_reason:
+            raise ValueError(
+                "persistent jail supervisor failure reason does not match its evidence"
+            )
+        failure_record = _episode_failure_record(config, key, reason=failure_reason)
+        failure_record["failure_reason"] = failure_reason
+        failure_record["infrastructure_failure"] = dict(infrastructure_failure)
+        failure_record["trace_summary"] = trace_summary
         return failure_record
     episode_token = run_result.episode_token if isinstance(run_result, EpisodeRun) else None
     command_records = run_result.command_records if isinstance(run_result, EpisodeRun) else None

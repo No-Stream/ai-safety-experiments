@@ -22,7 +22,7 @@ scripts/run_jail_tests.sh --backend unshare   # pin the fallback backend instead
 | `scripts/stage_jail_python.sh` | Stages a >=3.12 CPython where the jail can bind it read-only. |
 | `scripts/jail_assertions.py` | The 14 containment checks plus the honeypot-collision check. |
 | `scripts/run_jail_tests.sh` | The gate: argument guards, host checks, in-jail run, and the negative control. |
-| `scripts/persistent_jail_assertions.py` | The persistent transport containment, supervisor protection, timeout recovery and orphan checks. |
+| `scripts/persistent_jail_assertions.py` | Persistent transport containment, supervisor protection, timeout and OOM recovery, and orphan checks. |
 | `reward_hacking/persistent_jail.py` | Keeps an episode namespace alive and executes a fresh shell for each actor command. |
 | `scripts/scan_secrets.py` | Pre-upload and pre-commit gate: fails on secret-shaped text, machine-local identity values, or benchmark item material. |
 
@@ -154,8 +154,8 @@ commands check it while waiting for protocol input or output and kill the namesp
 when interrupted. The worker pool observes failures in completion order while preserving task
 order in successful results. Real two-worker tests fail each task position while its sibling runs
 a long command, then check that the actor child and outer launcher disappear. The isolation gate
-uses explicitly advisory fixture limits when exercising the
-persistent transport, and does not certify live systemd cgroup enforcement.
+uses explicitly advisory fixture limits for the ordinary persistent-transport checks, and those
+checks do not certify live systemd cgroup enforcement.
 
 The host receives PID 1's kernel credentials over a Unix socket before actor commands can start,
 opens a pidfd, and retains it until teardown. If the supervisor hangs, the host kills namespace
@@ -164,14 +164,57 @@ wrapper. A live test stops the supervisor with SIGSTOP and checks that context e
 the namespace. Another paired test removes the dumpability guard: opening the supervisor's output
 descriptor succeeds under that mutation and is denied with the guard restored.
 
+The resource limiter keeps `OOMPolicy=kill` by default, including for the previous per-command jail
+path, where an OOM still kills that command's own unit. `PersistentJail` alone requests
+`OOMPolicy=continue`, leaving the other processes in its episode unit available after a command is
+killed; the persistent unit uses `memory.oom.group=0`. Before each actor shell starts, its launcher
+sets `oom_score_adj=1000` and then replaces itself with the shell, so command descendants inherit
+the OOM preference. The supervisor can then report an exit-137 command result and accept the next
+command. The supervisor adds a `SIGKILL or cgroup OOM` diagnostic because exit 137 alone does not
+prove the kernel cause. The strict memory gate checks the cgroup's `memory.events` OOM-kill counter
+as separate kernel evidence. No explicit swap cap is configured by default, so effective swap
+follows host and parent settings; the optional swap limit is set to zero only in the capped gate
+probe.
+
+If the supervisor still exits, the harness catches only the typed
+`PersistentJailSupervisorError` at the actor-command boundary. It records the attempted command as
+exit 125 and writes the infrastructure-failure reason into both the episode evidence and summary.
+Final grading is skipped, the true result remains unmeasured, and the reward is `None`, so any
+workspace submission from that episode is not scored. The rollout logs the count in its per-step
+summary and warns when it is nonzero. Training continues with isolated failures, but stops when
+more than 25% of a step's episodes have infrastructure failures; an isolated loss is survivable,
+while a larger share would make that step's training signal unreliable. Dynamic sampling applies
+the same rate check to the episodes collected so far after each collection batch, including during
+resume and group refill, so it stops refilling if failures cross the threshold instead of treating
+dead supervisors as ordinary uninformative groups.
+
 The persistent gate runs the ordinary containment assertions through the new transport, then
 checks sibling and host paths, protected supervisor descriptors, signal resistance, output framing,
-timeout recovery, detached-child cleanup and exception cleanup. On 2026-10-17, its sibling-path
-check was attacked by adding a real read-only bind of a synthetic sibling episode directory to the
-executor. The check failed with exit 1 at `host and sibling path hidden`; removing the added bind
-restored a passing gate. The unchanged outside-jail negative control also passed using a synthetic
-writable home with empty credential and hook fixtures, because the execution sandbox exposes the
-real home read-only. These live checks certified the unshare backend; bwrap was unavailable.
+timeout recovery, detached-child cleanup and exception cleanup. A separate strict-cgroup check uses
+a 256 MiB episode limit with swap disabled, verifies that a harmless actor command shares the
+supervisor's cgroup and has `oom_score_adj=1000`, then runs a command that allocates and touches
+anonymous memory. The bomb must return exit 137 with the supervisor's `SIGKILL or cgroup OOM`
+diagnostic, and the cgroup's `memory.events` counter must record an OOM kill. A following command
+must succeed through the same supervisor. The gate closes that episode and verifies no process
+remains in its PID namespace. This probe never uses advisory limits; if the host cannot start an
+enforced unit or verify `memory.max=256 MiB`, `memory.swap.max=0`, `memory.oom.group=0`, and the
+actor command's cgroup and OOM score, the gate stops before the bomb. The other persistent transport
+checks use explicitly advisory fixture limits and do not establish cgroup memory behavior. An
+initial attempt requested a memory cap without verifying the live cgroup properties, so its result
+does not establish capped OOM behavior. A later verified memory-capped probe left swap uncapped; its
+2 GiB allocator completed without an OOM, which motivated setting the optional swap cap to zero for
+the strict probe without changing production swap defaults. On 2026-10-17, the persistent unit's
+OOM policy was sabotaged back to `kill` while the 256 MiB memory cap and zero-swap cap remained
+verified. The capped command then killed the
+supervisor and the gate failed with `PersistentJailSupervisorError`; restoring `continue` and the
+expected `memory.oom.group=0` made the gate pass again. On 2026-10-17, its sibling-path check was
+attacked by adding a real read-only bind of a synthetic sibling episode directory to the executor.
+The check failed with exit 1 at `host and sibling path hidden`; removing the added bind restored a
+passing gate. The unchanged outside-jail negative control also passed using a synthetic writable
+home with empty credential and hook fixtures, because the execution sandbox exposes the real home
+read-only. One restored-gate attempt stopped earlier because the unrelated outside-jail network
+negative control timed out; the following full attempt passed. These live checks certified the
+unshare backend; bwrap was unavailable.
 
 A CPU-only comparison on the same date ran 20 `true` commands per mode with the unshare backend
 and explicitly advisory fixture limits. Per-command jails took 18.995 seconds in total, with a

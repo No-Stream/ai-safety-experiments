@@ -981,6 +981,17 @@ def test_sleeping_weight_bytes_come_from_the_owned_server_log(tmp_path: Path) ->
         phases.vllm_sleeping_weight_bytes(server_log)
 
 
+def test_sleeping_weight_bytes_use_the_latest_launch_in_an_appended_log(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm-server.log"
+    server_log.write_text(
+        "INFO [model_runner.py:407] Model loading took 1.50 GiB memory and 9.1 seconds\n"
+        "ERROR startup refused, relaunching in the same output dir\n"
+        "INFO [model_runner.py:407] Model loading took 1.75 GiB memory and 8.7 seconds\n",
+        encoding="utf-8",
+    )
+    assert phases.vllm_sleeping_weight_bytes(server_log) == int(1.75 * 2**30)
+
+
 @pytest.mark.parametrize("frozen_host_memory", ["pageable", "pinned", "persistent"])
 def test_controller_builds_requested_host_arena_mode(
     server: tuple[httpx2.MockTransport, ServerState],

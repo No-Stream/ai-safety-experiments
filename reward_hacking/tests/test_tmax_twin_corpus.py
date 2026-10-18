@@ -429,7 +429,25 @@ class TestWriteCorpus:
         rigged = cast("dict[str, Any]", problem_record["stimuli"][SIDE_RIGGED])
         assert rigged["spans"][SPAN_ASSERTION32][1] - rigged["spans"][SPAN_ASSERTION32][0] == 32
         assert tuple(rigged["input_ids"]) == twin.stimuli[SIDE_RIGGED].input_ids
-        assert "text" not in rigged
+        assert rigged["text"] == twin.stimuli[SIDE_RIGGED].text
+
+    def test_readback_mismatch_names_stimulus_and_field(
+        self,
+        twin: TwinProblem,
+        tokenizer: PreTrainedTokenizerBase,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        original_load_stimuli = corpus_module.load_stimuli
+
+        def changed_readback(path: Path) -> list[Any]:
+            stimuli = original_load_stimuli(path)
+            stimuli[0] = replace(stimuli[0], text=stimuli[0].text + " changed")
+            return stimuli
+
+        monkeypatch.setattr(corpus_module, "load_stimuli", changed_readback)
+        with pytest.raises(SpanError, match=r"stimulus .*changed fields \['text'\]"):
+            write_corpus(corpus_of(twin), tmp_path, tokenizer=tokenizer)
 
     def test_refuses_to_overwrite(
         self, twin: TwinProblem, tokenizer: PreTrainedTokenizerBase, tmp_path: Path

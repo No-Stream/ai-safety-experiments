@@ -51,7 +51,6 @@ from reward_hacking.interp.lens_geometry import (
     GateProvenanceError,
     StoredDecodeGate,
     anchor_rows_from_activations,
-    assert_gate_matches_lens_file,
     assert_gate_matches_weights,
     wrong_layer_for,
 )
@@ -96,7 +95,12 @@ FINGERPRINT_B = "b" * 64
 
 
 def provenance_for(
-    lens_name: str, *, n_rows: int, lens_sha256: str = "c" * 64, fingerprint: str = FINGERPRINT_A
+    lens_name: str,
+    *,
+    n_rows: int,
+    lens_sha256: str = "c" * 64,
+    fingerprint: str = FINGERPRINT_A,
+    fit_id: str | None = "fit-stub-001",
 ) -> GateProvenance:
     return GateProvenance(
         lens_name=lens_name,
@@ -104,6 +108,7 @@ def provenance_for(
         weights_identity="hf:deadbeef",
         weights_fingerprint=fingerprint,
         lens_sha256=lens_sha256,
+        fit_id=fit_id,
         anchors_path="corpus/anchors.jsonl",
         anchors_sha256="d" * 64,
         anchor_digest="e" * 64,
@@ -207,32 +212,42 @@ class TestAnchorsSidecar:
         with pytest.raises(GateProvenanceError, match="not written together"):
             StoredDecodeGate.load(tmp_path)
 
-    def test_a_gate_recorded_on_other_weights_is_refused_by_name(self) -> None:
+    def test_a_gate_recorded_for_another_model_revision_is_refused_by_name(self) -> None:
         gate = StoredDecodeGate(
             torch.zeros(2, 4, 8),
             torch.zeros(2, dtype=torch.long),
             "step_500/window",
             provenance=provenance_for("step_500/window", n_rows=2, fingerprint=FINGERPRINT_A),
         )
-        assert_gate_matches_weights(gate, FINGERPRINT_A, what="cell base")
+        assert_gate_matches_weights(
+            gate,
+            model_label="org/model@step_500",
+            weights_identity="hf:deadbeef",
+            what="cell base",
+        )
         with pytest.raises(
-            GateProvenanceError, match=r"aaaaaaaaaaaa.*cell base serves weights bbbbbbbbbbbb"
+            GateProvenanceError, match=r"model_label.*org/model@step_500.*org/model@step_600"
         ):
-            assert_gate_matches_weights(gate, FINGERPRINT_B, what="cell base")
+            assert_gate_matches_weights(
+                gate,
+                model_label="org/model@step_600",
+                weights_identity="hf:cafef00d",
+                what="cell base",
+            )
 
-    def test_a_gate_beside_a_different_lens_file_is_refused(self, tmp_path: Path) -> None:
-        lens_path = tmp_path / LENS_FILENAME
-        lens_path.write_bytes(b"lens bytes")
+    def test_matching_model_identity_is_not_overridden_by_a_fingerprint_change(self) -> None:
         gate = StoredDecodeGate(
             torch.zeros(2, 4, 8),
             torch.zeros(2, dtype=torch.long),
-            "x",
-            provenance=provenance_for("x", n_rows=2, lens_sha256=sha256_of_file(lens_path)),
+            "step_500/window",
+            provenance=provenance_for("step_500/window", n_rows=2, fingerprint=FINGERPRINT_B),
         )
-        assert assert_gate_matches_lens_file(gate, lens_path) == sha256_of_file(lens_path)
-        lens_path.write_bytes(b"another fit")
-        with pytest.raises(GateProvenanceError, match="cannot gate another"):
-            assert_gate_matches_lens_file(gate, lens_path)
+        assert_gate_matches_weights(
+            gate,
+            model_label="org/model@step_500",
+            weights_identity="hf:deadbeef",
+            what="cell base",
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -524,12 +539,24 @@ class TestStoredUnembed:
         assert fingerprint == FINGERPRINT_A
         assert torch.equal(loaded.lm_head_weight, stored.lm_head_weight)
         assert loaded.rms_eps == 1e-5
+
+    def test_model_identity_is_recorded_in_unembed_metadata(self, tmp_path: Path) -> None:
+        stored = StoredUnembed(torch.zeros(8), torch.ones(12, 8), rms_eps=1e-6)
+        stored.save(
+            tmp_path,
+            weights_fingerprint=FINGERPRINT_A,
+            model_label="org/model@step_500",
+            weights_identity="hf:deadbeef",
+        )
+        loaded, _ = StoredUnembed.load(tmp_path)
+        assert loaded.model_label == "org/model@step_500"
+        assert loaded.weights_identity == "hf:deadbeef"
         meta_path = tmp_path / UNEMBED_META_FILENAME
         meta = json.loads(meta_path.read_text())
         meta["schema"] = 17
         meta_path.write_text(json.dumps(meta))
         loaded_future, future_fingerprint = StoredUnembed.load(tmp_path)
-        assert future_fingerprint == fingerprint
+        assert future_fingerprint == FINGERPRINT_A
         assert torch.equal(loaded_future.lm_head_weight, stored.lm_head_weight)
 
         meta["norm_convention"] = "rmsnorm(x) * w"
@@ -583,6 +610,7 @@ def lens_provenance(**overrides: object) -> LensProvenance:
         "model_label": "org/model@step_500",
         "weights_identity": "hf:deadbeef",
         "weights_fingerprint": FINGERPRINT_A,
+        "fit_id": "fit-stub-001",
         "load_path": LENS_LOAD_PATH,
         "tokenizer": {"source": "org/base"},
         "corpus_dir": "corpus",
@@ -638,7 +666,12 @@ class TestLensProvenance:
 
 
 def write_lens_dir(
-    out_dir: Path, *, fingerprint: str = FINGERPRINT_A, hidden: int = 8, n_layers: int = 4
+    out_dir: Path,
+    *,
+    fingerprint: str = FINGERPRINT_A,
+    fit_id: str | None = "fit-stub-001",
+    hidden: int = 8,
+    n_layers: int = 4,
 ) -> Path:
     """A consistent directory the reads side can open: lens file, gate, unembedding, provenance."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -653,15 +686,27 @@ def write_lens_dir(
         target_token_ids=torch.arange(6),
         lens_name="stub/window",
         provenance=provenance_for(
-            "stub/window", n_rows=6, lens_sha256=lens_sha256, fingerprint=fingerprint
+            "stub/window",
+            n_rows=6,
+            lens_sha256=lens_sha256,
+            fingerprint=fingerprint,
+            fit_id=fit_id,
         ),
     )
     gate.save(out_dir)
     StoredUnembed(
         torch.zeros(hidden), torch.randn(12, hidden, generator=generator), rms_eps=1e-6
-    ).save(out_dir, weights_fingerprint=fingerprint)
+    ).save(
+        out_dir,
+        weights_fingerprint=fingerprint,
+        model_label="org/model@step_500",
+        weights_identity="hf:deadbeef",
+    )
     lens_provenance(
-        lens_name="stub/window", weights_fingerprint=fingerprint, lens_sha256=lens_sha256
+        lens_name="stub/window",
+        weights_fingerprint=fingerprint,
+        lens_sha256=lens_sha256,
+        fit_id=fit_id,
     ).save(out_dir)
     return out_dir
 
@@ -680,15 +725,42 @@ class TestLoadLensBundle:
         with pytest.raises(LensArtifactError, match="did not finish"):
             load_lens_bundle(tmp_path)
 
-    def test_a_lens_file_swapped_after_the_fit_is_refused(self, tmp_path: Path) -> None:
+    def test_semantically_same_lens_survives_reserialization(self, tmp_path: Path) -> None:
         write_lens_dir(tmp_path)
-        write_jlens_file(
-            tmp_path / LENS_FILENAME,
-            {0: torch.eye(8), 1: torch.eye(8), 2: torch.eye(8)},
-            n_prompts=1,
-        )
-        with pytest.raises(LensArtifactError, match="not the one the sidecar describes"):
+        checkpoint = cast("dict[str, Any]", torch.load(tmp_path / LENS_FILENAME, weights_only=True))
+        torch.save(checkpoint, tmp_path / LENS_FILENAME, _use_new_zipfile_serialization=False)
+        assert load_lens_bundle(tmp_path).lens.n_prompts == 3
+
+    def test_unembed_fingerprint_is_provenance_when_named_model_identity_matches(
+        self, tmp_path: Path
+    ) -> None:
+        write_lens_dir(tmp_path)
+        meta_path = tmp_path / UNEMBED_META_FILENAME
+        meta = json.loads(meta_path.read_text())
+        meta["weights_fingerprint"] = FINGERPRINT_B
+        meta_path.write_text(json.dumps(meta))
+        assert load_lens_bundle(tmp_path).lens_name == "stub/window"
+
+    def test_gate_from_a_different_fit_is_refused_by_name(self, tmp_path: Path) -> None:
+        write_lens_dir(tmp_path)
+        gate_meta_path = tmp_path / GATE_META_FILENAME
+        gate_meta = json.loads(gate_meta_path.read_text())
+        gate_meta["provenance"]["fit_id"] = "another-fit"
+        gate_meta_path.write_text(json.dumps(gate_meta))
+        with pytest.raises(GateProvenanceError, match="fit_id"):
             load_lens_bundle(tmp_path)
+
+    def test_legacy_sidecars_without_fit_ids_still_load(self, tmp_path: Path) -> None:
+        write_lens_dir(tmp_path, fit_id=None)
+        gate_meta_path = tmp_path / GATE_META_FILENAME
+        gate_meta = json.loads(gate_meta_path.read_text())
+        del gate_meta["provenance"]["fit_id"]
+        gate_meta_path.write_text(json.dumps(gate_meta))
+        provenance_path = tmp_path / PROVENANCE_FILENAME
+        provenance_payload = json.loads(provenance_path.read_text())
+        del provenance_payload["fit_id"]
+        provenance_path.write_text(json.dumps(provenance_payload))
+        assert load_lens_bundle(tmp_path).lens_name == "stub/window"
 
     def test_a_gate_from_another_checkpoint_is_refused_by_name(self, tmp_path: Path) -> None:
         write_lens_dir(tmp_path)
@@ -698,12 +770,15 @@ class TestLoadLensBundle:
             target_token_ids=gate.target_token_ids,
             lens_name=gate.lens_name,
             provenance=replace(
-                cast("GateProvenance", gate.provenance), weights_fingerprint=FINGERPRINT_B
+                cast("GateProvenance", gate.provenance),
+                weights_identity="hf:cafef00d",
+                model_label="org/model@step_600",
             ),
         )
         other.save(tmp_path)
         with pytest.raises(
-            GateProvenanceError, match=r"bbbbbbbbbbbb.*lens stub/window serves weights aaaaaaaaaaaa"
+            GateProvenanceError,
+            match=r"model_label: gate 'org/model@step_600', lens 'org/model@step_500'",
         ):
             load_lens_bundle(tmp_path)
 
@@ -723,8 +798,14 @@ def identity(n_layers: int, hidden: int) -> CellIdentity:
     )
 
 
-def write_toy_cell(
-    root: Path, *, fingerprint: str, n_layers: int = 4, hidden: int = 8
+def write_toy_cell(  # noqa: PLR0913 - each checkpoint identity field is explicit in this fixture
+    root: Path,
+    *,
+    fingerprint: str,
+    weights_label: str = "org/model@step_500",
+    weights_commit_sha: str = "deadbeef",
+    n_layers: int = 4,
+    hidden: int = 8,
 ) -> CapturedCell:
     rows = RowIndex(
         stimulus_ids=("p0--a", "p0--b", "p1--a", "p1--b"),
@@ -742,7 +823,11 @@ def write_toy_cell(
         activations={("twins", "mean"): torch.randn(4, n_layers, hidden)},
         applied_adapter_weights=None,
         adapter_weights_sha256=None,
-        provenance={"weights_fingerprint": fingerprint},
+        provenance={
+            "weights_fingerprint": fingerprint,
+            "weights_label": weights_label,
+            "weights_commit_sha": weights_commit_sha,
+        },
     )
     return read_cell(cell_dir)
 
@@ -764,9 +849,14 @@ class TestDecodeContextForCell:
         assert context.gate is bundle.gate
         assert context.scale_by_layer is not None
         assert set(context.scale_by_layer) == {0, 1, 2, 3}
-        other = write_toy_cell(tmp_path / "other", fingerprint=FINGERPRINT_B)
+        other = write_toy_cell(
+            tmp_path / "other",
+            fingerprint=FINGERPRINT_B,
+            weights_label="org/model@step_600",
+            weights_commit_sha="cafef00d",
+        )
         with pytest.raises(
-            GateProvenanceError, match=r"cell base/step-0 .*serves weights bbbbbbbbbbbb"
+            GateProvenanceError, match=r"model_label.*org/model@step_500.*org/model@step_600"
         ):
             decode_context_for(
                 bundle,
@@ -1015,10 +1105,12 @@ def toy_corpus(corpus_dir: Path) -> LensCorpus:
 
 
 def toy_handle(hf: ToyHF, *, fingerprint: str = FINGERPRINT_A) -> LensModelHandle:
+    model_label = "org/toy@step_0" if fingerprint == FINGERPRINT_A else "org/toy@step_1"
+    commit_sha = "c0ffee" if fingerprint == FINGERPRINT_A else "cafef00d"
     facts = FullWeightsFacts(
-        label="org/toy@step_0",
+        label=model_label,
         snapshot_dir=Path("/nonexistent/snapshot"),
-        commit_sha="c0ffee",
+        commit_sha=commit_sha,
         weights_sha256=(("model.safetensors", fingerprint),),
         chat_template_sha256=None,
         declares_vision_config=False,
@@ -1141,19 +1233,28 @@ class TestFitAndWrite:
         assert bundle.gate.n_anchors == 6
         assert bundle.gate.n_layers == TOY_LAYERS
         assert bundle.gate.provenance is not None
-        assert bundle.gate.provenance.anchor_digest == "a" * 64
-        assert bundle.gate.provenance.anchors_sha256 == sha256_of_file(
-            tmp_path / "corpus" / ANCHORS_FILENAME
-        )
+        assert bundle.gate.provenance.fit_id == provenance.fit_id
+        assert bundle.gate.provenance.anchor_rows[0][0] == "anchor:000"
+        assert bundle.gate.provenance.anchors_path.endswith(ANCHORS_FILENAME)
         assert bundle.gate.provenance.weights_fingerprint == provenance.weights_fingerprint
         assert bundle.unembed.vocab_size == TOY_VOCAB
         report = provenance.report
         assert report["unembed_agreement"]["argmax_all_agree"] is True
         assert report["fit_quality"]["available"] is True
         assert report["gate"]["anchors_are_fit_text"] is False
-        assert_gate_matches_weights(bundle.gate, provenance.weights_fingerprint, what="lens")
+        assert_gate_matches_weights(
+            bundle.gate,
+            model_label=provenance.model_label,
+            weights_identity=provenance.weights_identity,
+            what="lens",
+        )
         with pytest.raises(GateProvenanceError, match="cannot gate residuals from another"):
-            assert_gate_matches_weights(bundle.gate, FINGERPRINT_B, what="cell tmax")
+            assert_gate_matches_weights(
+                bundle.gate,
+                model_label=provenance.model_label,
+                weights_identity="hf:different-commit",
+                what="cell tmax",
+            )
 
     def test_partial_fit_identity_records_repo_and_source_implementations_without_gating(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1207,6 +1308,13 @@ class TestFitAndWrite:
         provenance, out_dir, jl = self.run_fit(tmp_path)
         again, _, _ = self.run_fit(tmp_path, jl=jl)
         assert again == provenance
+        assert len(jl.fit_calls) == 1
+        provenance_path = out_dir / PROVENANCE_FILENAME
+        payload = json.loads(provenance_path.read_text())
+        payload["weights_fingerprint"] = FINGERPRINT_B
+        provenance_path.write_text(json.dumps(payload))
+        reloaded, _, _ = self.run_fit(tmp_path, jl=jl)
+        assert reloaded.fit_id == provenance.fit_id
         assert len(jl.fit_calls) == 1
         handle = toy_handle(ToyHF())
         corpus = toy_corpus(tmp_path / "corpus")
@@ -1304,6 +1412,13 @@ class TestHalvesAndMerge:
         hf = ToyHF()
         odd = fit_into(tmp_path, tmp_path / "odd", hf=hf, fit_half="odd")
         even = fit_into(tmp_path, tmp_path / "even", hf=hf, fit_half="even")
+        for half_dir in (tmp_path / "odd", tmp_path / "even"):
+            half_path = half_dir / LENS_FILENAME
+            torch.save(
+                torch.load(half_path, weights_only=True),
+                half_path,
+                _use_new_zipfile_serialization=False,
+            )
         assert odd.n_fit_prompts == 1
         assert even.n_fit_prompts == 2
         jl = StubJlens()
@@ -1340,7 +1455,7 @@ class TestHalvesAndMerge:
             toy_args(merge_halves=(tmp_path / "odd", tmp_path / "even")),
             label="org/toy@step_0",
         )
-        with pytest.raises(LensArtifactError, match="weights_fingerprint: half"):
+        with pytest.raises(LensArtifactError, match="model_label: half"):
             fit_and_write(
                 other,
                 corpus,
@@ -1375,6 +1490,12 @@ class TestCrossLens:
     ) -> None:
         base = ToyHF()
         base_provenance = fit_into(tmp_path, tmp_path / "base", hf=base)
+        base_lens_path = tmp_path / "base" / LENS_FILENAME
+        torch.save(
+            torch.load(base_lens_path, weights_only=True),
+            base_lens_path,
+            _use_new_zipfile_serialization=False,
+        )
         other_hf = ToyHF()
         with torch.no_grad():
             other_hf.lm_head.weight.add_(0.05 * torch.randn_like(other_hf.lm_head.weight))
@@ -1399,7 +1520,7 @@ class TestCrossLens:
         assert cross["lens_sha256"] == base_provenance.lens_sha256
         assert cross["fit_quality_on_this_checkpoint"]["available"] is True
         assert isinstance(cross["gate_by_layer_on_this_checkpoints_anchors"], dict)
-        with pytest.raises(LensArtifactError, match="own weights"):
+        with pytest.raises(LensArtifactError, match="own model_label"):
             fit_into(tmp_path, tmp_path / "base-again", hf=base, cross_lens_dir=[tmp_path / "base"])
 
 

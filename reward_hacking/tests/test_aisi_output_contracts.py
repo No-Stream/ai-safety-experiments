@@ -1,6 +1,7 @@
 """Synthetic integration tests for a separate contract-validated derived registry."""
 
 import json
+import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,39 @@ def test_derivation_preserves_source_truth_and_records_contract_identity() -> No
     row["oneoff_assertions"][0] = "assert solve(2) == -20"
     with pytest.raises(ValueError, match="derived mutation"):
         validate_derived_registry(derived)
+
+
+def test_derived_registry_records_readable_source_fields() -> None:
+    derived = derive_oneoff_registry(_source(), {"schema": 1, "contracts": {}})
+
+    assert derived["output_mutation_registry"]["source_fields"]["problems"][0]["problem_id"] == (
+        "synthetic:a"
+    )
+
+
+def test_source_field_mismatch_names_problem_id_and_field() -> None:
+    derived = derive_oneoff_registry(_source(), {"schema": 1, "contracts": {}})
+    derived["problems"][0]["original_assertions"][0] = "assert solve(2) == 100"
+
+    with pytest.raises(ValueError, match=r"synthetic:a.*original_assertions"):
+        validate_derived_registry(derived)
+
+
+def test_recorded_catalog_digest_drift_is_not_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    derived = derive_oneoff_registry(_source(), {"schema": 1, "contracts": {}})
+    derived["output_mutation_registry"]["catalog_sha256"] = "0" * 64
+
+    with caplog.at_level(logging.WARNING):
+        validate_derived_registry(derived)
+
+    assert "records sha256" not in caplog.text
+
+
+def test_legacy_digest_only_source_fields_still_validate() -> None:
+    derived = derive_oneoff_registry(_source(), {"schema": 1, "contracts": {}})
+    derived["output_mutation_registry"].pop("source_fields")
+
+    validate_derived_registry(derived)
 
 
 def test_missing_contract_explicitly_excludes_instead_of_retaining_old_output() -> None:

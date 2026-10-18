@@ -296,10 +296,7 @@ def _cached_model_weight_identity(
         _read_weight_file(weight_file, tensor_identities, torch)
     if not tensor_identities:
         raise ValueError(f"local model path contains no named tensors: {model_path}")
-    canonical = json.dumps(tensor_identities, sort_keys=True, separators=(",", ":"))
-    identity: dict[str, object] = {
-        "tensor_content_sha256": hashlib.sha256(canonical.encode()).hexdigest()
-    }
+    identity: dict[str, object] = {"tensors": tensor_identities}
     config_identity = _local_config_identity(model_path)
     if config_identity:
         identity["config"] = config_identity
@@ -390,7 +387,87 @@ def split_inputs(path: Path) -> dict[str, object]:
 
 
 def _is_semantic_model_identity(value: object) -> bool:
-    return isinstance(value, dict) and ("tensor_content_sha256" in value or "reference" in value)
+    return isinstance(value, dict) and (
+        "tensor_content_sha256" in value or "tensors" in value or "reference" in value
+    )
+
+
+def model_identity_differences(
+    recorded_identity: Mapping[str, object], current_identity: Mapping[str, object]
+) -> list[str]:
+    """Name semantic model fields that differ, including legacy aggregate tensor digests."""
+    recorded_tensors = recorded_identity.get("tensors")
+    current_tensors = current_identity.get("tensors")
+    recorded_tensor_digest = recorded_identity.get("tensor_content_sha256")
+    current_tensor_digest = current_identity.get("tensor_content_sha256")
+    has_recorded_weights = isinstance(recorded_tensors, Mapping) or isinstance(
+        recorded_tensor_digest, str
+    )
+    has_current_weights = isinstance(current_tensors, Mapping) or isinstance(
+        current_tensor_digest, str
+    )
+    differences: list[str] = []
+    if isinstance(recorded_tensors, Mapping) and isinstance(current_tensors, Mapping):
+        differences.extend(
+            _identity_differences(
+                cast("Mapping[str, object]", recorded_tensors),
+                cast("Mapping[str, object]", current_tensors),
+                "tensors",
+            )
+        )
+    elif isinstance(recorded_tensor_digest, str) and isinstance(current_tensors, Mapping):
+        if recorded_tensor_digest != _tensor_identity_digest(current_tensors):
+            differences.append("tensor_content_sha256")
+    elif isinstance(current_tensor_digest, str) and isinstance(recorded_tensors, Mapping):
+        if current_tensor_digest != _tensor_identity_digest(recorded_tensors):
+            differences.append("tensor_content_sha256")
+    elif isinstance(recorded_tensor_digest, str) and isinstance(current_tensor_digest, str):
+        if recorded_tensor_digest != current_tensor_digest:
+            differences.append("tensor_content_sha256")
+    elif has_recorded_weights != has_current_weights:
+        differences.append("tensors")
+
+    recorded_settings = {
+        key: value
+        for key, value in recorded_identity.items()
+        if key not in {"tensors", "tensor_content_sha256"}
+    }
+    current_settings = {
+        key: value
+        for key, value in current_identity.items()
+        if key not in {"tensors", "tensor_content_sha256"}
+    }
+    differences.extend(_identity_differences(recorded_settings, current_settings))
+    return differences
+
+
+def _tensor_identity_digest(tensors: Mapping[str, object]) -> str:
+    canonical = json.dumps(tensors, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _identity_differences(
+    expected: Mapping[str, object], current: Mapping[str, object], prefix: str = ""
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(expected) | set(current)):
+        field_path = f"{prefix}.{key}" if prefix else key
+        if key not in expected or key not in current:
+            differences.append(field_path)
+            continue
+        expected_value = expected[key]
+        current_value = current[key]
+        if isinstance(expected_value, Mapping) and isinstance(current_value, Mapping):
+            differences.extend(
+                _identity_differences(
+                    cast("Mapping[str, object]", expected_value),
+                    cast("Mapping[str, object]", current_value),
+                    field_path,
+                )
+            )
+        elif expected_value != current_value:
+            differences.append(field_path)
+    return differences
 
 
 def _legacy_model_configs_match(
@@ -414,7 +491,9 @@ def _recorded_model_identity_matches(
     current_identity: dict[str, object] | None,
 ) -> bool:
     if _is_semantic_model_identity(previous_identity):
-        return current_identity is not None and previous_identity == current_identity
+        return current_identity is not None and not model_identity_differences(
+            cast("Mapping[str, object]", previous_identity), current_identity
+        )
     if current_identity is not None and not _legacy_model_configs_match(
         previous_identity, current_identity
     ):

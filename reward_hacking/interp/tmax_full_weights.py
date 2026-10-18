@@ -633,6 +633,15 @@ def cell_fingerprint(cell: CapturedCell) -> str:
     return fingerprint
 
 
+def cell_weights_identity(cell: CapturedCell) -> str:
+    """Return a readable source identity for a full-weights cell."""
+    commit_sha = cell.provenance.get("weights_commit_sha")
+    label = _require_field(cell, "weights_label")
+    if isinstance(commit_sha, str) and commit_sha:
+        return f"hf:{commit_sha}"
+    return f"local:{label}"
+
+
 def declared_replica_anchor(cell: CapturedCell) -> str | None:
     """Return the games label (`arm/step-N`) of the cell this one declares itself a replica of, or None.
 

@@ -50,6 +50,7 @@ from games.chunked_decode import (
     sweep_chunk_size,
 )
 from games.framing_stimulus import (
+    RECIPIENT_CONDITIONS,
     RuntimeFramings,
     load_dictator_recipient_clauses,
     resolve_framing_clause,
@@ -501,6 +502,21 @@ META_FIELDS_OWNED_HERE: frozenset[str] = frozenset(
 LOCAL_TEMPLATE_TRANSPORTS: frozenset[str] = frozenset({HFBackend.transport, VLLMBackend.transport})
 
 
+def _validate_trap_cells_clauses(clauses: tuple[tuple[str, str], ...], file: Path | None) -> None:
+    if not clauses:
+        return
+    if file is None:
+        raise ValueError("trap_cells_clauses cannot be set without trap_cells_file.")
+    clause_ids = tuple(clause_id for clause_id, _text in clauses)
+    if clause_ids != RECIPIENT_CONDITIONS:
+        raise ValueError(
+            f"trap_cells_clauses must name {list(RECIPIENT_CONDITIONS)} in order, "
+            f"got {list(clause_ids)}."
+        )
+    if any(not clause_text.strip() for _clause_id, clause_text in clauses):
+        raise ValueError("trap_cells_clauses values must be non-empty text.")
+
+
 @dataclass(frozen=True)
 class EvalConfig:
     """Knobs for one battery run; every value lands in the trace's meta record."""
@@ -584,11 +600,9 @@ class EvalConfig:
     # (`games.framing_stimulus.FRAMINGS_PATH`). No baked default, for `survey_data_dir`'s reason: a path
     # chosen here would be right on one machine and silently absent on the next.
     trap_cells_file: Path | None = None
-    # The digest of what that file held when the plan was resolved. Recorded beside the path because
-    # the path is machine-local and the CONTENT is what a second box has to agree with: two cells
-    # whose recipient paragraphs differ are different measurements, and the digest is what says so
-    # in the cell identity and in the bank key.
+    # Retained as provenance for older records; new plan identities compare named clause text.
     trap_cells_digest: str = ""
+    trap_cells_clauses: tuple[tuple[str, str], ...] = ()
     # The counterpart framings a wave authored outside version control, loaded from the gitignored
     # file `--framings-file` names (`games.framing_stimulus`). None is a battery that renders
     # registered framings only. `counterpart_framings` still names what runs: a file's roster
@@ -635,6 +649,7 @@ class EvalConfig:
                 f"trap_cells_digest={self.trap_cells_digest!r}. The digest is what the cell "
                 f"identity keys on, since the path is machine-local."
             )
+        _validate_trap_cells_clauses(self.trap_cells_clauses, self.trap_cells_file)
         unknown = sorted(set(self.games) - set(ALL_GAME_IDS))
         if unknown:
             raise ValueError(f"Unknown game ids {unknown}; known games: {sorted(ALL_GAME_IDS)}.")
@@ -835,6 +850,7 @@ class EvalConfig:
                 str(self.trap_cells_file) if self.trap_cells_file is not None else None
             ),
             "trap_cells_digest": self.trap_cells_digest,
+            "trap_cells_clauses": [list(clause) for clause in self.trap_cells_clauses],
             "framings_file": (
                 None if self.runtime_framings is None else str(self.runtime_framings.path)
             ),
@@ -1669,9 +1685,9 @@ def _plan_trap_cells(config: EvalConfig) -> list[PlannedRequest]:
     an hour apart, which is the framing sweep's reasoning and matters more here: the whole reading is
     a within-cell difference between the versions.
 
-    The paragraphs are loaded from the file the config names rather than from anything committed, and
-    the file's digest is already in the config record, so a cell measured under edited paragraphs
-    cannot collide with one measured under the earlier text.
+    The paragraphs are loaded from the file the config names rather than from anything committed.
+    New configs compare the two named clauses directly; the digest remains a compatibility check for
+    older configs that have no readable clause mapping.
     """
     if config.trap_cells_file is None:
         raise ValueError(
@@ -1681,7 +1697,19 @@ def _plan_trap_cells(config: EvalConfig) -> list[PlannedRequest]:
             f"planning, before any section generates."
         )
     clauses = load_dictator_recipient_clauses(config.trap_cells_file)
-    if clauses.digest != config.trap_cells_digest:
+    actual_clause_mapping = clauses.clause_by_condition
+    if config.trap_cells_clauses:
+        expected_clause_mapping = dict(config.trap_cells_clauses)
+        changed_clause_ids = sorted(
+            clause_id
+            for clause_id in RECIPIENT_CONDITIONS
+            if actual_clause_mapping[clause_id] != expected_clause_mapping[clause_id]
+        )
+        if changed_clause_ids:
+            raise ValueError(
+                f"trap-cell recipient clauses changed for clause ids {changed_clause_ids}."
+            )
+    elif clauses.digest != config.trap_cells_digest:
         raise ValueError(
             f"trap_cells_file {config.trap_cells_file} now digests to {clauses.digest!r} while the "
             f"config records {config.trap_cells_digest!r}: the recipient paragraphs changed after "
@@ -2650,11 +2678,10 @@ RESUME_SESSION_FIELDS: frozenset[str] = frozenset({"record", "written_at", "git_
 # `eval_config` fields that are machine-local paths to the item data rather than what was asked:
 # the same cell salvaged on another machine reads the same items from a different directory, and
 # a genuinely different item set shows up as orphan or missing identities instead. The runtime
-# framings file and the trap-cells file are here for that reason and stay checked by content:
-# `framings_digest` and `trap_cells_digest` are not exempt, so the same file under two paths resumes
-# and a different file under one path does not.
+# framings file stays checked by content. New trap-cell records compare the readable clause mapping;
+# the digest is retained only for older config records.
 RESUME_LOCAL_PATH_CONFIG_FIELDS: frozenset[str] = frozenset(
-    {"survey_data_dir", "dtbench_dir", "trap_cells_file", "framings_file"}
+    {"survey_data_dir", "dtbench_dir", "trap_cells_file", "trap_cells_digest", "framings_file"}
 )
 _DRIFT_REPR_CHARS = 200
 

@@ -4,12 +4,60 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 # Transport source/transport fields do not change tokenization and are recorded separately by callers.
 NON_CONTENT_INIT_KEYS = frozenset(
     {"_commit_hash", "name_or_path", "revision", "token", "tokenizer_file"}
 )
+
+
+def tokenizer_identity_payload(
+    tokenizer: Any,  # noqa: ANN401 - tokenizer implementations expose a dynamic vocabulary API
+    *,
+    name: str | None = None,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Return readable tokenizer identity fields for comparison and persisted reports."""
+    vocabulary = tokenizer.get_vocab()
+    if not isinstance(vocabulary, Mapping) or not vocabulary:
+        raise ValueError("a tokenizer identity needs a non-empty get_vocab() mapping")
+    init_kwargs = getattr(tokenizer, "init_kwargs", {})
+    if not isinstance(init_kwargs, Mapping):
+        raise TypeError("tokenizer.init_kwargs must be a mapping when present")
+    raw_name = name or getattr(tokenizer, "name_or_path", None) or init_kwargs.get("name_or_path")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError("a tokenizer identity needs a non-empty tokenizer name")
+    tokenizer_name = Path(raw_name).name if Path(raw_name).is_absolute() else raw_name
+    tokenizer_revision = revision or init_kwargs.get("revision")
+    if tokenizer_revision is not None and not isinstance(tokenizer_revision, str):
+        raise TypeError("tokenizer revision must be text when present")
+    special_tokens = getattr(tokenizer, "special_tokens_map", {})
+    if not isinstance(special_tokens, Mapping):
+        raise TypeError("tokenizer.special_tokens_map must be a mapping when present")
+    if any(
+        isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+        for token_id in vocabulary.values()
+    ):
+        raise ValueError("tokenizer vocabulary ids must be non-negative integers")
+    vocabulary_payload = {str(token): token_id for token, token_id in vocabulary.items()}
+    special_tokens_payload: dict[str, str | list[str]] = {}
+    for token_name, token_value in special_tokens.items():
+        token_values = token_value if isinstance(token_value, list) else [token_value]
+        if any(not isinstance(value, str) for value in token_values):
+            raise TypeError(f"tokenizer special token {token_name!r} must be text")
+        special_tokens_payload[str(token_name)] = (
+            token_values if isinstance(token_value, list) else token_values[0]
+        )
+    return {
+        "name": tokenizer_name,
+        "revision": tokenizer_revision,
+        "vocab_size": len(vocabulary_payload),
+        "vocab": vocabulary_payload,
+        "special_tokens": special_tokens_payload,
+    }
 
 
 def tokenizer_content_payload(tokenizer: Any) -> dict[str, object]:  # noqa: ANN401

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
@@ -38,6 +39,7 @@ from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEM
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_END_STRING
 from reward_hacking.model_backend import ContextWindowExceededError, RenderedCompletion
 from reward_hacking.organism_rl import rescore
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
@@ -3743,6 +3745,68 @@ def test_persistent_actor_jail_reuse_and_exception_cleanup(
         _run_episode(tmp_path, monkeypatch, backend, options)
         assert events == ["create", "actor", "actor", "close", "grade"]
     assert jail_session.current_persistent_jail(tmp_path / "episode", cpus=1, mem_max="1G") is None
+
+
+def test_persistent_jail_supervisor_failure_records_unscorable_episode_and_skips_grading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure_message = "persistent jail supervisor exited without a response: oom-kill"
+
+    class DeadSupervisor:
+        def run(self, _command: str, *, timeout: str) -> CommandResult:
+            assert timeout == "120s"
+            raise PersistentJailSupervisorError(failure_message)
+
+    monkeypatch.setattr(loop, "persistent_jail_scope", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        loop,
+        "current_persistent_jail",
+        lambda *_args, **_kwargs: DeadSupervisor(),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_sample_belief_probe_and_final_report",
+        lambda *_args, **_kwargs: pytest.fail("supervisor failure must skip final report sampling"),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_grade_episode",
+        lambda *_args, **_kwargs: pytest.fail("supervisor failure must skip grading"),
+    )
+    trace_path = tmp_path / "supervisor-failure.jsonl"
+    trace = loop.run_ladder_episode(
+        _task(),
+        ScriptedToolBackend([_ScriptedReply(_bash("echo never-runs"))]),
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="System",
+        user_template="{task_markdown}\n{listing}",
+        max_model_len=100_000,
+        max_turns=1,
+        persistent_jail=True,
+        trace_path=trace_path,
+    )
+
+    assert trace.ended_by == "persistent_jail_supervisor_failure"
+    assert trace.final_grade.true_pass is None
+    assert trace.final_grade.oracle_error == "persistent_jail_supervisor_failure"
+    summary = trace.summary_record()
+    assert summary["failure_reason"] == "persistent_jail_supervisor_failure"
+    failure = cast("dict[str, object]", summary["infrastructure_failure"])
+    assert failure["component"] == "persistent_jail_supervisor"
+    assert failure["reason"] == "persistent_jail_supervisor_failure"
+    assert failure["exception_type"] == "PersistentJailSupervisorError"
+    assert failure["message"] == failure_message
+    assert failure["attempted_command"] == "echo never-runs"
+    assert failure["turn_index"] == 0
+    assert trace.turns[0].raw_completion.startswith("reasoning</think>")
+    assert trace.turns[0].commands[0].exit_code == 125
+    records = load_trace(trace_path)
+    assert records[-2] == {
+        "record": "episode_infrastructure_failure",
+        **failure,
+    }
+    assert records[-1] == summary
 
 
 @needs_jail

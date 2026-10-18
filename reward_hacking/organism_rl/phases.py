@@ -298,11 +298,10 @@ def vllm_sleeping_weight_bytes(server_log: Path) -> int:
     matches = _MODEL_LOADING_PATTERN.findall(
         server_log.read_text(encoding="utf-8", errors="replace")
     )
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"expected one 'Model loading took' line in {server_log}, found {len(matches)}"
-        )
-    return int(float(matches[0]) * 2**30)
+    if not matches:
+        raise RuntimeError(f"no 'Model loading took' line in {server_log}")
+    # A relaunch in the same output dir appends to the log; the ready server is the latest load.
+    return int(float(matches[-1]) * 2**30)
 
 
 def check_pinned_and_sleeping_weight_budget(

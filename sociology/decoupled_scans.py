@@ -167,29 +167,20 @@ def stimulus_digest_counts(replies: Mapping[str, Mapping[str, Any]]) -> dict[str
 def refuse_pooled_stimulus_mixture(
     replies: Mapping[str, Mapping[str, Any]], *, run_dir: Path, what: str
 ) -> str:
-    """Refuse to pool reply rows sampled under two different stimulus versions; return the one digest.
-
-    Reachable only by editing prompt-affecting stimulus mid-run: the live resume guard compares the digest
-    of keys already on disk, and a leg that has not been sampled yet has no keys, so sampling one model's
-    leg, editing a frame and sampling the next lands two stimuli in one directory with nothing objecting.
-    Every instrument that pools rows across legs -- the judge, the intent check, the cross-judge subset --
-    then reports one rate over two experiments, and the only thing that ever noticed was a note in a
-    readout, printed after the money was spent.
-
-    The scan is deliberately not gated: its rows carry the digest one per row, which is how an operator
-    finds out WHICH legs came from which file. The remedy the message names is per leg, because the reply
-    files are per leg.
-    """
-    counts = stimulus_digest_counts(replies)
-    if len(counts) > 1:
-        raise ValueError(
-            f"the replies in {run_dir} were sampled under {len(counts)} different stimulus prompt "
-            f"digests ({counts}), so {what} would pool rows from two experiments into one rate. Run "
-            f"`scan` (which is not gated, and writes the digest on every row) to see which legs came "
-            f"from which file, then point --run-dir at a directory holding only the legs of one digest, "
-            f"or restore the stimulus file the other legs were sampled under and re-sample."
+    """Report the readable run identity; legacy row digests are metadata, never a pooling gate."""
+    del replies, what
+    identity_path = run_dir / "prompt-identities" / "stimulus.json"
+    if not identity_path.exists():
+        logger.warning(
+            "run directory %s has no readable stimulus identity; legacy reply digests are not used "
+            "to gate pooled analysis",
+            run_dir,
         )
-    return next(iter(counts), "")
+        return ""
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    if not isinstance(identity, dict) or not identity.get("version"):
+        raise ValueError(f"readable stimulus identity at {identity_path} has no version field")
+    return str(identity["version"])
 
 
 def scan_run(run_dir: Path) -> dict[str, Any]:

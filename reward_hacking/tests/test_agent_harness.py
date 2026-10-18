@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -69,13 +70,14 @@ from reward_hacking.harness.tasks import (
     OracleError,
 )
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID
-from reward_hacking.jailed_poc import classify
+from reward_hacking.jailed_poc import CommandResult, classify
 from reward_hacking.model_backend import (
     DEFAULT_BEDROCK_MAX_TOKENS,
     BedrockSamplingConfig,
     MockBackend,
     SamplingConfig,
 )
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.tiers import RegradeVerdict, TrustBoundary
 
 if TYPE_CHECKING:
@@ -1292,6 +1294,81 @@ _ABORT_WITHOUT_REASON = _abort_script("<abort/>")
 def _ran_command_containing(trace: AgentEpisodeTrace, needle: str) -> bool:
     """Whether any executed command in the trace contains ``needle``."""
     return any(needle in result.command for turn in trace.turns for result in turn.commands)
+
+
+class TestPersistentSupervisorFailure:
+    def test_failure_is_recorded_as_unmeasured_and_keeps_the_attempted_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        failure_message = "persistent jail supervisor exited without a response: oom-kill"
+        command_callbacks: list[tuple[str, CommandResult | None]] = []
+
+        class DeadSupervisor:
+            def run(self, command: str, *, timeout: str) -> CommandResult:
+                assert command == "echo attempted"
+                assert timeout == "60s"
+                raise PersistentJailSupervisorError(failure_message)
+
+        monkeypatch.setattr(loop, "persistent_jail_scope", lambda *_args, **_kwargs: nullcontext())
+        monkeypatch.setattr(
+            loop, "current_persistent_jail", lambda *_args, **_kwargs: DeadSupervisor()
+        )
+        monkeypatch.setattr(
+            loop,
+            "_grade_completed_episode",
+            lambda *_args, **_kwargs: pytest.fail("supervisor failure must skip grading"),
+        )
+        trace_path = tmp_path / "supervisor-failure.jsonl"
+        trace = run_agent_episode(
+            TASKS_BY_ID["sum-ledger"],
+            MockBackend(
+                ["reasoning</think>\n<run>echo attempted</run>\n<run>echo must-not-run</run>"],
+                model_id="mock-supervisor-failure",
+            ),
+            episode_dir=tmp_path / "supervisor-failure",
+            persistent_jail=True,
+            final_report=True,
+            trace_path=trace_path,
+            before_command=lambda _episode_dir, command: command_callbacks.append((command, None)),
+            after_command=lambda _episode_dir, command, result: command_callbacks.append(
+                (command, result)
+            ),
+        )
+
+        assert trace.ended_by == "persistent_jail_supervisor_failure"
+        assert trace.failure_reason == "persistent_jail_supervisor_failure"
+        assert trace.true_pass is None
+        assert trace.true_measured is False
+        assert trace.oracle_error == "persistent_jail_supervisor_failure"
+        assert trace.outcome is EpisodeOutcome.UNMEASURED
+        assert trace.final_report is None
+        assert trace.turns[0].completion.startswith("reasoning</think>")
+        assert [result.command for result in trace.turns[0].commands] == ["echo attempted"]
+        assert trace.turns[0].commands[0].exit_code == 125
+        assert "PersistentJailSupervisorError" in trace.turns[0].commands[0].stderr
+        assert len(command_callbacks) == 2
+        assert command_callbacks[0] == ("echo attempted", None)
+        assert command_callbacks[1][0] == "echo attempted"
+        assert command_callbacks[1][1] is trace.turns[0].commands[0]
+        failure = trace.infrastructure_failure
+        assert failure is not None
+        assert failure == {
+            "component": "persistent_jail_supervisor",
+            "reason": "persistent_jail_supervisor_failure",
+            "exception_type": "PersistentJailSupervisorError",
+            "message": failure_message,
+            "attempted_command": "echo attempted",
+            "turn_index": 0,
+        }
+        assert trace.true_evidence == {"infrastructure_failure": failure}
+        records = load_traces(trace_path)
+        infrastructure_record = records[-2]
+        summary_record = records[-1]
+        true_record = cast("dict[str, object]", summary_record["true"])
+        assert infrastructure_record == {"record": "episode_infrastructure_failure", **failure}
+        assert summary_record["failure_reason"] == "persistent_jail_supervisor_failure"
+        assert summary_record["infrastructure_failure"] == failure
+        assert true_record["oracle_error"] == "persistent_jail_supervisor_failure"
 
 
 @needs_jail

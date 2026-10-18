@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -16,11 +17,13 @@ import httpx2
 import pytest
 
 from reward_hacking.distill.episodes import render_student_contexts, trace_hint
+from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder import runner
-from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
+from reward_hacking.model_backend import RenderedCompletion, SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome
 from reward_hacking.organism_rl import health, ladder_source
 from reward_hacking.organism_rl.ladder_source import load_training_scenarios, score_ladder_task
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.trace import write_trace
 
 
@@ -164,6 +167,243 @@ def test_ladder_final_state_uses_native_ci_verdict() -> None:
     assert isinstance(summary, dict)
     summary["final_state_verdict"] = {"verdict": "SUCCESS", "register": "ci"}
     assert score_ladder_task(record).reward == 1
+
+
+def test_ladder_infrastructure_failure_is_unscorable_even_after_successful_submission() -> None:
+    reason = "persistent_jail_supervisor_failure"
+    infrastructure_failure = {
+        "component": "persistent_jail_supervisor",
+        "reason": reason,
+        "exception_type": "PersistentJailSupervisorError",
+        "message": "synthetic supervisor exit",
+    }
+    record = _record()
+    record["record"] = "ladder_episode_failure"
+    record["reason"] = reason
+    record["failure_reason"] = reason
+    record["infrastructure_failure"] = infrastructure_failure
+    record["trace_summary"] = {
+        "ended_by": reason,
+        "failure_reason": reason,
+        "infrastructure_failure": infrastructure_failure,
+        "true": {"measured": False, "pass": None, "oracle_error": reason},
+        "submission_verdicts": [{"verdict": "SUCCESS", "register": "ci"}],
+    }
+
+    score = score_ladder_task(record)
+
+    assert score.reward is None
+    assert score.outcome == RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE
+    assert score.evidence.true_measured is False
+    assert score.evidence.infrastructure_failure == reason
+
+
+def test_source_persists_and_replays_native_supervisor_failure_as_unscorable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scenario(tmp_path / "scenarios", "synthetic-train")
+    backend = SimpleNamespace(
+        model_id="synthetic-base",
+        sampling=SamplingConfig(max_new_tokens=256),
+        tokenizer=object(),
+        request_admission=None,
+    )
+    monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        ladder_source, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+    source = ladder_source.LadderEpisodeSource(
+        endpoint="http://localhost:8000",
+        model_path="synthetic-base",
+        served_model_id="synthetic-base",
+        revision=None,
+        output_dir=tmp_path / "traces",
+        max_model_len=4096,
+        scenarios_dir=tmp_path / "scenarios",
+    )
+    reason = "persistent_jail_supervisor_failure"
+    infrastructure_failure = {
+        "component": "persistent_jail_supervisor",
+        "reason": reason,
+        "exception_type": "PersistentJailSupervisorError",
+        "message": "synthetic supervisor exit",
+    }
+    summary: dict[str, object] = {
+        "record": "episode_summary",
+        "ended_by": reason,
+        "failure_reason": reason,
+        "infrastructure_failure": infrastructure_failure,
+        "true": {"measured": False, "pass": None, "oracle_error": reason},
+        "submission_verdicts": [{"verdict": "SUCCESS", "register": "ci"}],
+    }
+    calls: list[int] = []
+
+    def failed_episode(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(1)
+        trace_path = _args[5]
+        assert isinstance(trace_path, Path)
+        write_trace(trace_path, [summary], append=True)
+        return summary
+
+    monkeypatch.setattr(runner, "_run_real_episode", failed_episode)
+
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    score = score_ladder_task(first.record)
+    replayed = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+    assert first.record["record"] == "ladder_episode_failure"
+    assert first.record["reason"] == reason
+    assert first.record["infrastructure_failure"] == infrastructure_failure
+    assert first.record["trace_summary"] == summary
+    assert summary in first.trace_records
+    assert score.reward is None
+    assert score.outcome == RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE
+    assert score.evidence.infrastructure_failure == reason
+    assert replayed.record == first.record
+    assert calls == [1]
+
+
+def test_actual_supervisor_failure_trace_scores_unscorable_in_native_source(  # noqa: C901 - exercise native flow
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scenario(tmp_path / "scenarios", "synthetic-train")
+    reason = "persistent_jail_supervisor_failure"
+    failure_message = "persistent jail supervisor exited without a response: oom-kill"
+
+    class Tokenizer:
+        chat_template = "synthetic chat template"
+        eos_token_id = 248044
+        name_or_path = "qwen"
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, object]],
+            *,
+            tools: list[dict[str, object]],
+            tokenize: bool,
+            add_generation_prompt: bool,
+            enable_thinking: bool,
+            **_kwargs: str,
+        ) -> str:
+            del tokenize, enable_thinking
+            rendered = json.dumps(tools, sort_keys=True)
+            for message in messages:
+                role = message["role"]
+                if not isinstance(role, str):
+                    raise TypeError("synthetic chat message role must be a string")
+                content = message.get("content", "")
+                if not isinstance(content, str):
+                    raise TypeError("synthetic chat message content must be a string")
+                rendered += f"<|im_start|>{role}\n"
+                if role == "assistant":
+                    reasoning = message.get("reasoning_content", "")
+                    if not isinstance(reasoning, str):
+                        raise TypeError("synthetic assistant reasoning must be a string")
+                    rendered += f"<think>\n{reasoning}</think>\n{content}"
+                else:
+                    rendered += content
+                rendered += "<|im_end|>\n"
+            if add_generation_prompt:
+                rendered += "<|im_start|>assistant\n<think>\n"
+            return rendered
+
+        def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
+            del tools
+            return self.chat_template
+
+        def convert_tokens_to_ids(self, token: str) -> int | None:
+            return {"<|endoftext|>": 248044, "<|im_end|>": 248046}.get(token)
+
+        def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            return list(range(len(text.split())))
+
+        def __call__(self, text: str, *, add_special_tokens: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(
+                input_ids=self.encode(text, add_special_tokens=add_special_tokens)
+            )
+
+    class Backend:
+        model_id = "synthetic-base"
+        model_path = None
+        transport = "vllm-http"
+
+        def __init__(self) -> None:
+            self.tokenizer = Tokenizer()
+            self.sampling = SamplingConfig(max_new_tokens=256)
+            self.request_admission = None
+            self.stop_token_ids: tuple[int, ...] = ()
+
+        def complete_rendered(
+            self,
+            prompt: str,
+            *,
+            max_tokens: int,
+            seed: int | None,
+            timeout_seconds: float | None = None,
+        ) -> RenderedCompletion:
+            del max_tokens, seed, timeout_seconds
+            completion = (
+                "reasoning</think>\n<tool_call>\n"
+                "<function=bash>\n<parameter=command>\necho synthetic\n"
+                "</parameter>\n</function>\n</tool_call>"
+            )
+            token_ids = tuple(range(1, len(completion.split()) + 1))
+            return RenderedCompletion(
+                text=completion,
+                finish_reason="stop",
+                matched_stop=248046,
+                prompt_tokens=len(prompt.split()),
+                completion_tokens=len(token_ids),
+                token_ids=token_ids,
+                token_logprobs=(-0.25,) * len(token_ids),
+            )
+
+    class DeadSupervisor:
+        def run(self, _command: str, *, timeout: str) -> object:
+            assert timeout == "120s"
+            raise PersistentJailSupervisorError(failure_message)
+
+    backend = Backend()
+    monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        ladder_source,
+        "QWEN_PROTOCOL",
+        SimpleNamespace(stop_token_ids=lambda _tokenizer: (248044, 248046)),
+    )
+    monkeypatch.setattr(
+        ladder_loop, "persistent_jail_scope", lambda *_args, **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        ladder_loop, "current_persistent_jail", lambda *_args, **_kwargs: DeadSupervisor()
+    )
+    source = ladder_source.LadderEpisodeSource(
+        endpoint="http://localhost:8000",
+        model_path="synthetic-base",
+        served_model_id="synthetic-base",
+        revision=None,
+        output_dir=tmp_path / "traces",
+        max_model_len=4096,
+        scenarios_dir=tmp_path / "scenarios",
+    )
+
+    sample = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    score = score_ladder_task(sample.record)
+    trace_summary = cast("dict[str, object]", sample.record["trace_summary"])
+    true_result = cast("dict[str, object]", trace_summary["true"])
+    infrastructure_failure = cast("dict[str, object]", trace_summary["infrastructure_failure"])
+
+    assert sample.record["record"] == "ladder_episode_failure"
+    assert sample.record["reason"] == reason
+    assert trace_summary["ended_by"] == reason
+    assert true_result["oracle_error"] == reason
+    assert infrastructure_failure["message"] == failure_message
+    assert any(
+        row.get("record") == "episode_infrastructure_failure" for row in sample.trace_records
+    )
+    assert score.reward is None
+    assert score.outcome == RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE
+    assert score.evidence.infrastructure_failure == reason
 
 
 def test_native_runner_preserves_sampling_seed(

@@ -403,6 +403,78 @@ def _semantic_task(task: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _identity_payload(
+    config: dict[str, Any], commit: str, tasks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "source_commit": commit,
+        "uv_image": config["uv_image"],
+        "tasks": {
+            task["task_id"]: _semantic_task(task)
+            for task in sorted(tasks, key=lambda task: task["task_id"])
+        },
+    }
+
+
+def _identity_differences(
+    expected: dict[str, Any], stored: dict[str, Any], prefix: str = ""
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(expected) | set(stored)):
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in expected or key not in stored:
+            differences.append(path)
+        elif isinstance(expected[key], dict) and isinstance(stored[key], dict):
+            differences.extend(_identity_differences(expected[key], stored[key], path))
+        elif expected[key] != stored[key]:
+            differences.append(path)
+    return differences
+
+
+def _legacy_identity(config: dict[str, Any], commit: str, tasks: list[dict[str, Any]]) -> str:
+    """Read old build-state records whose semantic payload was stored only as a digest."""
+    payload = {
+        "source_commit": commit,
+        "uv_image": config["uv_image"],
+        "tasks": sorted((_semantic_task(task) for task in tasks), key=lambda task: task["task_id"]),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _load_or_initialize_build_state(
+    output: Path,
+    identity_payload: dict[str, Any],
+    identity: str,
+    legacy_identity: str,
+) -> dict[str, Any]:
+    if not output.exists():
+        output.mkdir(parents=True)
+        return {
+            "identity": identity,
+            "identity_payload": identity_payload,
+            "status": "preparing",
+            "records": [],
+            "base_images": {},
+        }
+
+    state: dict[str, Any] = json.loads((output / "build-state.json").read_text())
+    if "identity_payload" in state:
+        differences = _identity_differences(identity_payload, state["identity_payload"])
+        if differences:
+            raise ValueError(
+                "resume semantic configuration changed at " + ", ".join(differences[:10])
+            )
+    elif state["identity"] != legacy_identity:
+        raise ValueError(
+            "legacy resume configuration identity mismatch; the old record has no semantic "
+            "payload to name changed fields"
+        )
+    else:
+        state["identity"] = identity
+        state["identity_payload"] = identity_payload
+    return state
+
+
 def build_runtime_registry(
     config_path: Path,
     output: Path,
@@ -437,26 +509,11 @@ def build_runtime_registry(
         )
         for task in tasks
     ]
-    identity = hashlib.sha256(
-        json.dumps(
-            {
-                "source_commit": commit,
-                "uv_image": config["uv_image"],
-                "tasks": sorted(
-                    (_semantic_task(task) for task in tasks), key=lambda task: task["task_id"]
-                ),
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
-    state_path = output / "build-state.json"
-    if output.exists():
-        state: dict[str, Any] = json.loads(state_path.read_text())
-        if state["identity"] != identity:
-            raise ValueError("resume configuration identity mismatch")
-    else:
-        output.mkdir(parents=True)
-        state = {"identity": identity, "status": "preparing", "records": [], "base_images": {}}
+    identity_payload = _identity_payload(config, commit, tasks)
+    identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True).encode()).hexdigest()
+    state = _load_or_initialize_build_state(
+        output, identity_payload, identity, _legacy_identity(config, commit, tasks)
+    )
     _persist(state, output, commit, "incomplete")
     _validate_receipts(tasks, repository, commit, config_path.parent)
     records: list[dict[str, Any]] = state["records"]

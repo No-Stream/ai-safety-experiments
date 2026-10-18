@@ -259,6 +259,8 @@ def _handle(prompts: list[str], model_id: str = GPT_OSS_20B) -> BatchJobHandle:
         record_count=len(prompts),
         prompt_digest=prompt_digest(prompts),
         cell_digest=cell_digest(_cell_metadata(len(prompts))),
+        submitted_prompts=list(prompts),
+        submitted_cells=_cell_metadata(len(prompts)),
         input_uri="s3://bucket/run/input.jsonl",
         output_uri="s3://bucket/run/output/",
         region="us-west-2",
@@ -1063,13 +1065,23 @@ class TestCollectValidation:
     def test_results_from_a_different_submission_are_refused(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The digest tripwire: right record ids, wrong prompts."""
+        """Right record ids with a changed prompt must name the changed position."""
         backend, _, s3 = _build(monkeypatch)
         prompts = _prompts()
         handle = _handle(prompts)
         _write_results(s3, handle, [f"a different prompt {i}" for i in range(len(prompts))])
-        with pytest.raises(RuntimeError, match="do not belong to this handle"):
+        with pytest.raises(RuntimeError, match=r"prompt\[0\].*do not belong to this handle"):
             backend.collect(handle)
+
+    def test_echoed_prompt_comparison_uses_content_not_a_recorded_digest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, _, s3 = _build(monkeypatch)
+        prompts = _prompts()
+        handle = replace(_handle(prompts), prompt_digest="edited provenance digest")
+        _write_results(s3, handle, prompts)
+
+        assert backend.collect(handle)
 
     def test_waiting_polls_through_the_non_terminal_states(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1185,19 +1197,13 @@ class TestCellDigest:
         with pytest.raises(TypeError):
             cell_digest([{"item_id": object()}])
 
-    def test_the_digest_of_the_real_caller_shape_has_not_moved(self) -> None:
-        """Pinned because handles saved in ``artifacts/`` compare against it in a later session.
+    def test_handle_cell_differences_name_the_changed_metadata_field(self) -> None:
+        cells = _cell_metadata(3)
+        handle = replace(_handle(_prompts(3)), cell_digest="edited provenance digest")
+        relabelled = [{**cells[0], "arm": "cooperative"}, *cells[1:]]
 
-        A change to the digest scheme silently invalidates every handle already on disk, turning a
-        collect into a mismatch that reads as a corpus edit. This pin is what makes such a change
-        deliberate: it moved once, from the indexed four-key scheme to canonical full-content JSON
-        (2026-08-25), after checking that every handle directory on disk had already been
-        collected. This is the value the sweep's four-key metadata produces under that scheme.
-        """
-        assert (
-            cell_digest(_cell_metadata(3))
-            == "afb7093a9b9c1a0e238cd86c3b6c5e39b81b664cc329641d7d969ec2afdc130d"
-        )
+        assert handle.submission_differences(_prompts(3), cells) == []
+        assert handle.submission_differences(_prompts(3), relabelled) == ["cells[0].arm differs"]
 
 
 class TestHandleRoundTrip:
@@ -1206,6 +1212,33 @@ class TestHandleRoundTrip:
     def test_a_handle_reloads_field_for_field(self, tmp_path: Path) -> None:
         handle = _handle(_prompts())
         assert BatchJobHandle.load(handle.save(tmp_path / "h.json")) == handle
+
+    def test_submit_persists_the_prompt_and_cell_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, _, _ = _build(monkeypatch)
+        prompts = _prompts()
+        cells = _cell_metadata(len(prompts))
+
+        handle = backend.submit(prompts, metadata=cells)
+
+        assert handle.submitted_prompts == prompts
+        assert handle.submitted_cells == cells
+
+    def test_a_legacy_digest_only_handle_still_loads_and_compares(self, tmp_path: Path) -> None:
+        prompts = _prompts()
+        payload = asdict(_handle(prompts))
+        payload.pop("submitted_prompts")
+        payload.pop("submitted_cells")
+        path = tmp_path / "legacy.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = BatchJobHandle.load(path)
+
+        assert loaded.submitted_prompts is None
+        assert loaded.submitted_cells is None
+        assert loaded.submission_differences(prompts, _cell_metadata(len(prompts))) == []
+        assert loaded.submission_differences(["changed prompt"], _cell_metadata(len(prompts)))
 
     def test_the_job_id_is_the_output_subdirectory_name(self) -> None:
         assert _handle(_prompts()).job_id == "abc123xyz789"
@@ -1238,26 +1271,26 @@ class TestHandleRoundTrip:
         loaded = BatchJobHandle.load(path)
         assert (loaded.max_tokens, loaded.reasoning_effort) == (None, None)
 
-    def test_a_handle_missing_a_required_field_says_which_one_and_why_it_cannot_be_collected(
+    def test_a_prompt_digest_only_legacy_handle_loads_with_a_named_cell_limitation(
         self, tmp_path: Path
     ) -> None:
-        """Not every added field was given a default, and the oldest handle on disk lacks one.
-
-        ``cell_digest`` arrived after the first sweeps and is required, so the handle directory from
-        2026-08-17T00:27 does not load at all -- it raises a bare ``TypeError`` naming a dataclass
-        argument, which reads like a code defect rather than "this handle predates the corpus-drift
-        tripwire and cannot be safely collected". That refusal is correct and stays; what it says is
-        what changes, because an operator holding a paid job's only ARN deserves to know which.
-        """
+        """Keep the oldest usable handle format and report its unrecoverable cell identity."""
         path = tmp_path / "pre-cell-digest.json"
-        without_digest = {
-            key: value for key, value in asdict(_handle(_prompts())).items() if key != "cell_digest"
-        }
-        path.write_text(json.dumps(without_digest), encoding="utf-8")
+        legacy = asdict(_handle(_prompts()))
+        for field_name in ("cell_digest", "submitted_prompts", "submitted_cells"):
+            legacy.pop(field_name)
+        path.write_text(json.dumps(legacy), encoding="utf-8")
 
-        with pytest.raises(ValueError, match="cell_digest") as caught:
-            BatchJobHandle.load(path)
-        assert str(path) in str(caught.value)
+        loaded = BatchJobHandle.load(path)
+
+        assert loaded.cell_digest is None
+        assert loaded.submitted_prompts is None
+        assert loaded.submitted_cells is None
+        assert loaded.submission_differences(_prompts(), _cell_metadata(len(_prompts()))) == []
+        assert loaded.submission_limitations() == [
+            "cell metadata is unavailable on this legacy handle; only prompt_digest and record_count can be checked"
+        ]
+        assert loaded.submission_differences(["edited prompt"], _cell_metadata(len(_prompts())))
 
     def test_a_handle_carrying_an_unknown_field_is_refused_rather_than_silently_dropping_it(
         self, tmp_path: Path
@@ -1271,11 +1304,7 @@ class TestHandleRoundTrip:
             BatchJobHandle.load(path)
 
     def test_a_save_onto_a_tracked_path_is_refused_at_the_writer(self) -> None:
-        """The guard lives in the writer, not only in callers: a handle carries the AWS account id
-        (in ``job_arn``), the bucket (in the S3 URIs) and the profile name, and the last leak of
-        this class came through a second call site nothing guarded. The message must name that
-        cargo rather than the item prompt text a trace carries -- an operator told to look for
-        benchmark items in a file that has none will not find the real reason."""
+        """The handle carries account details and submitted prompts, so tracked saves are refused."""
         repo_root = Path(__file__).resolve().parents[2]
         tracked = repo_root / "reward_hacking" / "leaked-batch-handle.json"
         try:
@@ -1284,7 +1313,7 @@ class TestHandleRoundTrip:
             assert not tracked.exists()
             message = str(caught.value)
             assert "account id" in message, "the refusal must name what a handle actually carries"
-            assert "prompt text" not in message
+            assert "prompt text" in message
         finally:
             tracked.unlink(missing_ok=True)
 
@@ -1297,14 +1326,17 @@ class TestSamplingLabels:
     keeping them agreeing -- the parallel-dict copies had already diverged once.
     """
 
-    def test_the_label_fields_are_exactly_the_defaulted_handle_fields(self) -> None:
-        """What goes red the day someone adds temperature to the handle without teaching the
-        comparison about it. Optional-ness is read off the dataclass the same way ``load`` reads
-        it: the sampling labels are precisely the trailing defaulted fields."""
+    def test_sampling_labels_are_the_leading_defaulted_handle_fields(self) -> None:
+        """New content fields stay separate from the sampling labels shared by the two CLIs."""
         defaulted = tuple(
             field.name for field in fields(BatchJobHandle) if field.default is not MISSING
         )
-        assert defaulted == SAMPLING_LABEL_FIELDS
+        assert defaulted[: len(SAMPLING_LABEL_FIELDS)] == SAMPLING_LABEL_FIELDS
+        assert defaulted[len(SAMPLING_LABEL_FIELDS) :] == (
+            "submitted_prompts",
+            "submitted_cells",
+            "cell_digest",
+        )
 
     def test_matching_labels_report_no_mismatch(self) -> None:
         handle = replace(_handle(_prompts()), max_tokens=2048, reasoning_effort="high")

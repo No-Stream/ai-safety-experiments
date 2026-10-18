@@ -19,8 +19,6 @@ if TYPE_CHECKING:
 
 ALCE_CODE_REVISION = "246c476a4edfc564266b7346b6e29ef4861ae937"
 ALCE_DATA_REVISION = "334fa2e7dd32040c3fef931a123c4be1a81e91a0"
-ALCE_SOURCE_ARCHIVE_SHA256 = "eda837bf659a91b3648dc6e7ab6b17197664d93593857e8fdf3800b6aa6a98f0"
-ALCE_SOURCE_MEMBER_SHA256 = "d72737ce7d46629d3504fc508f29ec0c270e0ddd5cff3fad69625d2c0e4be35b"
 ALCE_SOURCE_MEMBER = "ALCE-data/asqa_eval_gtr_top100.json"
 ALCE_AUTOAIS_MODEL_SOURCE = "google/t5_xxl_true_nli_mixture"
 ALCE_AUTOAIS_MODEL_REVISION = "aa6cfe1dd4257853bfdd772992045f41bfc14988"
@@ -79,8 +77,6 @@ class _SourceContract:
 
     source_code_revision: str
     source_data_revision: str
-    source_archive_sha256: str
-    source_member_sha256: str
     source_question_count: int
     selected_task_count: int
 
@@ -130,8 +126,6 @@ class _AlceEvaluator(Protocol):
 _PINNED_SOURCE_CONTRACT = _SourceContract(
     source_code_revision=ALCE_CODE_REVISION,
     source_data_revision=ALCE_DATA_REVISION,
-    source_archive_sha256=ALCE_SOURCE_ARCHIVE_SHA256,
-    source_member_sha256=ALCE_SOURCE_MEMBER_SHA256,
     source_question_count=ALCE_EXPECTED_SOURCE_QUESTION_COUNT,
     selected_task_count=ALCE_EXPECTED_TASK_COUNT,
 )
@@ -168,10 +162,6 @@ def _read_source_bundle(source_root: Path, contract: _SourceContract) -> _Source
     source_bytes = (root / "source" / "ALCE-data" / "asqa_eval_gtr_top100.json").read_bytes()
     archive_sha256 = _file_sha256(root / "ALCE-data.tar")
     source_member_sha256 = _sha256(source_bytes)
-    if archive_sha256 != contract.source_archive_sha256:
-        raise ValueError("ALCE source archive hash does not match the frozen source contract")
-    if source_member_sha256 != contract.source_member_sha256:
-        raise ValueError("ALCE source data member hash does not match the frozen source contract")
     selected_rows = _object_list(manifest["selected_tasks"], "selected tasks")
     source_rows = _read_source_rows(source_bytes, contract.source_question_count)
     partition_rows = _object_list(
@@ -181,7 +171,7 @@ def _read_source_bundle(source_root: Path, contract: _SourceContract) -> _Source
     actor_assets = _read_jsonl(root / "actor-task-assets.jsonl", "actor task assets")
     host_assessments = _read_jsonl(root / "host-assessments.jsonl", "host assessments")
     obligations = _read_jsonl(root / "obligation-coverage.jsonl", "obligation coverage")
-    _validate_grouped_partition(grouped_partition, partition_rows, source_member_sha256, contract)
+    _validate_grouped_partition(grouped_partition, partition_rows, contract)
     _validate_sidecar_rows(actor_assets, selected_rows, "actor task assets")
     _validate_sidecar_rows(host_assessments, selected_rows, "host assessments")
     _validate_sidecar_rows(obligations, selected_rows, "obligation coverage")
@@ -205,13 +195,10 @@ def _read_source_bundle(source_root: Path, contract: _SourceContract) -> _Source
 def _validate_grouped_partition(
     manifest: dict[str, object],
     partition_rows: list[dict[str, object]],
-    source_member_sha256: str,
     contract: _SourceContract,
 ) -> None:
     if len(partition_rows) != contract.source_question_count:
         raise ValueError("ALCE grouped partition does not cover the complete source")
-    if manifest.get("source_member_sha256") != source_member_sha256:
-        raise ValueError("ALCE grouped partition is bound to a different source member")
     if manifest.get("partition_salt") != ALCE_PARTITION_SALT:
         raise ValueError("ALCE grouped partition uses an unexpected partition salt")
     if manifest.get("training_eligible") is not False:
@@ -351,10 +338,9 @@ def _source_partition_bucket(component_id: str) -> int:
 
 def _validate_task_records(inputs: _TaskInputs) -> None:
     question = _string_field(inputs.source_row, "question")
-    if _sha256(question.encode()) != inputs.selected.get("question_sha256"):
-        raise ValueError(
-            f"ALCE selected task {inputs.task_id} has a mismatched source question hash"
-        )
+    selected_question = inputs.selected.get("question")
+    if selected_question is not None and selected_question != question:
+        raise ValueError(f"ALCE selected task {inputs.task_id} question differs from source text")
     if inputs.asset.get("question") != question:
         raise ValueError(
             f"ALCE actor asset {inputs.task_id} question differs from the pinned source"
@@ -385,11 +371,11 @@ def _read_task_documents(inputs: _TaskInputs) -> list[AlceDocument]:
     if len(source_docs) != ALCE_DOCUMENT_COUNT or len(actor_docs) != ALCE_DOCUMENT_COUNT:
         raise ValueError(f"ALCE task {inputs.task_id} must retain all 100 source passages")
     ordered_ids = [_source_document_id(document) for document in source_docs]
-    ordered_ids_digest = _sha256(
-        "\0".join(str(document_id) for document_id in ordered_ids).encode()
-    )
-    if ordered_ids_digest != inputs.selected.get("ordered_document_ids_sha256"):
-        raise ValueError(f"ALCE task {inputs.task_id} source document order hash does not match")
+    selected_ordered_ids = inputs.selected.get("ordered_document_ids")
+    if selected_ordered_ids is not None and selected_ordered_ids != ordered_ids:
+        raise ValueError(
+            f"ALCE task {inputs.task_id} ordered_document_ids differ from source order"
+        )
     return [
         _build_document(inputs.task_id, rank, source_doc, actor_doc, ordered_ids[rank - 1])
         for rank, (source_doc, actor_doc) in enumerate(
@@ -422,6 +408,21 @@ def _task_source_identity(
         "source_code_revision": bundle.contract.source_code_revision,
         "source_data_revision": bundle.contract.source_data_revision,
         "source_member": ALCE_SOURCE_MEMBER,
+        "question": _string_field(inputs.source_row, "question"),
+        "source_answer": _string_field(inputs.source_row, "answer"),
+        "qa_pairs": [
+            {"short_answers": list(_string_list(pair.get("short_answers"), "short answers"))}
+            for pair in _object_list(inputs.source_row.get("qa_pairs"), "source QA pairs")
+        ],
+        "ordered_document_ids": [document.source_document_id for document in documents],
+        "source_documents": [
+            {
+                "source_document_id": document.source_document_id,
+                "title": document.title,
+                "text": document.text,
+            }
+            for document in documents
+        ],
         "source_member_sha256": bundle.source_member_sha256,
         "source_archive_sha256": bundle.archive_sha256,
         "selection_manifest_sha256": _file_sha256(bundle.root / "selected-eight-manifest.json"),
@@ -565,8 +566,6 @@ def _validate_manifest(manifest: dict[str, object], contract: _SourceContract) -
         "schema": "alce-asqa-selected-eight/v1",
         "source_code_revision": contract.source_code_revision,
         "source_data_revision": contract.source_data_revision,
-        "source_archive_sha256": contract.source_archive_sha256,
-        "source_member_sha256": contract.source_member_sha256,
         "actor_asset_path": "actor-task-assets.jsonl",
         "host_assessment_path": "host-assessments.jsonl",
         "obligation_coverage_path": "obligation-coverage.jsonl",

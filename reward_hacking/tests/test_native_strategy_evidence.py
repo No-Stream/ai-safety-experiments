@@ -109,6 +109,20 @@ def test_native_evidence_roundtrip_only_overlays_mechanisms(tmp_path: Path) -> N
     assert len(loaded.bindings) == 1
 
 
+def test_native_header_ignores_added_run_context_metadata(
+    tmp_path: Path,
+) -> None:
+    records, native, rescored = native_fixture_files(tmp_path)
+    rows = [json.loads(line) for line in rescored.read_text().splitlines()]
+    header = rows[0]
+    header["provenance"]["run_context"] = {"endpoint": "synthetic-endpoint"}
+    _write(rescored, rows)
+
+    path = build_native_evidence(records, native, rescored, tmp_path / "evidence.json")
+
+    assert len(load_native_evidence(path, records).entries) == 1
+
+
 @pytest.mark.parametrize("source", ["ordinary", "native", "rescored", "headers", "trace"])
 def test_live_source_changes_reject_old_manifest(tmp_path: Path, source: str) -> None:
     records, native, rescored = native_fixture_files(tmp_path)

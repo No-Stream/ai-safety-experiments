@@ -3,25 +3,26 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
-from typing import TYPE_CHECKING
+import logging
+import subprocess
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 from test_r2e_leak_data import _commit_json
 
+from reward_hacking import r2e_leak_etl
 from reward_hacking.r2e_leak_data import load_tasks, task_id_for
 from reward_hacking.r2e_leak_etl import (
     DatasetRow,
     TreeMeasurement,
     bake,
+    extract_template,
     measure_tree,
     rank_candidates,
     require_free_disk,
     task_from_row,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 DIGEST = "sha256:" + "cd" * 32
 SMALL_TREE = TreeMeasurement(100, 1000, 10, 100, 20, 200)
@@ -93,6 +94,54 @@ class TestTaskFromRow:
     def test_empty_gold_patch_refused(self) -> None:
         with pytest.raises(ValueError, match="empty gold patch"):
             task_from_row((_row("alpha", "a" * 40, 3, path="tests/test_toy.py")), DIGEST)
+
+
+class TestExtractTemplate:
+    def test_provenance_records_readable_image_reference_and_legacy_digest_resumes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        task = task_from_row(_row("alpha", "a" * 40, 3), DIGEST)
+        templates_root = tmp_path / "templates"
+        docker_calls: list[list[str]] = []
+        monkeypatch.setattr(r2e_leak_etl, "require_free_disk", lambda *_args, **_kwargs: 1)
+        monkeypatch.setattr(r2e_leak_etl, "pull_by_digest", lambda _task: None)
+
+        def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            docker_calls.append(argv)
+            if argv[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, "100", "")
+            if argv[1] == "create":
+                return subprocess.CompletedProcess(argv, 0, "synthetic-container", "")
+            if argv[1] == "cp":
+                destination = Path(argv[-1])
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / "synthetic.py").write_text("VALUE = 1\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(r2e_leak_etl, "run", fake_run)
+        with caplog.at_level(logging.WARNING):
+            task_directory = extract_template(task, templates_root, "synthetic-revision")
+
+        provenance_path = task_directory / "provenance.json"
+        provenance = json.loads(provenance_path.read_text())
+        assert provenance["image_reference"] == task.digest_pinned_image
+        assert "image reference" not in caplog.text
+
+        docker_calls.clear()
+        extract_template(task, templates_root, "synthetic-revision")
+        assert docker_calls == []
+
+        legacy = dict(provenance)
+        legacy.pop("image_reference")
+        provenance_path.write_text(json.dumps(legacy))
+        extract_template(task, templates_root, "synthetic-revision")
+        assert docker_calls == []
+
+        changed_task = replace(task, image_digest="sha256:" + "ef" * 32)
+        with caplog.at_level(logging.WARNING):
+            extract_template(changed_task, templates_root, "synthetic-revision")
+        assert "image reference" in caplog.text
+        assert docker_calls
 
 
 class TestBake:

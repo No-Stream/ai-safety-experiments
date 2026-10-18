@@ -266,14 +266,28 @@ def keyword_basis(text: str) -> str:
     return "none-matched"
 
 
-def rubric_digest() -> str:
-    """Digest of the whole fixed prompt scaffold, stored per row so any edit to it is visible in the data.
+def rubric_sections() -> dict[str, str]:
+    """Return the fixed judge prompt sections by readable name for row-level comparisons."""
+    return {
+        "instructions": JUDGE_INSTRUCTIONS,
+        "game_section": GAME_SECTION_TEMPLATE,
+        "prompt_template": JUDGE_PROMPT_TEMPLATE,
+        "empty_channel": EMPTY_CHANNEL_MARKER,
+    }
 
-    Covers everything in the prompt that is not per-record: the rubric, the game-section template, the
-    transcript delimiters and the empty-channel marker. The judge loop resumes only over rows carrying
-    this digest, so an edit anywhere in the scaffold re-judges rather than pools; the hand-bumped
-    ``RUBRIC_VERSION`` names the schema, and this names the exact wording.
-    """
+
+def rubric_section_differences(row: Mapping[str, Any]) -> list[str]:
+    """Name each fixed prompt section that differs from the text stored on a modern judged row."""
+    stored = row.get("rubric_sections")
+    if not isinstance(stored, dict):
+        return ["rubric_sections"]
+    expected = rubric_sections()
+    names = sorted(set(expected) | set(stored))
+    return [f"rubric_sections.{name}" for name in names if stored.get(name) != expected.get(name)]
+
+
+def rubric_digest() -> str:
+    """Legacy digest retained for loading older judged rows; new rows store their scaffold text."""
     scaffold = f"{JUDGE_INSTRUCTIONS}\n{GAME_SECTION_TEMPLATE}\n{JUDGE_PROMPT_TEMPLATE}\n{EMPTY_CHANNEL_MARKER}"
     return hashlib.sha256(scaffold.encode("utf-8")).hexdigest()[:16]
 
@@ -382,17 +396,16 @@ def parse_judge_reply(text: str) -> JudgeVerdict:
 
 
 def judged_under_current_scaffold(row: Mapping[str, Any]) -> bool:
-    """Whether a judged row's verdict answers THIS rubric version under THIS scaffold digest.
+    """Whether a row's verdict answers the current version and fixed prompt sections.
 
-    Both have to match: the version names the schema and the digest names the exact wording, and a
-    verdict produced under other wording is an answer to a different question -- kept in the file for
-    the record, never read as this pass's.
+    Older rows have only a scaffold digest, so that field is consulted only while reading that legacy
+    format. New rows compare each stored text section directly.
     """
-    return (
-        "verdict" in row
-        and row.get("rubric_version") == RUBRIC_VERSION
-        and row.get("rubric_digest") == rubric_digest()
-    )
+    if "verdict" not in row or row.get("rubric_version") != RUBRIC_VERSION:
+        return False
+    if "rubric_sections" in row:
+        return not rubric_section_differences(row)
+    return row.get("rubric_digest") == rubric_digest()
 
 
 def verdict_from_row(row: Mapping[str, Any]) -> JudgeVerdict:
@@ -414,13 +427,21 @@ def verdict_from_row(row: Mapping[str, Any]) -> JudgeVerdict:
             f"judged row {row.get('key')!r} was judged under rubric {version!r}; this code reads "
             f"{RUBRIC_VERSION!r}. Re-run judge over the same output directory so the row is re-judged."
         )
-    digest = row.get("rubric_digest")
-    if digest != rubric_digest():
-        raise ValueError(
-            f"judged row {row.get('key')!r} was judged under scaffold digest {digest!r}; this code's "
-            f"scaffold is {rubric_digest()!r}. Re-run judge over the same output directory so the row "
-            f"is re-judged rather than pooled with rows from a differently worded prompt."
-        )
+    if "rubric_sections" in row:
+        differences = rubric_section_differences(row)
+        if differences:
+            raise ValueError(
+                f"judged row {row.get('key')!r} has changed scaffold section(s) {differences}; "
+                "re-run judge over the same output directory so the row is re-judged."
+            )
+    else:
+        digest = row.get("rubric_digest")
+        if digest != rubric_digest():
+            raise ValueError(
+                f"legacy judged row {row.get('key')!r} was judged under scaffold digest {digest!r}; "
+                f"this code's legacy scaffold digest is {rubric_digest()!r}. Re-run judge over the "
+                "same output directory so the row is re-judged."
+            )
     return _verdict_from_payload(payload)
 
 

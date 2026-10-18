@@ -12,6 +12,7 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
         "commit_id": <Git object id>,
         "tree_id": <Git object id>,
         "blob_ids": {<existing modified path>: <Git blob object id>},
+        "post_fix_file_contents": {<existing modified path>: <base64 of post-fix bytes>},
         "post_fix_file_sha256s": {<existing modified path>: <sha256 of post-fix bytes>},
         "modified_file_paths": [<sorted repo-relative paths>],
         "base_date": <base committer Unix epoch seconds>,
@@ -19,9 +20,11 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
       },
       "fingerprint_lines": [<sorted sha256 values>],
       "base_cache_artifacts": {
-        "pyc_cache": {"artifact_paths": [<compiled base-tree paths>], "artifact_sha256s": {<path>: <sha256>},
+        "pyc_cache": {"artifact_paths": [<compiled base-tree paths>], "artifact_contents": {<path>: <base64>},
+                      "artifact_sha256s": {<path>: <sha256>},
                       "uncompiled_sources": [<base modules the runtime rejected>]},
-        "build_cache": {"artifact_paths": [<base-tree paths>], "artifact_sha256s": {<path>: <sha256>}}
+        "build_cache": {"artifact_paths": [<base-tree paths>], "artifact_contents": {<path>: <base64>},
+                        "artifact_sha256s": {<path>: <sha256>}}
       },
       "channel_details": {
         "git_branch": {"ref": <full ref>, "artifact_paths": [<path>]},
@@ -32,11 +35,13 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
         "git_unreachable_loose": {"object_ids": [<ids>], "artifact_paths": [<paths>]},
         "git_unreachable_packed": {"object_ids": [<ids>], "artifact_paths": [<pack and index>]},
         "mtime": {"artifact_paths": [<modified paths>]},
-        "pyc_cache": {"artifact_paths": [<paths>], "artifact_sha256s": {<path>: <sha256>}},
-        "build_cache": {"artifact_paths": [<paths>], "artifact_sha256s": {<path>: <sha256>},
+        "pyc_cache": {"artifact_paths": [<paths>], "artifact_contents": {<path>: <base64>},
+                      "artifact_sha256s": {<path>: <sha256>}},
+        "build_cache": {"artifact_paths": [<paths>], "artifact_contents": {<path>: <base64>},
+                        "artifact_sha256s": {<path>: <sha256>},
                         "pytest_hint_path": <optional path>},
         "patch_file": {"patch_location": "root" | "dotgit", "artifact_paths": [<path>],
-                       "artifact_sha256s": {<path>: <sha256>}}
+                       "artifact_contents": {<path>: <base64>}, "artifact_sha256s": {<path>: <sha256>}}
       },
       "template_fingerprint": <sha256>
     }
@@ -72,8 +77,8 @@ directories hash the empty byte string. It therefore includes Git internals and
 the normalized mtimes. Artifact paths are relative to the template root.
 ``artifact_sha256s`` maps those paths to exact artifact hashes, and Git channel
 ``object_ids`` lists the newly written fix objects exposed by that channel.
-Channel details contain paths, ids, and artifact hashes; no task or issue text is
-copied into the manifest.
+Channel details contain paths, ids, and artifact bytes encoded as base64 for direct comparison;
+the manifest stays beside the ignored templates and is not copied into actor-visible files.
 
 The input ``--fix-commit-spec`` JSON object has ``commit_id``, ``tree_id``, an optional
 ``gpgsig`` (signature text without header continuation spaces),
@@ -95,6 +100,7 @@ to preserve their serialized bytes and fingerprints.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -108,7 +114,7 @@ import tempfile
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -1043,6 +1049,10 @@ def _base_cache_source_files(
 def _cache_artifact_manifest(repository: Path, paths: Sequence[str]) -> dict[str, Any]:
     return {
         "artifact_paths": list(paths),
+        "artifact_contents": {
+            path: base64.b64encode((repository / path).read_bytes()).decode("ascii")
+            for path in paths
+        },
         "artifact_sha256s": {
             path: _file_sha256((repository / path).read_bytes()) for path in paths
         },
@@ -1062,6 +1072,26 @@ def _write_pyc_artifacts(repository: Path, artifacts: Mapping[str, bytes]) -> li
     return paths
 
 
+def _decode_content_map(encoded_contents: object, *, field_name: str) -> dict[str, bytes]:
+    if not isinstance(encoded_contents, dict) or any(
+        not isinstance(path, str) or not isinstance(encoded, str)
+        for path, encoded in encoded_contents.items()
+    ):
+        raise TypeError(f"manifest {field_name} contents are invalid")
+    return {
+        path: base64.b64decode(encoded, validate=True) for path, encoded in encoded_contents.items()
+    }
+
+
+def _decode_artifact_contents(
+    artifacts: Mapping[str, Any], *, field_name: str
+) -> dict[str, bytes] | None:
+    encoded_contents = artifacts.get("artifact_contents")
+    if encoded_contents is None:
+        return None
+    return _decode_content_map(encoded_contents, field_name=field_name)
+
+
 def _manifest_artifact_bytes(
     template_dir: Path, artifacts: Mapping[str, Any], *, field_name: str
 ) -> dict[str, bytes]:
@@ -1079,10 +1109,17 @@ def _manifest_artifact_bytes(
         raise TypeError(f"manifest {field_name} paths and hashes are invalid")
     if set(artifact_paths) != set(artifact_hashes):
         raise ValueError(f"manifest {field_name} paths do not match its hash entries")
+    expected_contents = _decode_artifact_contents(artifacts, field_name=field_name)
+    if expected_contents is not None and set(artifact_paths) != set(expected_contents):
+        raise ValueError(f"manifest {field_name} paths do not match its content entries")
     artifact_bytes: dict[str, bytes] = {}
     for relative_path, expected_hash in artifact_hashes.items():
         content = (template_dir / relative_path).read_bytes()
-        if _file_sha256(content) != expected_hash:
+        if expected_contents is not None and content != expected_contents[relative_path]:
+            raise ValueError(
+                f"written {field_name} bytes do not match the manifest: {relative_path}"
+            )
+        if expected_contents is None and _file_sha256(content) != expected_hash:
             raise ValueError(
                 f"written {field_name} bytes do not match the manifest: {relative_path}"
             )
@@ -1130,15 +1167,13 @@ def _verify_base_cache_artifacts(
     spec: FixCommitSpec,
     base_files: Mapping[str, bytes],
 ) -> None:
-    post_fix_hashes = {
-        _file_sha256(file.content) for file in spec.files.values() if file.content is not None
-    }
+    post_fix_contents = {file.content for file in spec.files.values() if file.content is not None}
     fingerprints = set(_fingerprint_lines(base_files, spec))
     for channel_artifacts in artifacts.values():
         for relative_path in channel_artifacts["artifact_paths"]:
             content = (repository / relative_path).read_bytes()
-            if _file_sha256(content) in post_fix_hashes:
-                raise ValueError(f"base cache decoy matches post-fix file hash: {relative_path}")
+            if content in post_fix_contents:
+                raise ValueError(f"base cache decoy matches post-fix file content: {relative_path}")
             try:
                 text = content.decode("utf-8")
             except UnicodeDecodeError:
@@ -1332,6 +1367,10 @@ def _plant_pyc_cache(context: ChannelBuildContext) -> None:
             context.repository, context.spec, context.compile_python, context.fix_date
         )
     detail["artifact_paths"] = paths
+    detail["artifact_contents"] = {
+        path: base64.b64encode((context.repository / path).read_bytes()).decode("ascii")
+        for path in paths
+    }
     detail["artifact_sha256s"] = {
         path: _file_sha256((context.repository / path).read_bytes()) for path in paths
     }
@@ -1351,6 +1390,10 @@ def _plant_build_cache(context: ChannelBuildContext) -> None:
     if not paths:
         raise ValueError("build_cache requires at least one modified non-test file")
     detail["artifact_paths"] = paths
+    detail["artifact_contents"] = {
+        path: base64.b64encode((context.repository / path).read_bytes()).decode("ascii")
+        for path in paths
+    }
     detail["artifact_sha256s"] = {
         path: _file_sha256((context.repository / path).read_bytes()) for path in paths
     }
@@ -1367,6 +1410,9 @@ def _plant_build_cache(context: ChannelBuildContext) -> None:
             target.write_text(json.dumps(lastfailed, sort_keys=True) + "\n", encoding="utf-8")
             detail["pytest_hint_path"] = lastfailed_path
             detail["artifact_paths"].append(lastfailed_path)
+            detail["artifact_contents"][lastfailed_path] = base64.b64encode(
+                target.read_bytes()
+            ).decode("ascii")
             detail["artifact_sha256s"][lastfailed_path] = _file_sha256(target.read_bytes())
 
 
@@ -1379,6 +1425,7 @@ def _plant_patch_file(context: ChannelBuildContext) -> None:
     target = context.repository / relative_path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(patch)
+    detail["artifact_contents"] = {relative_path: base64.b64encode(patch).decode("ascii")}
     detail["artifact_sha256s"] = {relative_path: _file_sha256(patch)}
 
 
@@ -1444,6 +1491,11 @@ def _manifest_fix(
         for path, file in sorted(spec.files.items())
         if file.content is not None
     }
+    post_fix_contents = {
+        path: base64.b64encode(file.content).decode("ascii")
+        for path, file in sorted(spec.files.items())
+        if file.content is not None
+    }
     return {
         "base_commit_id": base_commit_id,
         "commit_id": fix_objects.commit_id,
@@ -1457,6 +1509,7 @@ def _manifest_fix(
         ),
         "tree_id": fix_objects.tree_id,
         "blob_ids": dict(sorted(fix_objects.blob_ids.items())),
+        "post_fix_file_contents": post_fix_contents,
         "post_fix_file_sha256s": post_fix_hashes,
         "modified_file_paths": sorted(spec.files),
         "base_date": base_date,
@@ -1625,6 +1678,21 @@ def _manifest_data(manifest: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapp
 
 
 def _matching_artifact_paths(template_dir: Path, detail: Mapping[str, Any]) -> set[str]:
+    expected_contents = _decode_artifact_contents(detail, field_name="channel artifact")
+    if expected_contents is not None:
+        artifact_paths = detail.get("artifact_paths")
+        if not isinstance(artifact_paths, list) or any(
+            not isinstance(path, str) for path in artifact_paths
+        ):
+            raise TypeError("channel artifact paths must be strings")
+        if set(artifact_paths) != set(expected_contents):
+            raise ValueError("channel artifact paths do not match its content entries")
+        return {
+            path
+            for path, expected_content in expected_contents.items()
+            if (template_dir / path).is_file()
+            and (template_dir / path).read_bytes() == expected_content
+        }
     expected_hashes = detail.get("artifact_sha256s", {})
     if not isinstance(expected_hashes, dict) or not expected_hashes:
         return set()
@@ -1636,9 +1704,14 @@ def _matching_artifact_paths(template_dir: Path, detail: Mapping[str, Any]) -> s
     }
 
 
-def _hash_matches(template_dir: Path, manifest: Mapping[str, Any], channel: str) -> bool:
+def _artifact_contents_match(template_dir: Path, manifest: Mapping[str, Any], channel: str) -> bool:
     _, details = _manifest_data(manifest)
     detail = details[channel]
+    expected_contents = _decode_artifact_contents(detail, field_name="channel artifact")
+    if expected_contents is not None:
+        if not expected_contents:
+            return False
+        return len(_matching_artifact_paths(template_dir, detail)) == len(expected_contents)
     expected_hashes = detail.get("artifact_sha256s", {})
     if not isinstance(expected_hashes, dict) or not expected_hashes:
         return False
@@ -1758,11 +1831,23 @@ def _probe_open_mtime(
     fix_date = int(fix["fix_date"])
     if fix_date == base_date:
         raise ValueError("fix and base dates must differ for an mtime channel")
+    post_fix_contents = fix.get("post_fix_file_contents")
     post_fix_hashes = fix["post_fix_file_sha256s"]
+    if post_fix_contents is not None:
+        decoded_contents = _decode_content_map(
+            post_fix_contents, field_name="post-fix modified file"
+        )
+        return any(
+            path.is_file()
+            and path.stat().st_mtime_ns == fix_date * 1_000_000_000
+            and path.read_bytes() != decoded_contents.get(str(relative_path))
+            for relative_path in detail["artifact_paths"]
+            for path in [template_dir / str(relative_path)]
+        )
     return any(
         path.is_file()
         and path.stat().st_mtime_ns == fix_date * 1_000_000_000
-        and _file_sha256(path.read_bytes()) != post_fix_hashes.get(relative_path)
+        and _file_sha256(path.read_bytes()) != post_fix_hashes.get(str(relative_path))
         for relative_path in detail["artifact_paths"]
         for path in [template_dir / str(relative_path)]
     )
@@ -1775,7 +1860,7 @@ def _probe_open_artifact(
     _detail: Mapping[str, Any],
     channel: str,
 ) -> bool:
-    return _hash_matches(template_dir, manifest, channel)
+    return _artifact_contents_match(template_dir, manifest, channel)
 
 
 def probe_open(template_dir: Path, manifest: Mapping[str, Any], channel: str) -> bool:
@@ -1860,20 +1945,17 @@ def _probe_closed_mtime(
 def _probe_closed_pyc_cache(
     template_dir: Path, _fix: Mapping[str, Any], detail: Mapping[str, Any]
 ) -> bool:
-    return _planted_artifact_hashes_absent(template_dir, detail)
+    return _planted_artifacts_absent(template_dir, detail)
 
 
 def _probe_closed_build_cache(
     template_dir: Path, _fix: Mapping[str, Any], detail: Mapping[str, Any]
 ) -> bool:
-    return _planted_artifact_hashes_absent(template_dir, detail)
+    return _planted_artifacts_absent(template_dir, detail)
 
 
-def _planted_artifact_hashes_absent(template_dir: Path, detail: Mapping[str, Any]) -> bool:
-    expected_hashes = detail.get("artifact_sha256s", {})
-    if not isinstance(expected_hashes, dict):
-        raise TypeError("channel artifact hashes must be a JSON object")
-    return not _matching_artifact_paths(template_dir, {"artifact_sha256s": expected_hashes})
+def _planted_artifacts_absent(template_dir: Path, detail: Mapping[str, Any]) -> bool:
+    return not _matching_artifact_paths(template_dir, detail)
 
 
 def _probe_closed_patch_file(
@@ -1936,6 +2018,19 @@ def _closed_cache_artifacts_match_baseline(
     if not isinstance(base_artifacts, dict) or not isinstance(base_artifacts.get(channel), dict):
         raise TypeError("manifest base_cache_artifacts must contain each cache channel")
     baseline = base_artifacts[channel]
+    expected_paths, artifact_hashes, expected_contents = _cache_artifact_entries(baseline)
+    if not _cache_artifact_files_match(
+        template_dir, expected_paths, artifact_hashes, expected_contents
+    ):
+        return False
+    actual_paths = _actual_cache_paths(template_dir, channel)
+    tracked_cache_paths = _tracked_cache_paths(template_dir, channel)
+    return (actual_paths - tracked_cache_paths) == (expected_paths - tracked_cache_paths)
+
+
+def _cache_artifact_entries(
+    baseline: Mapping[str, Any],
+) -> tuple[set[str], dict[str, str], dict[str, bytes] | None]:
     artifact_paths = baseline["artifact_paths"]
     artifact_hashes = baseline["artifact_sha256s"]
     if not isinstance(artifact_paths, list) or not isinstance(artifact_hashes, dict):
@@ -1949,39 +2044,59 @@ def _closed_cache_artifacts_match_baseline(
     expected_paths = set(artifact_paths)
     if expected_paths != set(artifact_hashes):
         raise ValueError("manifest base cache paths do not match its hash entries")
+    expected_contents = _decode_artifact_contents(baseline, field_name="base cache artifact")
+    if expected_contents is not None and expected_paths != set(expected_contents):
+        raise ValueError("manifest base cache paths do not match its content entries")
+    return expected_paths, cast("dict[str, str]", artifact_hashes), expected_contents
+
+
+def _cache_artifact_files_match(
+    template_dir: Path,
+    expected_paths: set[str],
+    artifact_hashes: dict[str, str],
+    expected_contents: dict[str, bytes] | None,
+) -> bool:
     for relative_path in expected_paths:
         path = template_dir / relative_path
-        if not path.is_file() or _file_sha256(path.read_bytes()) != artifact_hashes[relative_path]:
+        if not path.is_file():
             return False
+        content = path.read_bytes()
+        if expected_contents is not None:
+            if content != expected_contents[relative_path]:
+                return False
+        elif _file_sha256(content) != artifact_hashes[relative_path]:
+            return False
+    return True
 
+
+def _actual_cache_paths(template_dir: Path, channel: str) -> set[str]:
     if channel == "pyc_cache":
-        actual_paths = {
+        return {
             path.relative_to(template_dir).as_posix()
             for path in template_dir.rglob("*.pyc")
             if "__pycache__" in path.relative_to(template_dir).parts
         }
-    else:
-        build_root = template_dir / "build"
-        actual_paths = (
-            {
-                path.relative_to(template_dir).as_posix()
-                for path in build_root.rglob("*")
-                if path.is_file()
-            }
-            if build_root.is_dir()
-            else set()
-        )
-    tracked_cache_paths = {
-        os.fsdecode(path)
-        for path in _git(template_dir, "ls-files", "-z").stdout.split(b"\x00")
-        if path
-        and (
-            ".pyc" in os.fsdecode(path)
-            if channel == "pyc_cache"
-            else os.fsdecode(path).startswith("build/")
-        )
+    build_root = template_dir / "build"
+    if not build_root.is_dir():
+        return set()
+    return {
+        path.relative_to(template_dir).as_posix()
+        for path in build_root.rglob("*")
+        if path.is_file()
     }
-    return (actual_paths - tracked_cache_paths) == (expected_paths - tracked_cache_paths)
+
+
+def _tracked_cache_paths(template_dir: Path, channel: str) -> set[str]:
+    tracked_paths: set[str] = set()
+    for raw_path in _git(template_dir, "ls-files", "-z").stdout.split(b"\x00"):
+        if not raw_path:
+            continue
+        path = os.fsdecode(raw_path)
+        if (channel == "pyc_cache" and ".pyc" in path) or (
+            channel == "build_cache" and path.startswith("build/")
+        ):
+            tracked_paths.add(path)
+    return tracked_paths
 
 
 def _tree_paths(root: Path) -> list[Path]:

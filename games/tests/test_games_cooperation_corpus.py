@@ -231,18 +231,21 @@ class TestRealSweepAudit:
         rows = [
             {
                 "prompt_id": "pd-row",
+                "prompt": "synthetic pd prompt",
                 "game_id": "twin-pd",
                 "payoff_variant": "v",
                 "framing_id": "twin",
             },
             {
                 "prompt_id": "stag-row",
+                "prompt": "synthetic stag prompt",
                 "game_id": "stag-hunt",
                 "payoff_variant": "v",
                 "framing_id": "human",
             },
             {
                 "prompt_id": "trust-row",
+                "prompt": "synthetic trust prompt",
                 "game_id": "trust-vs-stated-return",
                 "payoff_variant": "v",
                 "framing_id": cc.FRAMING_ID_UNSET,
@@ -281,6 +284,7 @@ class TestRealSweepAudit:
             expected_prompt_ids=prompt_ids,
             expected_model_id="model-under-test",
             expected_sampler_identity=sampler,
+            expected_rows=rows,
             expected_strata=cc.expected_stratum_keys(rows),
         )
 
@@ -292,13 +296,55 @@ class TestRealSweepAudit:
         assert summary.strata[0].n_pure_prompts == 1
         assert all(stratum.n_prompts == 1 for stratum in summary.strata)
 
-        with pytest.raises(ValueError, match="prompt-content digest"):
+        legacy_meta = dict(entries[0])
+        legacy_meta["prompt_id_order_sha256"] = "old digest format"
+        legacy_meta["rows_sha256"] = "old corpus digest"
+        summary = cc.summarize_sweep_trace(
+            [legacy_meta, *entries[1:]],
+            expected_prompt_ids=prompt_ids,
+            expected_model_id="model-under-test",
+            expected_sampler_identity=sampler,
+            expected_rows=rows,
+        )
+        assert summary.n_prompts == len(rows)
+
+        changed_rows = [dict(row) for row in rows]
+        changed_rows[1]["prompt"] = "edited synthetic stag prompt"
+        with pytest.raises(ValueError, match=r"stag-row.*prompt"):
             cc.summarize_sweep_trace(
                 entries,
                 expected_prompt_ids=prompt_ids,
                 expected_model_id="model-under-test",
                 expected_sampler_identity=sampler,
-                expected_rows_sha256="different-corpus",
+                expected_rows=changed_rows,
+            )
+
+    def test_prompt_order_mismatch_names_the_ids_and_expected_count(self) -> None:
+        sampler = {"temperature": 0.7}
+        entries = [
+            {
+                "record_kind": "sweep-meta",
+                "backend": {"model_id": "model", "sampling": sampler},
+                "n_prompts": 2,
+            },
+            {
+                "record_kind": "prompt-sweep",
+                "prompt_id": "found-row",
+                "row": {"prompt_id": "found-row", "game_id": "twin-pd"},
+                "n_samples": 1,
+                "n_parse_failures": 0,
+                "n_truncated_thinking": 0,
+                "selection_scores": [0.5],
+                "score_std": 0.0,
+            },
+        ]
+
+        with pytest.raises(ValueError, match=r"prompt IDs.*found-row.*expected-row"):
+            cc.summarize_sweep_trace(
+                entries,
+                expected_prompt_ids=["expected-row"],
+                expected_model_id="model",
+                expected_sampler_identity=sampler,
             )
 
     def test_trace_summary_refuses_sampler_drift(self) -> None:

@@ -35,6 +35,7 @@ from games.evals import (
     SECTIONS,
     EvalConfig,
     PlannedRequest,
+    _plan_trap_cells,
     plan_battery,
     read_eval_records,
     render_capability_prompt,
@@ -960,6 +961,52 @@ class TestSectionAndConfigValidation:
         # so it is a pure function of the trace; every registered section must still be reduced.
         assert {key for key in summary if key in SECTIONS} == set(SECTIONS)
         assert all(summary[section]["n_records"] > 0 for section in SECTIONS)
+
+    def test_trap_cell_plan_names_changed_clause_ids_without_digest_gating(
+        self, tmp_path: Path
+    ) -> None:
+        trap_cells_path = write_framings_file(tmp_path)
+        original_clauses = load_dictator_recipient_clauses(trap_cells_path)
+        payload = json.loads(trap_cells_path.read_text())
+        clause_key = next(iter(original_clauses.clause_by_condition))
+        payload["dictator_recipient_clauses"][clause_key] = (
+            "The receiving place keeps a small reserve for its ordinary needs."
+        )
+        trap_cells_path.write_text(json.dumps(payload), encoding="utf-8")
+        config = dataclasses.replace(
+            SMALL_CONFIG,
+            trap_cells_file=trap_cells_path,
+            trap_cells_digest=original_clauses.digest,
+            trap_cells_clauses=tuple(original_clauses.clause_by_condition.items()),
+        )
+
+        with pytest.raises(ValueError, match=clause_key):
+            _plan_trap_cells(config)
+
+    def test_trap_cell_plan_accepts_reformatted_file_when_clause_text_matches(
+        self, tmp_path: Path
+    ) -> None:
+        trap_cells_path = write_framings_file(tmp_path)
+        clauses = load_dictator_recipient_clauses(trap_cells_path)
+        payload = json.loads(trap_cells_path.read_text())
+        trap_cells_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        config = dataclasses.replace(
+            SMALL_CONFIG,
+            trap_cells_file=trap_cells_path,
+            trap_cells_digest=clauses.digest,
+            trap_cells_clauses=tuple(clauses.clause_by_condition.items()),
+        )
+
+        planned = _plan_trap_cells(config)
+
+        assert planned
+        assert all(
+            any(
+                clause_text in request.prompt
+                for clause_text in clauses.clause_by_condition.values()
+            )
+            for request in planned
+        )
 
     def test_an_empty_section_list_raises(self, tmp_path: Path) -> None:
         backend = cooperative_backend(("twin-pd",))

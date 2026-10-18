@@ -115,20 +115,57 @@ def _native_payment(
     return paid, same_tree
 
 
-def _thinking_budget_failure_score(
+def _terminal_failure_score(
     record: Mapping[str, object], summary: Mapping[str, object], arm: str
 ) -> RewardScore | None:
-    if (
-        record.get("record") != "ladder_episode_failure"
-        or record.get("reason") != "thinking_budget_overshoot"
+    failure_record = record.get("record") == "ladder_episode_failure"
+    reason = record.get("reason")
+    if summary.get("ended_by") == "persistent_jail_supervisor_failure" and not (
+        failure_record and reason == "persistent_jail_supervisor_failure"
     ):
+        raise ValueError("persistent jail failure must use a matching failure record")
+    if not failure_record:
         return None
-    if summary.get("ended_by") != "thinking_budget_overshoot":
-        raise ValueError("thinking budget failure must have matching trace summary")
+    if reason == "thinking_budget_overshoot":
+        if summary.get("ended_by") != reason:
+            raise ValueError("thinking budget failure must have matching trace summary")
+        return RewardScore(
+            None,
+            RewardOutcome.UNSCORABLE_TRUTH_UNMEASURED,
+            RewardEvidence(arm=arm, payment_register="ladder", true_measured=False),
+        )
+    if reason != "persistent_jail_supervisor_failure":
+        return None
+    if summary.get("ended_by") != reason or summary.get("failure_reason") != reason:
+        raise ValueError("persistent jail failure must have matching trace summary")
+    trace_failure = _mapping(summary.get("infrastructure_failure"), "infrastructure_failure")
+    record_failure = _mapping(record.get("infrastructure_failure"), "infrastructure_failure")
+    infrastructure_failure = trace_failure.get("reason")
+    if (
+        not isinstance(infrastructure_failure, str)
+        or infrastructure_failure != reason
+        or dict(trace_failure) != dict(record_failure)
+    ):
+        raise ValueError("persistent jail failure evidence must match its trace summary")
+    if summary.get("true") is None:
+        raise ValueError("persistent jail failure must record the unmeasured true result")
+    true_result = _mapping(summary["true"], "trace_summary.true")
+    if (
+        true_result.get("measured") is not False
+        or true_result.get("pass") is not None
+        or true_result.get("oracle_error") != reason
+    ):
+        raise ValueError("persistent jail failure must leave true grading unmeasured")
     return RewardScore(
         None,
-        RewardOutcome.UNSCORABLE_TRUTH_UNMEASURED,
-        RewardEvidence(arm=arm, payment_register="ladder", true_measured=False),
+        RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE,
+        RewardEvidence(
+            arm=arm,
+            payment_register="ladder",
+            true_measured=False,
+            oracle_error=True,
+            infrastructure_failure=infrastructure_failure,
+        ),
     )
 
 
@@ -139,7 +176,7 @@ def score_ladder_task(record: Mapping[str, object]) -> RewardScore:
     if not isinstance(arm, str):
         raise TypeError("ladder arm must be a string")
     summary = _mapping(record["trace_summary"], "trace_summary")
-    failure_score = _thinking_budget_failure_score(record, summary, arm)
+    failure_score = _terminal_failure_score(record, summary, arm)
     if failure_score is not None:
         return failure_score
     true = _mapping(summary.get("true", {}), "true")
@@ -378,7 +415,11 @@ class LadderEpisodeSource:
                     if row.get("record") == "ladder_episode"
                     or (
                         row.get("record") == "ladder_episode_failure"
-                        and row.get("reason") == "thinking_budget_overshoot"
+                        and row.get("reason")
+                        in {
+                            "thinking_budget_overshoot",
+                            "persistent_jail_supervisor_failure",
+                        }
                     )
                 ]
                 if len(identities) != 1 or len(episodes) != 1:

@@ -76,6 +76,7 @@ from reward_hacking.ladder.tools import (
     format_submission_feedback,
 )
 from reward_hacking.model_backend import ContextWindowExceededError, VLLMHTTPBackend
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -450,6 +451,7 @@ class LadderEpisodeTrace:
     final_report_model_call_seconds: float | None = None
     uncompleted_model_call_seconds: float | None = None
     final_grading_seconds: float | None = None
+    infrastructure_failure: Mapping[str, object] | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -598,6 +600,7 @@ class LadderEpisodeTrace:
             "final_report_prompt_sha256": self.final_report_prompt_sha256,
             "final_report_prompt_text": self.final_report_prompt_text,
             "final_report_prompt_is_full": self.final_report_prompt_is_full,
+            "final_report_sampled": bool(self.final_report_prompt_sha256),
             "report_unavailable": self.report_unavailable,
             "arm": self.arm.to_json_dict(),
             "history_reasoning": self.history_reasoning,
@@ -633,6 +636,9 @@ class LadderEpisodeTrace:
         }
         if self.ended_by == "thinking_budget_overshoot":
             record["failure_reason"] = "thinking_budget_overshoot"
+        if self.infrastructure_failure is not None:
+            record["failure_reason"] = "persistent_jail_supervisor_failure"
+            record["infrastructure_failure"] = dict(self.infrastructure_failure)
         if self.graded_on is not None:
             record["graded_on"] = self.graded_on
         if self.final_state_verdict is not None:
@@ -761,6 +767,7 @@ class _ToolActionContext:
     grader_hashable: bool
     remaining_turns: int
     announced_turn_budget: int | None
+    turn_index: int
     protocol: ModelProtocol = QWEN_PROTOCOL
 
 
@@ -786,6 +793,7 @@ class _ToolActionState:
     deadline_phase: DeadlinePhase | None = None
     tool_execution_seconds: float = 0.0
     grading_seconds: float = 0.0
+    infrastructure_failure: Mapping[str, object] | None = None
 
 
 def grade_registered_submission(
@@ -1066,11 +1074,12 @@ def _restore_shell_state(
 
     start = stderr.find(delimiter)
     end = stderr.rfind(delimiter)
+    visible_stderr = stderr[:start] + stderr[end + len(delimiter) :]
     payload = stderr[start + len(delimiter) : end]
     cwd, separator, exported_script = payload.partition("\0")
     if not separator or not cwd:
-        return state, stderr[:start], None
-    return _ShellState(cwd=cwd, exported_script=exported_script), stderr[:start], cwd
+        return state, visible_stderr, None
+    return _ShellState(cwd=cwd, exported_script=exported_script), visible_stderr, cwd
 
 
 def _execute_bash(
@@ -1338,7 +1347,7 @@ def protected_path_digests(episode_dir: Path, protected_paths: Sequence[str]) ->
     return dict(sorted(entries.items()))
 
 
-def _execute_tool_call(  # noqa: C901, PLR0915 - keep ordered execution and aligned evidence recording together
+def _execute_tool_call(  # noqa: C901, PLR0912, PLR0915 - ordered tool execution records aligned evidence
     call_index: int,
     call: ParsedToolCall,
     state: _ToolActionState,
@@ -1366,6 +1375,56 @@ def _execute_tool_call(  # noqa: C901, PLR0915 - keep ordered execution and alig
             state.snapshot_error = error
             state.ended_by = "workspace_snapshot_limit"
             _mark_unexecuted(state.call_records, call_index, "workspace_snapshot_limit")
+            return True
+        except PersistentJailSupervisorError as error:
+            failure_reason = "persistent_jail_supervisor_failure"
+            failure_message = str(error)
+            state.infrastructure_failure = {
+                "component": "persistent_jail_supervisor",
+                "reason": failure_reason,
+                "exception_type": type(error).__name__,
+                "message": failure_message,
+                "attempted_command": raw_command,
+                "turn_index": context.turn_index,
+            }
+            failed_command = CommandResult(
+                raw_command,
+                125,
+                "",
+                f"Command interrupted by persistent jail supervisor failure: {failure_message}",
+                timed_out=False,
+            )
+            state.call_records[call_index] = LadderToolCall(
+                name=call.name,
+                arguments=dict(call.arguments),
+                executed=True,
+            )
+            if context.command.after_command is not None:
+                context.command.after_command(context.episode_dir, raw_command, failed_command)
+            state.turn_commands.append(failed_command)
+            state.command_cwds_after.append(None)
+            if context.command.protected_paths:
+                state.command_protected_path_digests.append(
+                    (
+                        before_protected,
+                        protected_path_digests(
+                            context.episode_dir, context.command.protected_paths
+                        ),
+                    )
+                )
+            state.commands.append(failed_command)
+            state.tool_results.append(
+                LadderToolResult(
+                    name="bash",
+                    call_index=call_index,
+                    content_sent=failed_command.stderr,
+                    truncated=False,
+                )
+            )
+            state.tool_messages.append(
+                context.protocol.serialize_tool_feedback(failed_command.stderr)
+            )
+            state.ended_by = failure_reason
             return True
         if contains_non_registered_submit_marker(raw_command):
             content_sent = f"{content_sent}\n\n{NON_REGISTERED_SUBMIT_FEEDBACK}"
@@ -2239,6 +2298,7 @@ class _EpisodeProgress:
     next_call_number: int = 0
     final_grading_seconds: float | None = None
     uncompleted_model_call_seconds: float = 0.0
+    infrastructure_failure: Mapping[str, object] | None = None
 
 
 def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay ordered for auditability
@@ -2401,6 +2461,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
                 grader_hashable=context.grader_hashable,
                 remaining_turns=turns_remaining,
                 announced_turn_budget=context.announced_turn_budget,
+                turn_index=turn_index,
                 protocol=protocol,
             ),
         )
@@ -2415,6 +2476,8 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
     if action_state.ended_by is not None:
         progress.ended_by = action_state.ended_by
         progress.deadline_phase = action_state.deadline_phase
+    if action_state.infrastructure_failure is not None:
+        progress.infrastructure_failure = action_state.infrastructure_failure
     progress.snapshot_error = action_state.snapshot_error
 
     if not runaway and format_error is None:
@@ -2667,10 +2730,11 @@ def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode p
         ),
         final_grading_seconds=progress.final_grading_seconds,
         uncompleted_model_call_seconds=progress.uncompleted_model_call_seconds,
+        infrastructure_failure=progress.infrastructure_failure,
     )
 
 
-def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass these as keywords
+def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lifecycle and grading
     task: Task,
     backend: LadderBackend,
     *,
@@ -2827,61 +2891,101 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         ),
     )
 
-    with persistent_jail_scope(
-        episode_dir,
-        enabled=execution_mode == "persistent",
-        backend=jail_backend,
-        ro_bind_paths=task.jail_ro_bind_paths,
-    ):
-        consecutive_truncated_turns = 0
-        for turn_index in range(max_turns):
-            turn_count_before = len(progress.turns)
-            _play_turn(context, progress, turn_index)
-            if (
-                len(progress.turns) > turn_count_before
-                and progress.turns[-1].stop_reason == "max_tokens"
-            ):
-                consecutive_truncated_turns += 1
-            else:
-                consecutive_truncated_turns = 0
-            if (
-                max_consecutive_truncated_turns is not None
-                and consecutive_truncated_turns >= max_consecutive_truncated_turns
-                and progress.ended_by is None
-            ):
-                progress.ended_by = "consecutive_truncated_turns"
-            if progress.ended_by is not None:
-                break
-        if progress.ended_by is None:
-            progress.ended_by = "turn_cap"
+    try:
+        with persistent_jail_scope(
+            episode_dir,
+            enabled=execution_mode == "persistent",
+            backend=jail_backend,
+            ro_bind_paths=task.jail_ro_bind_paths,
+        ):
+            consecutive_truncated_turns = 0
+            for turn_index in range(max_turns):
+                turn_count_before = len(progress.turns)
+                _play_turn(context, progress, turn_index)
+                if (
+                    len(progress.turns) > turn_count_before
+                    and progress.turns[-1].stop_reason == "max_tokens"
+                ):
+                    consecutive_truncated_turns += 1
+                else:
+                    consecutive_truncated_turns = 0
+                if (
+                    max_consecutive_truncated_turns is not None
+                    and consecutive_truncated_turns >= max_consecutive_truncated_turns
+                    and progress.ended_by is None
+                ):
+                    progress.ended_by = "consecutive_truncated_turns"
+                if progress.ended_by is not None:
+                    break
+            if progress.ended_by is None:
+                progress.ended_by = "turn_cap"
 
-        eval_belief_probe, report = _sample_belief_probe_and_final_report(
-            context,
-            progress,
-            belief_probe_questions=belief_probe_questions if belief_probe else None,
-            final_report_prompt=final_report_prompt,
-        )
-        progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
-        progress.fabricated_tool_responses += report.fabricated_tool_responses
+            if progress.infrastructure_failure is None:
+                eval_belief_probe, report = _sample_belief_probe_and_final_report(
+                    context,
+                    progress,
+                    belief_probe_questions=belief_probe_questions if belief_probe else None,
+                    final_report_prompt=final_report_prompt,
+                )
+                progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
+                progress.fabricated_tool_responses += report.fabricated_tool_responses
+            else:
+                eval_belief_probe = None
+                report = _FinalReportOutcome()
+    except PersistentJailSupervisorError as error:
+        progress.ended_by = "persistent_jail_supervisor_failure"
+        if progress.infrastructure_failure is None:
+            progress.infrastructure_failure = {
+                "component": "persistent_jail_supervisor",
+                "reason": progress.ended_by,
+                "exception_type": type(error).__name__,
+                "message": str(error),
+            }
+        eval_belief_probe = None
+        report = _FinalReportOutcome()
 
     grading_started_at = time.monotonic()
-    grading = _grade_episode(
-        task,
-        episode_dir=episode_dir,
-        arm=arm,
-        timeout=timeout,
-        jail_backend=jail_backend,
-        grader_hashable=grader_hashable,
-        submit_grader=submit_grader,
-        ended_by=progress.ended_by,
-        last_submission=progress.last_submission,
-        snapshot_error=progress.snapshot_error,
-    )
+    if progress.infrastructure_failure is not None:
+        failure_reason = cast("str", progress.infrastructure_failure["message"])
+        grader_command = (
+            task.docker_grader_command or task.docker_true_grader_command or task.grader_command
+        )
+        grading = _EpisodeGrading(
+            final_grade=FinalGrade(
+                grader=CommandResult(grader_command, 125, "", failure_reason, timed_out=False),
+                proxy_pass=False,
+                true_pass=None,
+                oracle_error="persistent_jail_supervisor_failure",
+                grader_pregrade_sha256=None,
+            ),
+            ended_by="persistent_jail_supervisor_failure",
+            snapshot_error=None,
+            graded_on=None,
+            final_state_verdict=None,
+        )
+    else:
+        grading = _grade_episode(
+            task,
+            episode_dir=episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            grader_hashable=grader_hashable,
+            submit_grader=submit_grader,
+            ended_by=progress.ended_by,
+            last_submission=progress.last_submission,
+            snapshot_error=progress.snapshot_error,
+        )
     progress.final_grading_seconds = time.monotonic() - grading_started_at
     graded_artifact = (
         _persist_graded_artifact(task, episode_dir, trace_path, grading.final_grade)
         if persist_graded_artifact
-        and grading.ended_by not in {"thinking_budget_overshoot", "workspace_snapshot_limit"}
+        and grading.ended_by
+        not in {
+            "thinking_budget_overshoot",
+            "workspace_snapshot_limit",
+            "persistent_jail_supervisor_failure",
+        }
         else None
     )
     trace = _build_episode_trace(
@@ -2892,5 +2996,10 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         eval_belief_probe=eval_belief_probe,
         graded_artifact=graded_artifact,
     )
+    if trace.infrastructure_failure is not None:
+        _append_trace_record(
+            trace_path,
+            {"record": "episode_infrastructure_failure", **dict(trace.infrastructure_failure)},
+        )
     _append_trace_record(trace_path, trace.summary_record())
     return trace

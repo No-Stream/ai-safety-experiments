@@ -184,6 +184,13 @@ def test_fit_gate_uses_capture_renderer_and_cooperation_seq_len_derivation(
 
 
 def gate_payload() -> dict[str, Any]:
+    tokenizer_identity = {
+        "name": "Qwen/base",
+        "revision": "source-commit",
+        "vocab_size": 2,
+        "vocab": {"alpha": 0, "beta": 1},
+        "special_tokens": {"eos_token": "<eos>"},
+    }
     return {
         "passed": True,
         "jlens": {"commit": "581d398abc"},
@@ -191,6 +198,7 @@ def gate_payload() -> dict[str, Any]:
             "weights_identity": "hf:base-commit",
             "resolved_weights_identity": "hf:base-commit",
             "tokenizer_content_sha256": "tokenizer-content",
+            "tokenizer_identity": tokenizer_identity,
         },
         "max_seq_len": 128,
         "cooperation_fit_corpus": {
@@ -199,6 +207,7 @@ def gate_payload() -> dict[str, Any]:
             "stimulus_render": "templated_here",
             "enable_thinking": True,
             "tokenizer_content_sha256": "tokenizer-content",
+            "tokenizer_identity": tokenizer_identity,
         },
         "deltanet_kernels_bound": {"chunk": "fused"},
         "gates_requested": ["autograd", "kernel", "sweep", "resume"],
@@ -222,7 +231,7 @@ def bind(payload: dict[str, Any]) -> dict[str, Any]:
     return cooperation_lens.validate_gradient_gate_binding(
         payload,
         base_weights_identity="hf:base-commit",
-        tokenizer_content_identity="tokenizer-content",
+        tokenizer_identity=payload["model"]["tokenizer_identity"],
         comparison_reference_identity="hf:base-commit",
         fit_stimuli_sha256="fit-stimuli",
         fit_rendered_sha256="fit-prompt",

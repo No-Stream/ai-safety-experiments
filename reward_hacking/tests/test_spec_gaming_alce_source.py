@@ -116,7 +116,9 @@ def _write_alce_fixture(
         "private_task_id_sha256": task_id,
         "source_sample_id": sample_id,
         "source_question_component_id": component_id,
+        "question": source_row["question"],
         "question_sha256": _sha256(source_row["question"].encode()),
+        "ordered_document_ids": [document["id"] for document in source_docs],
         "ordered_document_ids_sha256": ordered_document_ids_sha256,
         "qa_pair_count": len(source_qa_pairs),
         "partition": partition,
@@ -194,8 +196,6 @@ def _write_alce_fixture(
     return _SourceContract(
         source_code_revision=ALCE_CODE_REVISION,
         source_data_revision="d" * 40,
-        source_archive_sha256=_sha256(archive_bytes),
-        source_member_sha256=_sha256(source_bytes),
         source_question_count=1,
         selected_task_count=1,
     )
@@ -235,6 +235,48 @@ def test_loader_binds_ordered_actor_assets_and_holdout_metadata(
     terms = task.source_identity["terms"]
     assert isinstance(terms, dict)
     assert terms["public_redistribution_approved"] is False
+
+
+def test_loader_uses_readable_source_fields_instead_of_frozen_digests(
+    source_fixture: tuple[Path, _SourceContract],
+) -> None:
+    source_root, contract = source_fixture
+    source_file = source_root / "source" / "ALCE-data" / "asqa_eval_gtr_top100.json"
+    source_rows = json.loads(source_file.read_text())
+    source_file.write_text(json.dumps(source_rows, indent=2))
+
+    selection_path = source_root / "selected-eight-manifest.json"
+    selection = json.loads(selection_path.read_text())
+    selection["source_archive_sha256"] = "stale-archive-digest"
+    selection["source_member_sha256"] = "stale-member-digest"
+    selection["selected_tasks"][0]["question_sha256"] = "stale-question-digest"
+    selection["selected_tasks"][0]["ordered_document_ids_sha256"] = "stale-order-digest"
+    selection_path.write_text(json.dumps(selection))
+
+    partition_path = source_root / "grouped-partition.json"
+    partition = json.loads(partition_path.read_text())
+    partition["source_member_sha256"] = "stale-member-digest"
+    partition_path.write_text(json.dumps(partition))
+
+    tasks = _load_alce_tasks(source_root, contract)
+
+    assert tasks[0].question == "What is the synthetic answer?"
+    assert tasks[0].source_identity["ordered_document_ids"] == [
+        f"source-document-{rank}" for rank in range(1, 101)
+    ]
+
+
+def test_loader_names_a_changed_ordered_document_id_field(
+    source_fixture: tuple[Path, _SourceContract],
+) -> None:
+    source_root, contract = source_fixture
+    selection_path = source_root / "selected-eight-manifest.json"
+    selection = json.loads(selection_path.read_text())
+    selection["selected_tasks"][0]["ordered_document_ids"][0] = "changed-document-id"
+    selection_path.write_text(json.dumps(selection))
+
+    with pytest.raises(ValueError, match="ordered_document_ids"):
+        _load_alce_tasks(source_root, contract)
 
 
 def test_loader_rejects_selected_task_from_reserved_partition(
@@ -314,14 +356,29 @@ def test_loader_rejects_host_qa_mismatch(
         _load_alce_tasks(source_root, contract)
 
 
-def test_loader_rejects_source_member_digest_mismatch(
+def test_loader_accepts_harmless_source_json_reformatting(
     source_fixture: tuple[Path, _SourceContract],
 ) -> None:
     source_root, contract = source_fixture
     source_path = source_root / "source" / "ALCE-data" / "asqa_eval_gtr_top100.json"
-    source_path.write_text(source_path.read_text() + " ")
+    source_rows = json.loads(source_path.read_text())
+    source_path.write_text(json.dumps(source_rows, indent=2) + "\n")
 
-    with pytest.raises(ValueError, match="member hash"):
+    tasks = _load_alce_tasks(source_root, contract)
+
+    assert tasks[0].question == "What is the synthetic answer?"
+
+
+def test_loader_rejects_changed_source_question_by_name(
+    source_fixture: tuple[Path, _SourceContract],
+) -> None:
+    source_root, contract = source_fixture
+    source_path = source_root / "source" / "ALCE-data" / "asqa_eval_gtr_top100.json"
+    source_rows = json.loads(source_path.read_text())
+    source_rows[0]["question"] = "A different synthetic question?"
+    source_path.write_text(json.dumps(source_rows))
+
+    with pytest.raises(ValueError, match="question differs"):
         _load_alce_tasks(source_root, contract)
 
 

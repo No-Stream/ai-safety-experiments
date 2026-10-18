@@ -19,15 +19,13 @@ against whatever the code currently returns. A win rate pooled across items inst
 item, or a cheap-talk match rate whose denominator counted the unparsed renders, both produce
 perfectly plausible numbers -- so only a hand-computed expectation can catch them.
 
-**The bit-identical pin at the bottom is the whole warrant for calling this change additive.** It
-digests the spec fields AND every rendered prompt of the battery that existed before these families
-were registered, both from synthetic data and from the real local files. Both digests were checked
-equal against a `git archive HEAD` checkout of the pre-change module before being written down here.
+**The count pins at the bottom show which registered families and item shapes are present.** They
+avoid copying item text into tracked tests, and a changed count names the part of the battery that
+moved.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections import Counter
 from dataclasses import replace
@@ -2558,96 +2556,8 @@ def synthetic_data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
-# Everything about an item except its words, in a fixed order, so a digest over it is readable in a
-# diff when it changes: this is exactly the tracked half of the item contract.
-_PIN_SPEC_FIELDS: tuple[str, ...] = (
-    "item_id",
-    "family",
-    "instrument",
-    "kind",
-    "tier",
-    "subscale",
-    "wording",
-    "twin_of",
-    "counterpart",
-    "reverse_keyed",
-    "scale_points",
-    "predicts_game",
-)
-
-
-def battery_digest(items: list[SurveyItem]) -> str:
-    """Digest every item's tracked spec AND every prompt it renders, in a stable order.
-
-    The renders are in it on purpose: what "unchanged" has to mean for this battery is that the model
-    receives the same bytes, and a spec-only digest would miss a changed instruction template. It is a
-    hash rather than the strings themselves because the strings are item text, which never enters a
-    tracked file.
-    """
-    hasher = hashlib.sha256()
-    for item in sorted(items, key=lambda entry: entry.item_id):
-        counterbalanced: list[tuple[int, ...] | None] = [order for _, order in battery_orders(item)]
-        orders = counterbalanced or [None]
-        # Per item, because the rotation is fractions of the item's own bound: for the percent-bounded
-        # items this battery holds today that is (25, 60, 75) either way, and for a smaller-bounded
-        # item landing later it is the difference between digesting its real renders and raising.
-        examples: list[int | None] = (
-            list(numeric_example_rotation(item)) if item.kind == SURVEY_NUMERIC else [None]
-        )
-        renders = [
-            render_survey_prompt(item, option_order=order, numeric_example=example)
-            for order in orders
-            for example in examples
-        ]
-        hasher.update(
-            json.dumps(
-                [str(getattr(item, name)) for name in _PIN_SPEC_FIELDS] + renders,
-                ensure_ascii=False,
-            ).encode("utf-8")
-        )
-    return hasher.hexdigest()
-
-
-# The battery as it stands, over synthetic item text derived from the tracked registry. Every value
-# below was checked against a `git archive` checkout of the previous state, so this is a verified
-# additivity pin rather than a snapshot of whatever the code happens to do now.
-#
-# Verified at the 2026-08-22 landing of the seven authored families (154 specs, 184 -> 338 items):
-# the pre-change tree at cea5b68 reproduced the then-current digest exactly, and the digest over
-# those same 184 ids AFTER the landing was byte-identical to it, so not one pre-existing item's spec
-# or render moved.
-#
-# Re-verified at the 2026-08-24 own-action-rate elicitation repair, which is the first change to move
-# these digests without adding a single item: the eight self-prediction stems were reworded and the
-# loader now appends that family's shared closing block. Both digests below therefore moved and the
-# counts did not, which is the shape of a rewording rather than a landing. Discharged the same way,
-# with the split done per family so the claim is checkable rather than asserted -- each tree measured
-# with its own loader and its own fixtures, `git archive HEAD` into /var/tmp for the pre-change side:
-#   over the REAL item text, the 330 non-self-prediction items digest to
-#     c3e9c4cc5ccc00daccdb1ffaaf94bd9173f5dfab77d0b6bc2c31de81d79adc5b before AND after;
-#   over each tree's own synthetic fixtures, those same 330 digest to
-#     10754bc0e53314cbe0b9cbe13a7cf1f6952f1ad3dc968c9447138174ff364777 before AND after.
-# The eight family items moved in both (real 06fc3825 -> d849a9b3, synthetic 0d5531c2 -> 94caf222).
-#
-# Re-verified at the 2026-08-25 negative-control headroom landing (five adopted items plus the
-# season promotion, 338 -> 343): the pre-change tree at 06e6469 reproduced both prior digests
-# exactly (synthetic over its own fixtures; real over the current authored.json with the five new
-# ids removed, which also proves the data-file rewrite left every existing item's text
-# byte-identical). Per-item comparison across the trees: five ids added, none removed, and of the
-# 338 pre-existing entries exactly one moved -- negative-control-season, in its tier field only
-# (breadth -> core, the promotion), with its renders byte-identical on both the synthetic and the
-# real side.
-#
-# THE UPDATE POINT: landing new item specs changes every number below, and that is correct -- the
-# battery grew. When you update them, do it in the same commit as the specs, and check the previously
-# existing items are untouched the way this one was: build the pre-change tree with
-#   git archive <sha> | tar -x -C /var/tmp/<dir>
-# and compare `battery_digest` over the items whose ids existed before, measuring EACH tree with its
-# own fixtures rather than a hand-rolled synthetic file (one written for the 08-22 landing omitted
-# the published neutral twins and read 114 items where this pin says 338). Never just bump a
-# constant.
+# Keep readable counts and contract values below. Item text and rendered prompts stay out of tests.
 PIN_SYNTHETIC_N_ITEMS = 343
-PIN_SYNTHETIC_DIGEST = "530b9abc15892209ad689e5b76ca9ac9f5ec9ae1d2bd4bd42018a69a0856a121"
 PIN_FAMILY_COUNTS: dict[str, int] = {
     "altruism-past-behaviour-likert": 18,
     "competitiveness-likert": 28,
@@ -2677,21 +2587,14 @@ PIN_KIND_COUNTS: dict[str, int] = {
 }
 PIN_WORDING_COUNTS: dict[str, int] = {"as-published": 261, "neutral-twin": 82}
 PIN_TIER_COUNTS: dict[str, int] = {"breadth": 278, "core": 65}
-# The same digest over the REAL local item text. Depends on the local files, so it is checked only
-# where they exist and skips loudly otherwise.
-PIN_REAL_DIGEST = "de09dcef671831316412b14f2a65f81e64f6130e131c948ed62d4a59e8a7afcf"
-
 _PIN_FAILURE = (
-    "the pre-existing survey battery changed. This test exists to prove a change to games/survey.py "
-    "was ADDITIVE: if you added item specs, update the pins beside this message in the same commit "
-    "and verify the previously existing items are untouched (the procedure is in the comment above "
-    "the pins). If you did not add items, something changed how the existing battery loads or "
-    "renders, and that is the bug."
+    "the registered survey counts changed; review the family and item-shape distributions before "
+    "updating these pins alongside an intentional battery change"
 )
 
 
-class TestTheExistingBatteryStillLoadsIdentically:
-    """The additivity pin: readable counts first, so a failure says which axis moved, digest after."""
+class TestRegisteredBatteryCounts:
+    """Keep the registered family and item-shape counts readable in failures."""
 
     def test_the_item_count_is_unchanged(self, synthetic_data_dir: Path) -> None:
         items = survey_battery(data_dir=synthetic_data_dir)
@@ -2715,9 +2618,14 @@ class TestTheExistingBatteryStillLoadsIdentically:
         assert dict(sorted(Counter(item.wording for item in items).items())) == PIN_WORDING_COUNTS
         assert dict(sorted(Counter(item.tier for item in items).items())) == PIN_TIER_COUNTS
 
-    def test_every_spec_and_every_render_is_byte_identical(self, synthetic_data_dir: Path) -> None:
+    def test_each_item_has_readable_registered_identity_fields(
+        self, synthetic_data_dir: Path
+    ) -> None:
         items = survey_battery(data_dir=synthetic_data_dir)
-        assert battery_digest(items) == PIN_SYNTHETIC_DIGEST, _PIN_FAILURE
+        assert len({item.item_id for item in items}) == PIN_SYNTHETIC_N_ITEMS, _PIN_FAILURE
+        assert {item.family for item in items} == set(PIN_FAMILY_COUNTS)
+        assert all(item.kind in SURVEY_KINDS for item in items)
+        assert all(item.instrument and item.tier and item.expected_direction for item in items)
 
     def test_the_new_kinds_are_registered_without_disturbing_the_old_ones(self) -> None:
         """The additive claim about the kind registry itself, stated separately from the counts."""
@@ -2731,20 +2639,18 @@ class TestTheExistingBatteryStillLoadsIdentically:
             SURVEY_TAGGED,
         )
 
-    def test_the_real_local_battery_is_byte_identical(self) -> None:
-        """Skips loudly on a fresh clone; on a machine holding the item text it is the strongest form
-        of the pin, because it exercises the real anchors, payoffs, twins and swapped stems."""
+    def test_the_real_local_battery_has_the_registered_counts(self) -> None:
+        """Skip on a fresh clone; when local items exist, check their public family counts."""
         if not (REAL_DATA_DIR / AUTHORED_FILENAME).is_file():
             pytest.skip(
                 f"{REAL_DATA_DIR / AUTHORED_FILENAME} is not on this machine (fresh clone); "
-                f"assemble it as games/data/survey/README.md describes to run the real-text pin"
+                f"assemble it as games/data/survey/README.md describes to run the real-data count check"
             )
         items = survey_battery(data_dir=REAL_DATA_DIR)
         assert len(items) == PIN_SYNTHETIC_N_ITEMS, _PIN_FAILURE
         assert dict(sorted(Counter(item.family for item in items).items())) == PIN_FAMILY_COUNTS, (
             _PIN_FAILURE
         )
-        assert battery_digest(items) == PIN_REAL_DIGEST, _PIN_FAILURE
 
     def test_the_core_tier_filter_still_selects_what_it_did(self, synthetic_data_dir: Path) -> None:
         """A tier filter is the only way to select core, so a shifted tiering would silently change

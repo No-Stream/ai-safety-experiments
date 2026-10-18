@@ -36,16 +36,18 @@ logged here so they are not reopened:
   substring of the trace (``evidence_not_found`` marks a row whose quote is not). An off-schema value
   is an errored row, never coerced -- the one errored hatch-judge row was an enum level the schema
   forgot, and a test asserts the rubric describes every level the parser accepts. A row resumes only
-  when it was judged under this rubric version AND this scaffold digest (the hash of every fixed
-  string in the prompt) AND over this completion's digest; anything else is re-judged on relaunch and
-  never read as the current schema, so rows from two wordings of the prompt can never pool.
+  when it was judged under this rubric version and the stored named prompt sections and exact
+  completion text match; anything else is re-judged on relaunch and never read as the current schema.
+  Legacy rows without those readable fields are checked through their recorded digests until they are
+  re-judged.
 - **The deterministic keyword companion** (``keyword_basis``, the regexes of the 2026-08-28 scratch
   screen) runs on every record and is reported as an agreement rate plus a disagreement listing --
   never merged into the judge's answer. The precedent agreement was 0.412 and was reported, not
   reconciled; disagreement is an instrument finding.
 - **A judge label is data with provenance**: every row stores the raw reply, the parsed verdict, token
-  usage, stop reason, latency telemetry, the rubric version and digest, the judge model id and the
-  completion's digest. Rows append per chunk under ``artifacts/games/trace_judge/<run>/`` (guarded by
+  usage, stop reason, latency telemetry, the rubric version and named prompt sections, judge model id,
+  exact completion text and its recorded digest. Rows append per chunk under
+  ``artifacts/games/trace_judge/<run>/`` (guarded by
   :func:`~reward_hacking.trace.refuse_tracked_trace_path`), so a crashed run keeps its spend and a
   relaunch resumes by record key, counting resumed rows apart from skipped ones.
 - **Rates follow the wave-3 harnesses' conventions** (see ``games.trace_judge_rates``): shares keyed
@@ -134,6 +136,7 @@ from games.trace_judge_schema import (
     keyword_basis,
     parse_judge_reply,
     rubric_digest,
+    rubric_sections,
 )
 from reward_hacking.hatch_narration_judge import judge_telemetry
 from reward_hacking.model_backend import (
@@ -187,7 +190,7 @@ def judge_prompt(record: TraceRecord) -> str:
 
     Deliberately carries nothing else -- no arm, cell, step, framing, prompt id, game id or flag -- so
     the judge cannot key on the experimental cell (the module docstring's blindness rationale). Every
-    fixed string comes from the schema module's templates, which is what ``rubric_digest`` hashes.
+    fixed string comes from the schema module's named prompt sections.
     """
     return JUDGE_PROMPT_TEMPLATE.format(
         instructions=JUDGE_INSTRUCTIONS,
@@ -234,10 +237,11 @@ def _row_for(
         {
             "completion_sha256": record.completion_sha256,
             "completion_chars": len(record.completion),
+            "completion_text": record.completion,
             "keyword_basis": keyword_basis(record.completion),
             "judge_model_id": judge_model_id,
             "rubric_version": RUBRIC_VERSION,
-            "rubric_digest": rubric_digest(),
+            "rubric_sections": rubric_sections(),
             "judge_stop_reason": completion.stop_reason,
             "judge_input_tokens": completion.usage.input_tokens,
             "judge_output_tokens": completion.usage.output_tokens,
@@ -337,12 +341,16 @@ def _replace_file_with_lines(path: Path, lines: Iterable[str]) -> None:
     temp.replace(path)
 
 
+def _completion_matches(row: Mapping[str, Any], record: TraceRecord) -> bool:
+    """Compare stored completion text, falling back to a digest only for older rows without text."""
+    if "completion_text" in row:
+        return row["completion_text"] == record.completion
+    return row.get("completion_sha256") == record.completion_sha256
+
+
 def _resumable(row: Mapping[str, Any], record: TraceRecord) -> bool:
-    """Whether a stored row answers this scaffold's question about THIS record's completion."""
-    return (
-        judged_under_current_scaffold(row)
-        and row.get("completion_sha256") == record.completion_sha256
-    )
+    """Whether a stored verdict matches this readable rubric and completion text."""
+    return judged_under_current_scaffold(row) and _completion_matches(row, record)
 
 
 def judge_records(  # noqa: PLR0913 - trailing keyword-only knobs, each a seam
@@ -357,10 +365,12 @@ def judge_records(  # noqa: PLR0913 - trailing keyword-only knobs, each a seam
     """Judge every judgeable record not already judged, appending rows per chunk; return counts.
 
     Resume is by record key against ``out_path``: a row resumes (``already_judged``) only when its
-    verdict parsed under THIS rubric version and THIS scaffold digest, over THIS completion's digest.
-    A row under another version or digest is re-judged as ``rejudged_stale_rubric``; a row whose stored
-    completion digest differs from the record's is re-judged as ``rejudged_changed_completion`` (the
-    tree under the key changed); ``skipped_empty`` records have no text to judge. ``attempted`` is the
+    verdict parsed under THIS rubric version and named prompt sections, over THIS completion's text.
+    A row under another version or section set is re-judged as ``rejudged_stale_rubric``; a row whose
+    stored completion text differs from the record's is re-judged as
+    ``rejudged_changed_completion`` (the tree under the key changed). Older rows without readable
+    fields use their stored digests until re-judged; ``skipped_empty`` records have no text to judge.
+    ``attempted`` is the
     number of records this pass sent to the judge (the rates' ``judged`` means something else: records
     with a verdict). Rows that errored are retried once at the end of the pass (a fresh call, appended
     last so last-wins loading sees the retry). Within a pass the backend's queue is kept full across
@@ -375,9 +385,7 @@ def judge_records(  # noqa: PLR0913 - trailing keyword-only knobs, each a seam
     done = {r.key for r in records if r.key in existing and _resumable(existing[r.key], r)}
     pending = [r for r in records if r.judgeable and r.key not in done]
     with_verdict = [r for r in pending if "verdict" in existing.get(r.key, {})]
-    changed_completion = [
-        r for r in with_verdict if existing[r.key].get("completion_sha256") != r.completion_sha256
-    ]
+    changed_completion = [r for r in with_verdict if not _completion_matches(existing[r.key], r)]
     counts = {
         "records": len(records),
         "skipped_empty": sum(1 for r in records if not r.judgeable),
@@ -473,7 +481,7 @@ def write_census(path: Path, records: Iterable[TraceRecord]) -> None:
 
 
 def restrict_to_handles(records: Sequence[TraceRecord], handles: set[Handle]) -> list[TraceRecord]:
-    """Keep the records whose (prompt_id, sample_index, digest) handle is in the set, in load order."""
+    """Keep the records whose (step, prompt_id, sample_index) handle is in the set, in load order."""
     return [record for record in records if record.handle in handles]
 
 

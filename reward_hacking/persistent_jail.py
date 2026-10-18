@@ -31,6 +31,11 @@ if TYPE_CHECKING:
     from pathlib import Path
     from types import TracebackType
 
+
+class PersistentJailSupervisorError(RuntimeError):
+    """The episode's persistent jail supervisor exited before completing its protocol."""
+
+
 # This source executes through an isolated, read-only interpreter, never from writable /work.
 _SUPERVISOR_SOURCE = r"""
 import base64
@@ -75,8 +80,19 @@ def cleanup():
         time.sleep(0.005)
 
 def execute(request):
+    launcher_source = (
+        "import os, sys\n"
+        "try:\n"
+        " with open('/proc/self/oom_score_adj', 'w', encoding='ascii') as score:\n"
+        "  score.write('1000')\n"
+        "except OSError as error:\n"
+        " os.write(2, f'resource-limits: could not set command oom_score_adj=1000: {error}\\n'.encode())\n"
+        " raise SystemExit(125) from error\n"
+        "os.execv(sys.argv[1], sys.argv[1:])\n"
+    )
     process = subprocess.Popen(
-        ['/bin/bash', '-lc' if request['login_shell'] else '-c', request['command']],
+        [sys.executable, '-I', '-c', launcher_source,
+         '/bin/bash', '-lc' if request['login_shell'] else '-c', request['command']],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd='/work', env=environment, close_fds=True, start_new_session=True,
     )
@@ -114,6 +130,14 @@ def execute(request):
                 process.wait()
             cleanup()
     exit_code = 128 - process.returncode if process.returncode < 0 else process.returncode
+    if exit_code == 137 and not timed_out:
+        oom_note = (
+            b"\n[command exited 137 (SIGKILL or cgroup OOM); episode supervisor remains available]"
+        )
+        if len(captured[1]) + len(oom_note) > maximum:
+            captured[1] = captured[1][:maximum - len(oom_note)]
+            truncated = True
+        captured[1].extend(oom_note)
     return dict(exit_code=124 if timed_out else exit_code,
                 stdout=base64.b64encode(captured[0]).decode('ascii'),
                 stderr=base64.b64encode(captured[1]).decode('ascii'),
@@ -138,6 +162,11 @@ def _seconds(duration: str) -> float:
     return seconds
 
 
+def _append_optional_resource_limit(argv: list[str], option: str, value: str | None) -> None:
+    if value is not None:
+        argv.extend((option, value))
+
+
 class PersistentJail:
     """Lazily start an episode jail; context exit tears it down even after caller exceptions.
 
@@ -153,6 +182,7 @@ class PersistentJail:
         ro_bind_paths: tuple[Path, ...] = (),
         cpus: int | None = None,
         mem_max: str | None = None,
+        mem_swap_max: str | None = None,
         episode_seconds: float | None = 600,
         resource_limits: JailResourceLimits | None = None,
         stop_requested: threading.Event | None = None,
@@ -167,6 +197,7 @@ class PersistentJail:
         self.ro_bind_paths = ro_bind_paths
         self.cpus = cpus
         self.mem_max = mem_max
+        self.mem_swap_max = mem_swap_max
         self.episode_seconds = episode_seconds
         self.resource_limits = resource_limits
         self.stop_requested = stop_requested
@@ -197,14 +228,15 @@ class PersistentJail:
     def _start(self) -> None:
         limits = self.resource_limits or jailed_poc.current_jail_resource_limits()
         argv = [str(jailed_poc.RESOURCE_LIMITS)]
+        argv.append("--preserve-processes-on-oom")
         if self.episode_seconds is not None:
             argv += ["-t", f"{self.episode_seconds}s"]
         if limits.mode == "advisory":
             argv.append("--advisory")
         if self.cpus is not None:
             argv += ["--cpus", str(self.cpus)]
-        if self.mem_max is not None:
-            argv += ["--mem-max", self.mem_max]
+        _append_optional_resource_limit(argv, "--mem-max", self.mem_max)
+        _append_optional_resource_limit(argv, "--mem-swap-max", self.mem_swap_max)
         supervisor_source = _SUPERVISOR_SOURCE.encode()
         argv += [
             "--",
@@ -305,6 +337,11 @@ class PersistentJail:
                     written_bytes = os.write(process.stdin.fileno(), remaining_data)
                 except BlockingIOError:
                     continue
+                except BrokenPipeError as error:
+                    diagnostic = self._diagnostics.decode("utf-8", errors="replace")
+                    raise PersistentJailSupervisorError(
+                        f"persistent jail supervisor exited while receiving a request: {diagnostic}"
+                    ) from error
                 remaining_data = remaining_data[written_bytes:]
 
     def _read_response(self, seconds: float) -> dict[str, Any]:
@@ -325,7 +362,7 @@ class PersistentJail:
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if not chunk:
                     diagnostic = self._diagnostics.decode("utf-8", errors="replace")
-                    raise RuntimeError(
+                    raise PersistentJailSupervisorError(
                         f"persistent jail supervisor exited without a response: {diagnostic}"
                     )
                 self._buffer.extend(chunk)

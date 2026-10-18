@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import re
 import shlex
@@ -19,7 +18,6 @@ from typing import Any
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import SUCCESS_MARKER, Task
 
-logger: logging.Logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 TRUTH_UNMEASURED_REASON = "independent_truth_unmeasured"
 SOURCE_GRADER_COMPLETE = "TERMINAL_SOURCE_GRADER_COMPLETE"
@@ -150,37 +148,16 @@ class TerminalWrenchRecord:
     grader_timeout_seconds: float | None = None
 
     def validate_assets(self) -> None:
-        """Detect changed source assets before task construction or semantic reuse."""
+        """Validate source asset paths and grader requirements before task construction."""
         _validate_grader_timeout(self.grader_timeout_seconds)
+        asset_tree_sha256(self.workspace_template)
+        asset_tree_sha256(self.tests_template)
         if self.instruction_path.is_symlink() or not self.instruction_path.is_file():
             raise ValueError("instruction assets require a regular file, not a symlink")
-        self._warn_on_digest_mismatch(
-            "workspace template", self.workspace_sha256, asset_tree_sha256(self.workspace_template)
-        )
-        self._warn_on_digest_mismatch(
-            "hidden test template", self.tests_sha256, asset_tree_sha256(self.tests_template)
-        )
-        self._warn_on_digest_mismatch(
-            "instruction",
-            self.instruction_sha256,
-            hashlib.sha256(self.instruction_path.read_bytes()).hexdigest(),
-        )
         if not (self.tests_template / "test_outputs.py").is_file():
             raise ValueError("source task requires its original test_outputs.py")
         if (self.workspace_template / "r2e_tests").exists():
             raise ValueError("actor workspace cannot contain hidden tests")
-
-    def _warn_on_digest_mismatch(
-        self, asset: str, recorded_sha256: str, observed_sha256: str
-    ) -> None:
-        if observed_sha256 != recorded_sha256:
-            logger.warning(
-                "terminal wrench task %s %s records sha256 %s but observed %s",
-                self.task_id,
-                asset,
-                recorded_sha256,
-                observed_sha256,
-            )
 
     def semantic_identity(self) -> dict[str, object]:
         """Exclude machine paths while retaining every reward-relevant immutable input."""

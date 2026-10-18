@@ -162,6 +162,64 @@ class TestCooperationScreenPersistence:
         assert second.trace_path.read_bytes() == trace_before
         assert second.summary_path.read_bytes() == summary_before
 
+    def test_same_rows_with_different_jsonl_serialization_finish_the_screen(
+        self, tmp_path: Path, frozen_rows: list[Row]
+    ) -> None:
+        corpus_path = tmp_path / "training.jsonl"
+        output_dir = tmp_path / "screen"
+        _write_corpus(corpus_path, frozen_rows)
+        config = _config(corpus_path, output_dir)
+
+        class ReformattingBackend(ScriptedBackend):
+            reformatted = False
+
+            def generate(self, prompts: list[str]) -> list[str]:
+                responses = super().generate(prompts)
+                if not self.reformatted:
+                    corpus_path.write_text(
+                        "".join(
+                            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                            for row in frozen_rows
+                        ),
+                        encoding="utf-8",
+                    )
+                    self.reformatted = True
+                return responses
+
+        result = cooperation_screen.run_matching_screen(
+            ReformattingBackend(frozen_rows), config, model_weights_identity="test:base"
+        )
+
+        assert result.n_generated + result.n_resumed == len(frozen_rows)
+        assert json.loads(result.summary_path.read_text(encoding="utf-8"))["n_prompts"] == len(
+            frozen_rows
+        )
+
+    def test_screen_identity_keeps_prompt_rows_readable_and_checks_text_by_id(
+        self, tmp_path: Path, frozen_rows: list[Row]
+    ) -> None:
+        corpus_path = tmp_path / "training.jsonl"
+        output_dir = tmp_path / "screen"
+        _write_corpus(corpus_path, frozen_rows)
+        config = _config(corpus_path, output_dir)
+        backend = ScriptedBackend(frozen_rows, fail_after_calls=1)
+
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            cooperation_screen.run_matching_screen(
+                backend, config, model_weights_identity="test:base"
+            )
+
+        first_row = dict(frozen_rows[0])
+        first_row["prompt"] = f"{first_row['prompt']} synthetic edit"
+        _write_corpus(corpus_path, [first_row, *frozen_rows[1:]])
+
+        with pytest.raises(
+            ValueError, match=rf"prompt_rows_by_id.*{frozen_rows[0]['prompt_id']}.*prompt"
+        ):
+            cooperation_screen.run_matching_screen(
+                ScriptedBackend(frozen_rows), config, model_weights_identity="test:base"
+            )
+
     def test_crash_between_trace_and_summary_recovers_without_sampling(
         self, tmp_path: Path, frozen_rows: list[Row], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -210,7 +268,7 @@ class TestCooperationScreenPersistence:
             )
 
         changed = ScriptedBackend(frozen_rows)
-        with pytest.raises(ValueError, match="different sweep"):
+        with pytest.raises(ValueError, match=r"screen_identity.model_weights_identity"):
             cooperation_screen.run_matching_screen(
                 changed, config, model_weights_identity="test:changed"
             )

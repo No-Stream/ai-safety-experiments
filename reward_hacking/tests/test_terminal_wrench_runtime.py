@@ -84,14 +84,14 @@ def test_native_task_preserves_hidden_source_and_unknown_truth(runtime_registry:
 @pytest.mark.parametrize(
     "asset", ["workspace/input.csv", "tests/test_outputs.py", "instruction.md"]
 )
-def test_mutated_assets_are_logged_on_resume(
+def test_mutated_assets_are_not_warned_about_on_resume(
     runtime_registry: Path, asset: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     registry = load_terminal_wrench_registry(runtime_registry)
     (runtime_registry.parent / asset).write_text("changed\n")
     with caplog.at_level(logging.WARNING):
         registry.task("synthetic-task")
-    assert "records sha256" in caplog.text
+    assert "records sha256" not in caplog.text
 
 
 def test_runtime_refuses_asset_symlinks(runtime_registry: Path) -> None:

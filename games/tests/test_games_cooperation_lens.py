@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,12 +20,14 @@ from games.cooperation_lens import (
     prepare_accumulation_resume,
     shared_coordinate_payload,
     validate_base_model_revision,
+    validate_construct_capture,
     validate_gradient_gate,
     validate_gradient_gate_binding,
     validate_private_stimulus_path,
 )
 from games.interp_cells import Stimulus
-from games.tokenizer_identity import tokenizer_content_sha256
+from games.lora import adapter_config_identity
+from games.tokenizer_identity import tokenizer_content_sha256, tokenizer_identity_payload
 
 
 def stimuli(prefix: str, n_prompts: int, *, text_size: int = 24) -> list[Stimulus]:
@@ -115,59 +119,97 @@ class TestBaseRevisionContract:
         )
         assert smoke_plan.identity_sha256 != measurement_plan.identity_sha256
 
-    def test_fit_and_quality_scenario_groups_cannot_overlap(self) -> None:
-        fit = stimuli("fit", 50)
-        quality = stimuli("quality", 8)
-        quality[0] = replace(quality[0], metadata=fit[0].metadata)
-        quality[1] = replace(quality[1], metadata=fit[0].metadata)
-        with pytest.raises(ValueError, match="fit and quality scenario groups overlap"):
-            build_corpus_plan(
-                fit,
-                quality,
-                rendered_fit=rendered(fit),
-                rendered_quality=rendered(quality),
-                fit_token_ids=token_ids(fit),
-                quality_token_ids=token_ids(quality),
-                profile="measurement",
-                max_seq_len_ceiling=256,
-            )
 
-    def test_fit_and_quality_groups_cannot_overlap_training_or_evaluation(self) -> None:
-        fit = stimuli("fit", 50)
-        quality = stimuli("quality", 8)
-        with pytest.raises(ValueError, match="overlap reserved training/evaluation groups"):
-            build_corpus_plan(
-                fit,
-                quality,
-                rendered_fit=rendered(fit),
-                rendered_quality=rendered(quality),
-                fit_token_ids=token_ids(fit),
-                quality_token_ids=token_ids(quality),
-                profile="measurement",
-                max_seq_len_ceiling=256,
-                reserved_group_ids={str(fit[0].metadata["scenario_group"])},
-            )
+def test_construct_capture_binds_adapter_path_step_size_and_config_not_hash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter_path = tmp_path / "checkpoint-3"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"adapter")
+    (adapter_path / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "base", "r": 8}), encoding="utf-8"
+    )
+    adapter_config = adapter_config_identity(adapter_path)
+    final_cell = SimpleNamespace(
+        label="care/step-3",
+        arm="care",
+        step=3,
+        provenance={
+            "adapter_dir": str(adapter_path),
+            "adapter_config": adapter_config,
+            "adapter_weights_size_bytes": (adapter_path / "adapter_model.safetensors")
+            .stat()
+            .st_size,
+        },
+        adapter_weights_sha256="stale-adapter-hash",
+    )
+    ladder = SimpleNamespace(
+        cells=(SimpleNamespace(label="base/step-0"), final_cell),
+        identity=SimpleNamespace(to_payload=lambda: {"base_model": "base"}),
+        cell=lambda _arm, _step: final_cell,
+    )
+    monkeypatch.setattr("games.cooperation_lens.load_ladder", lambda _root, **_kwargs: ladder)
 
-    def test_a_cropped_contrast_is_refused(self) -> None:
-        """Sabotage: a ceiling before the differing suffix must make this guard red."""
-        fit = stimuli("fit", 50, text_size=60)
-        quality = stimuli("quality", 8, text_size=60)
-        with pytest.raises(ValueError, match="would crop contrast-bearing prompts"):
-            build_corpus_plan(
-                fit,
-                quality,
-                rendered_fit=rendered(fit),
-                rendered_quality=rendered(quality),
-                fit_token_ids=token_ids(fit),
-                quality_token_ids=token_ids(quality),
-                profile="measurement",
-                max_seq_len_ceiling=20,
-            )
+    capture = validate_construct_capture(
+        tmp_path / "capture", adapter_path, final_arm="care", final_step=3
+    )
 
-    def test_tail_truncation_after_each_contrast_is_recorded_but_allowed(self) -> None:
-        fit = [replace(row, text=row.side + "z" * 100) for row in stimuli("fit", 50)]
-        quality = [replace(row, text=row.side + "z" * 100) for row in stimuli("quality", 8)]
-        plan = build_corpus_plan(
+    assert capture["final_adapter_weights_sha256"] == "stale-adapter-hash"
+    assert capture["final_adapter_path"] == str(adapter_path.resolve())
+    assert capture["final_step"] == 3
+    assert (
+        capture["final_adapter_weights_size_bytes"]
+        == (adapter_path / "adapter_model.safetensors").stat().st_size
+    )
+
+    final_cell.provenance["adapter_weights_size_bytes"] = 1
+    with pytest.raises(ValueError, match="different adapter weights size"):
+        validate_construct_capture(
+            tmp_path / "capture", adapter_path, final_arm="care", final_step=3
+        )
+
+
+def test_fit_and_quality_scenario_groups_cannot_overlap() -> None:
+    fit = stimuli("fit", 50)
+    quality = stimuli("quality", 8)
+    quality[0] = replace(quality[0], metadata=fit[0].metadata)
+    quality[1] = replace(quality[1], metadata=fit[0].metadata)
+    with pytest.raises(ValueError, match="fit and quality scenario groups overlap"):
+        build_corpus_plan(
+            fit,
+            quality,
+            rendered_fit=rendered(fit),
+            rendered_quality=rendered(quality),
+            fit_token_ids=token_ids(fit),
+            quality_token_ids=token_ids(quality),
+            profile="measurement",
+            max_seq_len_ceiling=256,
+        )
+
+
+def test_fit_and_quality_groups_cannot_overlap_training_or_evaluation() -> None:
+    fit = stimuli("fit", 50)
+    quality = stimuli("quality", 8)
+    with pytest.raises(ValueError, match="overlap reserved training/evaluation groups"):
+        build_corpus_plan(
+            fit,
+            quality,
+            rendered_fit=rendered(fit),
+            rendered_quality=rendered(quality),
+            fit_token_ids=token_ids(fit),
+            quality_token_ids=token_ids(quality),
+            profile="measurement",
+            max_seq_len_ceiling=256,
+            reserved_group_ids={str(fit[0].metadata["scenario_group"])},
+        )
+
+
+def test_a_cropped_contrast_is_refused() -> None:
+    """Sabotage: a ceiling before the differing suffix must make this guard red."""
+    fit = stimuli("fit", 50, text_size=60)
+    quality = stimuli("quality", 8, text_size=60)
+    with pytest.raises(ValueError, match="would crop contrast-bearing prompts"):
+        build_corpus_plan(
             fit,
             quality,
             rendered_fit=rendered(fit),
@@ -177,7 +219,22 @@ class TestBaseRevisionContract:
             profile="measurement",
             max_seq_len_ceiling=20,
         )
-        assert plan.n_truncated == 58
+
+
+def test_tail_truncation_after_each_contrast_is_recorded_but_allowed() -> None:
+    fit = [replace(row, text=row.side + "z" * 100) for row in stimuli("fit", 50)]
+    quality = [replace(row, text=row.side + "z" * 100) for row in stimuli("quality", 8)]
+    plan = build_corpus_plan(
+        fit,
+        quality,
+        rendered_fit=rendered(fit),
+        rendered_quality=rendered(quality),
+        fit_token_ids=token_ids(fit),
+        quality_token_ids=token_ids(quality),
+        profile="measurement",
+        max_seq_len_ceiling=20,
+    )
+    assert plan.n_truncated == 58
 
 
 def test_authored_lens_text_is_restricted_to_private_roots(tmp_path: Path) -> None:
@@ -221,6 +278,7 @@ class TestAccumulationResume:
 class FingerprintTokenizer:
     def __init__(self, *, vocabulary: dict[str, int], padding_side: str) -> None:
         self.vocabulary = vocabulary
+        self.name_or_path = "Qwen/base"
         self.padding_side = padding_side
         self.truncation_side = "right"
         self.model_max_length = 128
@@ -238,6 +296,12 @@ class FingerprintTokenizer:
 
 
 def gate_payload(*, live: bool = True, sabotage_zero: bool = True) -> dict[str, Any]:
+    tokenizer_identity = {
+        "name": "Qwen/base",
+        "revision": "source-commit",
+        "vocab_size": 1,
+        "special_tokens": {"eos_token": "<eos>"},
+    }
     return {
         "passed": live and sabotage_zero,
         "jlens": {"commit": "581d398abc"},
@@ -245,6 +309,7 @@ def gate_payload(*, live: bool = True, sabotage_zero: bool = True) -> dict[str, 
             "weights_identity": "hf:base-commit",
             "resolved_weights_identity": "hf:base-commit",
             "tokenizer_content_sha256": "tokenizer-content",
+            "tokenizer_identity": tokenizer_identity,
         },
         "max_seq_len": 128,
         "cooperation_fit_corpus": {
@@ -254,6 +319,7 @@ def gate_payload(*, live: bool = True, sabotage_zero: bool = True) -> dict[str, 
             "enable_thinking": True,
             "n_fit_prompts": 10,
             "tokenizer_content_sha256": "tokenizer-content",
+            "tokenizer_identity": tokenizer_identity,
         },
         "deltanet_kernels_bound": {"chunk": "fused"},
         "gates_requested": ["autograd", "kernel", "resume"],
@@ -296,7 +362,7 @@ class TestGradientGate:
         validated = validate_gradient_gate_binding(
             gate_payload(),
             base_weights_identity="hf:base-commit",
-            tokenizer_content_identity="tokenizer-content",
+            tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
             comparison_reference_identity="hf:base-commit",
             fit_stimuli_sha256="fit-stimuli",
             fit_rendered_sha256="fit-rendered",
@@ -332,7 +398,7 @@ class TestGradientGate:
             validate_gradient_gate_binding(
                 payload,
                 base_weights_identity="hf:base-commit",
-                tokenizer_content_identity="tokenizer-content",
+                tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
                 comparison_reference_identity="hf:base-commit",
                 fit_stimuli_sha256="fit-stimuli",
                 fit_rendered_sha256="fit-rendered",
@@ -343,18 +409,27 @@ class TestGradientGate:
                 kernels={"chunk": "fused"},
             )
 
-    def test_external_gate_binding_refuses_different_loaded_tokenizer_content(self) -> None:
-        """Sabotage: a changed vocabulary/config hash cannot inherit a prior model gate report."""
+    def test_external_gate_binding_refuses_different_readable_tokenizer_identity(self) -> None:
         payload = gate_payload()
         loaded_tokenizer = FingerprintTokenizer(vocabulary={"same": 0}, padding_side="right")
-        gate_tokenizer = FingerprintTokenizer(vocabulary={"changed": 0}, padding_side="left")
+        gate_tokenizer = FingerprintTokenizer(
+            vocabulary={"changed": 0, "extra": 1}, padding_side="left"
+        )
         payload["model"]["tokenizer_content_sha256"] = tokenizer_content_sha256(gate_tokenizer)
+        payload["model"]["tokenizer_identity"] = tokenizer_identity_payload(
+            gate_tokenizer, name="Qwen/base", revision="source-commit"
+        )
+        payload["cooperation_fit_corpus"]["tokenizer_identity"] = payload["model"][
+            "tokenizer_identity"
+        ]
 
-        with pytest.raises(ValueError, match="tokenizer content fingerprint"):
+        with pytest.raises(ValueError, match=r"tokenizer identity fields.*vocab_size"):
             validate_gradient_gate_binding(
                 payload,
                 base_weights_identity="hf:base-commit",
-                tokenizer_content_identity=tokenizer_content_sha256(loaded_tokenizer),
+                tokenizer_identity=tokenizer_identity_payload(
+                    loaded_tokenizer, name="Qwen/base", revision="source-commit"
+                ),
                 comparison_reference_identity="hf:base-commit",
                 fit_stimuli_sha256="fit-stimuli",
                 fit_rendered_sha256="fit-rendered",
@@ -364,6 +439,57 @@ class TestGradientGate:
                 dim_batch=8,
                 kernels={"chunk": "fused"},
             )
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("name", "Qwen/other"),
+            ("revision", "other-revision"),
+            ("vocab", {"different": 0}),
+            ("special_tokens", {"eos_token": "<different>"}),
+        ],
+    )
+    def test_external_gate_binding_names_changed_tokenizer_identity_field(
+        self, field: str, value: object
+    ) -> None:
+        payload = gate_payload()
+        payload["model"]["tokenizer_identity"][field] = value
+
+        with pytest.raises(ValueError, match=f"tokenizer identity fields.*{field}"):
+            validate_gradient_gate_binding(
+                payload,
+                base_weights_identity="hf:base-commit",
+                tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
+                comparison_reference_identity="hf:base-commit",
+                fit_stimuli_sha256="fit-stimuli",
+                fit_rendered_sha256="fit-rendered",
+                stimulus_render="templated_here",
+                enable_thinking=True,
+                max_seq_len=128,
+                dim_batch=8,
+                kernels={"chunk": "fused"},
+            )
+
+    def test_legacy_hash_only_tokenizer_records_remain_loadable(self) -> None:
+        payload = gate_payload()
+        payload["model"].pop("tokenizer_identity")
+        payload["cooperation_fit_corpus"].pop("tokenizer_identity")
+        payload["model"]["tokenizer_content_sha256"] = "older-content-record"
+        payload["cooperation_fit_corpus"]["tokenizer_content_sha256"] = "older-corpus-record"
+
+        validate_gradient_gate_binding(
+            payload,
+            base_weights_identity="hf:base-commit",
+            tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
+            comparison_reference_identity="hf:base-commit",
+            fit_stimuli_sha256="fit-stimuli",
+            fit_rendered_sha256="fit-rendered",
+            stimulus_render="templated_here",
+            enable_thinking=True,
+            max_seq_len=128,
+            dim_batch=8,
+            kernels={"chunk": "fused"},
+        )
 
     def test_token_comparison_commit_identity_remains_a_separate_binding(self) -> None:
         payload = gate_payload()
@@ -372,7 +498,7 @@ class TestGradientGate:
             validate_gradient_gate_binding(
                 payload,
                 base_weights_identity="hf:base-commit",
-                tokenizer_content_identity="tokenizer-content",
+                tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
                 comparison_reference_identity="hf:base-commit",
                 fit_stimuli_sha256="fit-stimuli",
                 fit_rendered_sha256="fit-rendered",
@@ -390,7 +516,6 @@ class TestGradientGate:
             ("fit_rendered_sha256", "stale-render"),
             ("stimulus_render", "verbatim"),
             ("enable_thinking", False),
-            ("tokenizer_content_sha256", "stale-tokenizer"),
         ],
     )
     def test_external_gate_binding_refuses_stale_fit_corpus_or_render(
@@ -402,7 +527,7 @@ class TestGradientGate:
             validate_gradient_gate_binding(
                 payload,
                 base_weights_identity="hf:base-commit",
-                tokenizer_content_identity="tokenizer-content",
+                tokenizer_identity=gate_payload()["model"]["tokenizer_identity"],
                 comparison_reference_identity="hf:base-commit",
                 fit_stimuli_sha256="fit-stimuli",
                 fit_rendered_sha256="fit-rendered",

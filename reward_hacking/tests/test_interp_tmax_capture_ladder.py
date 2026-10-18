@@ -776,6 +776,15 @@ class TestCaptureEndToEnd:
         with pytest.raises(FullWeightsCellError, match="the two sequences differ"):
             assert_ids_match_sidecar(cast("Any", tokenizer), rendered, table)
 
+    def test_sidecar_ids_are_compared_in_both_directions(self) -> None:
+        stimuli = verbatim_stimuli(n_pairs=1)
+        tokenizer = TinyTokenizer()
+        table = span_table_for(tokenizer, stimuli)
+        rendered = {stimulus.stimulus_id: stimulus.text for stimulus in stimuli}
+        table.input_ids["orphan-sidecar-id"] = (1, 2)
+        with pytest.raises(FullWeightsCellError, match="orphan-sidecar-id"):
+            assert_ids_match_sidecar(cast("Any", tokenizer), rendered, table)
+
 
 class TestTeacherForcedText:
     def test_the_completion_follows_the_template_think_line(self) -> None:

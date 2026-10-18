@@ -1,14 +1,14 @@
 """Explicit, resumable orchestration for the cooperation-generalisation experiment.
 
 This module contains experiment wiring only. Each operation is a real module CLI, and a phase is
-complete only when a receipt binds its command, environment, input bytes, and native output bytes.
+complete only when a receipt binds its command, environment, readable input inventory, and native
+output fields.
 The CPU inspection path never constructs a model or touches CUDA.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib
 import json
 import logging
@@ -45,7 +45,7 @@ from games.cooperation_eval_runner import (
     print_plan as print_endpoint_plan,
 )
 from games.cooperation_evals import load_behavior_manifest
-from games.evals import rebuild_summary
+from games.evals import SECTION_GAME_BEHAVIOR, rebuild_summary
 from games.fileio import read_json_object, write_json_atomic
 from games.plans import UV, artifact_model_slug, plan_setting
 from games.stage_runner import Stage, run_sequence
@@ -277,28 +277,85 @@ class Phase:
     needs_gpu: bool
 
 
-def _path_digest(path: Path) -> str:
+def _path_inventory(path: Path) -> dict[str, object]:
+    """Describe an input or output by its path and file sizes, without hashing bytes."""
     if not path.exists():
-        return f"missing:{path}"
+        return {"kind": "missing", "path": str(path)}
     if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    entries = [
-        f"{child.relative_to(path).as_posix()}:{hashlib.sha256(child.read_bytes()).hexdigest()}"
+        return {"kind": "file", "path": str(path), "size_bytes": path.stat().st_size}
+    files = [
+        {
+            "name": child.relative_to(path).as_posix(),
+            "size_bytes": child.stat().st_size,
+        }
         for child in sorted(path.rglob("*"))
         if child.is_file()
     ]
-    return (
-        "empty:" + str(path)
-        if not entries
-        else hashlib.sha256("\n".join(entries).encode()).hexdigest()
-    )
+    return {"kind": "directory", "path": str(path), "files": files}
+
+
+def _identity_differences(
+    expected: object, found: object, *, field_path: str = "identity"
+) -> list[str]:
+    """Describe key-level identity changes, naming both values and their containing fields."""
+    if isinstance(expected, dict) and isinstance(found, dict):
+        differences: list[str] = []
+        for key in sorted(set(expected) | set(found)):
+            child_path = f"{field_path}.{key}"
+            if key not in expected:
+                differences.append(f"{child_path} is unexpected")
+            elif key not in found:
+                differences.append(f"{child_path} is missing")
+            else:
+                differences.extend(
+                    _identity_differences(expected[key], found[key], field_path=child_path)
+                )
+        return differences
+    if isinstance(expected, list) and isinstance(found, list):
+        differences = []
+        for index in range(max(len(expected), len(found))):
+            child_path = f"{field_path}[{index}]"
+            if index >= len(expected):
+                differences.append(f"{child_path} is unexpected: found {found[index]!r}")
+            elif index >= len(found):
+                differences.append(f"{child_path} is missing; expected {expected[index]!r}")
+            else:
+                differences.extend(
+                    _identity_differences(expected[index], found[index], field_path=child_path)
+                )
+        return differences
+    return [] if expected == found else [field_path]
+
+
+def _runtime_input_value(path: Path) -> object:
+    """Read a private JSON or JSONL input as structured fields for resume identity."""
+    if path.suffix == ".jsonl":
+        rows = _read_jsonl_objects(path)
+        identity_field = next(
+            (
+                field
+                for field in ("prompt_id", "request_id", "pair_id", "id")
+                if all(field in row for row in rows)
+            ),
+            None,
+        )
+        if identity_field is None:
+            return {"row_count": len(rows), "rows": rows}
+        rows_by_id = {str(row[identity_field]): row for row in rows}
+        if len(rows_by_id) != len(rows):
+            raise ValueError(f"runtime input {path} repeats {identity_field} values")
+        return {
+            "row_count": len(rows),
+            "identity_field": identity_field,
+            "rows_by_id": rows_by_id,
+        }
+    return read_json_object(path)
 
 
 def phase_identity(phase: Phase) -> dict[str, object]:
-    """Return the content identity for a phase and all of its inputs."""
+    """Return the readable identity for a phase and the files it consumes."""
     return {
-        "schema": "cooperation-generalization-phase/v1",
-        "orchestrator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "schema": "cooperation-generalization-phase/v2",
         "phase": phase.name,
         "operations": [
             {
@@ -308,7 +365,7 @@ def phase_identity(phase: Phase) -> dict[str, object]:
             }
             for operation in phase.operations
         ],
-        "inputs": {str(path): _path_digest(path) for path in phase.inputs},
+        "inputs": {str(path): _path_inventory(path) for path in phase.inputs},
     }
 
 
@@ -425,7 +482,9 @@ def _validate_endpoint_artifacts(operation: Operation) -> None:  # noqa: C901, P
             )
 
 
-def _validate_natural_materialization(operation: Operation) -> None:  # noqa: C901 -- explicit native artifact identity gate
+def _validate_natural_materialization(  # noqa: C901, PLR0912, PLR0915 -- explicit native artifact contract
+    operation: Operation,
+) -> None:
     stimuli_path, sidecar_path = operation.artifacts
     rows = _read_jsonl_objects(stimuli_path)
     sidecar = read_json_object(sidecar_path)
@@ -468,19 +527,53 @@ def _validate_natural_materialization(operation: Operation) -> None:  # noqa: C9
         raise RuntimeError(f"semantic natural-prefix sidecar {sidecar_path} misbinds its state")
     records_path = Path(_operation_argument(operation, "--records"))
     selection_path = Path(_operation_argument(operation, "--natural-selection-manifest"))
+    source_selection = read_json_object(selection_path)
     if sidecar.get("records_file") != str(records_path) or sidecar.get("stimuli_file") != str(
         stimuli_path
     ):
         raise RuntimeError(
             f"semantic natural-prefix sidecar {sidecar_path} is not bound to its inputs"
         )
-    if sidecar.get("records_sha256") != hashlib.sha256(records_path.read_bytes()).hexdigest():
-        raise RuntimeError(
-            f"semantic natural-prefix sidecar {sidecar_path} has source-record digest drift"
-        )
     if sidecar.get("selection_manifest_path") != str(selection_path):
         raise RuntimeError(
             f"semantic natural-prefix sidecar {sidecar_path} has selection path drift"
+        )
+    embedded_selection = dict(selection)
+    if Path(str(embedded_selection.get("path", ""))).resolve() != selection_path.resolve():
+        raise RuntimeError(
+            f"semantic natural-prefix sidecar {sidecar_path} has selection_manifest.path drift"
+        )
+    embedded_selection.pop("path", None)
+    embedded_selection.pop("sha256", None)
+    selection_differences = _identity_differences(
+        source_selection,
+        embedded_selection,
+        field_path="selection_manifest",
+    )
+    if selection_differences:
+        raise RuntimeError(
+            f"semantic natural-prefix sidecar {sidecar_path} differs from its source selection at "
+            + ", ".join(selection_differences[:8])
+        )
+    records_by_request: dict[str, dict[str, Any]] = {}
+    for record in _read_jsonl_objects(records_path):
+        if record.get("record") != SECTION_GAME_BEHAVIOR:
+            continue
+        request_id = record.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise RuntimeError(
+                f"semantic natural-prefix source records {records_path} contain a behavior row "
+                "without request_id"
+            )
+        if request_id in records_by_request:
+            raise RuntimeError(
+                f"semantic natural-prefix source records {records_path} repeat request {request_id!r}"
+            )
+        records_by_request[request_id] = record
+    if set(records_by_request) != set(request_ids):
+        raise RuntimeError(
+            f"semantic natural-prefix source request IDs in {records_path} do not match the "
+            f"selection manifest: found={sorted(records_by_request)}, expected={sorted(request_ids)}"
         )
     row_ids = [row.get("id") for row in rows]
     row_requests = [row.get("metadata", {}).get("request_id") for row in rows]
@@ -504,6 +597,35 @@ def _validate_natural_materialization(operation: Operation) -> None:  # noqa: C9
             raise RuntimeError(
                 f"semantic natural-prefix row in {stimuli_path} is not a native pre-action stimulus"
             )
+        request_id = str(metadata["request_id"])
+        source_record = records_by_request[request_id]
+        if any(
+            not isinstance(source_record.get(field), str) or not source_record[field]
+            for field in ("prompt", "pre_action_prefix", "scenario_group")
+        ):
+            raise RuntimeError(
+                f"semantic natural-prefix source record {request_id!r} lacks readable prompt fields"
+            )
+        row_differences = _identity_differences(
+            {
+                "text": source_record.get("prompt"),
+                "pre_action_prefix": source_record.get("pre_action_prefix"),
+                "metadata.scenario_group": source_record.get("scenario_group"),
+                "metadata.selection_rule": source_selection.get("selection_rule"),
+            },
+            {
+                "text": row.get("text"),
+                "pre_action_prefix": row.get("assistant_prefix"),
+                "metadata.scenario_group": metadata.get("scenario_group"),
+                "metadata.selection_rule": metadata.get("selection_rule"),
+            },
+            field_path=f"request_rows.{request_id}",
+        )
+        if row_differences:
+            raise RuntimeError(
+                f"semantic natural-prefix stimulus {request_id!r} differs at "
+                + ", ".join(row_differences[:8])
+            )
 
 
 def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0912 -- explicit native capture schema gate
@@ -512,6 +634,8 @@ def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0
     ]
     if len(manifests) != NATURAL_PREFIX_STATE_COUNT:
         raise RuntimeError("semantic natural-prefix capture must contain base and final manifests")
+    selection_path = Path(_operation_argument(operation, "--natural-selection-manifest"))
+    source_selection = read_json_object(selection_path)
     for manifest_path in manifests:
         payload = read_json_object(manifest_path)
         identity = payload.get("identity")
@@ -560,12 +684,26 @@ def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0
             )
         if [record.get("request_id") for record in records] != request_ids:
             raise RuntimeError(
-                f"semantic natural-prefix manifest {manifest_path} has misbound requests"
+                f"semantic natural-prefix manifest {manifest_path} has misbound "
+                "selection_manifest.request_ids"
             )
-        selection_digest = _require_text(selection, "sha256", artifact=manifest_path)
-        if identity.get("natural_selection_manifest_sha256") != selection_digest:
+        _require_text(selection, "sha256", artifact=manifest_path)
+        if Path(str(selection.get("path", ""))).resolve() != selection_path.resolve():
             raise RuntimeError(
-                f"semantic natural-prefix manifest {manifest_path} has selection digest drift"
+                f"semantic natural-prefix manifest {manifest_path} has selection_manifest.path drift"
+            )
+        embedded_selection = {
+            key: value for key, value in selection.items() if key not in {"path", "sha256"}
+        }
+        selection_differences = _identity_differences(
+            source_selection,
+            embedded_selection,
+            field_path="selection_manifest",
+        )
+        if selection_differences:
+            raise RuntimeError(
+                f"semantic natural-prefix manifest {manifest_path} differs from its source "
+                "selection at " + ", ".join(selection_differences[:8])
             )
         expected_shapes = {
             stimulus_id: [3, len(layers), hidden_size] for stimulus_id in stimulus_ids
@@ -581,9 +719,21 @@ def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0
             )
 
 
-def _validate_selected_target(  # noqa: C901 -- explicit direction-selection identity gate
+def _finite_metric(payload: Mapping[str, Any], field: str, artifact: Path) -> float:
+    value = payload.get(field)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+    ):
+        raise RuntimeError(f"semantic geometry artifact {artifact} has invalid {field}")
+    return float(value)
+
+
+def _validate_selected_target(  # noqa: C901, PLR0912, PLR0915 -- explicit direction-selection contract
     report_path: Path, manifest_path: Path, selection_path: Path
 ) -> None:
+    report = read_json_object(report_path)
     directions = read_json_object(manifest_path)
     required_directions = {"costly-other-regard", "decision-dependence", "trained-displacement"}
     if set(directions) != {"base", "final"} or any(
@@ -634,13 +784,7 @@ def _validate_selected_target(  # noqa: C901 -- explicit direction-selection ide
         raise RuntimeError(
             f"semantic selected target {selection_path} is not bound to its geometry report path"
         )
-    if (
-        selection.get("geometry_report_sha256")
-        != hashlib.sha256(report_path.read_bytes()).hexdigest()
-    ):
-        raise RuntimeError(
-            f"semantic selected target {selection_path} is not bound to its geometry report"
-        )
+    _require_text(selection, "geometry_report_sha256", artifact=selection_path)
     direction_name = selection.get("direction")
     if direction_name not in required_directions:
         raise RuntimeError(f"semantic selected target {selection_path} names an unknown direction")
@@ -655,14 +799,12 @@ def _validate_selected_target(  # noqa: C901 -- explicit direction-selection ide
     if (
         directions["final"].get(direction_name) != str(direction_path)
         or not direction_path.is_file()
+        or direction_path.stat().st_size == 0
     ):
         raise RuntimeError(
             f"semantic selected target {selection_path} is not bound to its final direction"
         )
-    if selection.get("direction_sha256") != hashlib.sha256(direction_path.read_bytes()).hexdigest():
-        raise RuntimeError(
-            f"semantic selected target {selection_path} has a direction digest mismatch"
-        )
+    _require_text(selection, "direction_sha256", artifact=selection_path)
     layer = selection.get("layer")
     magnitude = selection.get("magnitude")
     alpha_multiplier = selection.get("alpha_multiplier")
@@ -679,6 +821,50 @@ def _validate_selected_target(  # noqa: C901 -- explicit direction-selection ide
         or float(alpha_multiplier) <= 0
     ):
         raise RuntimeError(f"semantic selected target {selection_path} has invalid magnitude")
+    context = report.get("context")
+    projections = report.get("projections")
+    if not isinstance(context, dict) or not isinstance(projections, list):
+        raise TypeError(f"semantic geometry report {report_path} lacks readable projection fields")
+    pooling = context.get("export_pooling")
+    if not isinstance(pooling, str) or not pooling:
+        raise RuntimeError(f"semantic geometry report {report_path} has no export_pooling")
+    matching_projections = [
+        projection
+        for projection in projections
+        if isinstance(projection, dict)
+        and projection.get("state") == "final"
+        and projection.get("construct") == direction_name
+        and projection.get("pooling") == pooling
+        and projection.get("layer") == layer
+    ]
+    if len(matching_projections) != 1:
+        raise RuntimeError(
+            f"semantic geometry report {report_path} has {len(matching_projections)} final "
+            f"{direction_name}/{pooling}/layer-{layer} projections for the selected target"
+        )
+    projection = matching_projections[0]
+    fit_accuracy = _finite_metric(projection, "fit_direction_accuracy", report_path)
+    placebo_accuracy = _finite_metric(projection, "fit_placebo_accuracy_max", report_path)
+    direction_norm = _finite_metric(projection, "fit_direction_norm", report_path)
+    expected_calibration_metric = fit_accuracy - placebo_accuracy
+    if (
+        not isinstance(selection.get("calibration_metric"), int | float)
+        or isinstance(selection.get("calibration_metric"), bool)
+        or not math.isclose(
+            float(selection["calibration_metric"]), expected_calibration_metric, abs_tol=1e-8
+        )
+    ):
+        raise RuntimeError(
+            f"semantic selected target {selection_path} calibration_metric does not match "
+            f"the layer {layer} projection"
+        )
+    if not math.isclose(
+        float(magnitude), float(alpha_multiplier) * float(direction_norm), abs_tol=1e-8
+    ):
+        raise RuntimeError(
+            f"semantic selected target {selection_path} magnitude does not match the layer "
+            f"{layer} direction norm"
+        )
 
 
 def _validate_geometry_artifacts(operation: Operation) -> None:  # noqa: C901 -- explicit tiny/final geometry contracts
@@ -839,16 +1025,75 @@ def _load_phase_receipt(phase: Phase) -> dict[str, Any] | None:
     if not phase.receipt_path.is_file():
         return None
     payload = read_json_object(phase.receipt_path)
-    if payload.get("phase_identity") != phase_identity(phase):
-        raise ValueError(f"phase receipt identity mismatch at {phase.receipt_path}")
-    outputs = {str(path): _path_digest(path) for path in _phase_outputs(phase)}
-    if any(value.startswith(("missing:", "empty:")) for value in outputs.values()):
-        return None
-    if payload.get("outputs") != outputs:
-        raise ValueError(f"phase receipt output mismatch at {phase.receipt_path}")
+    stored_identity = payload.get("phase_identity")
+    if not isinstance(stored_identity, dict):
+        raise TypeError(f"phase receipt {phase.receipt_path} has no identity mapping")
+    if stored_identity.get("schema") == "cooperation-generalization-phase/v1":
+        differences = _legacy_phase_receipt_differences(phase, payload, stored_identity)
+        if not _phase_outputs_are_present(phase):
+            return None
+    else:
+        differences = _identity_differences(
+            phase_identity(phase), stored_identity, field_path="phase"
+        )
+        outputs = {str(path): _path_inventory(path) for path in _phase_outputs(phase)}
+        if any(
+            value.get("kind") == "missing"
+            or (value.get("kind") == "directory" and not value.get("files"))
+            for value in outputs.values()
+        ):
+            return None
+        differences.extend(
+            _identity_differences(outputs, payload.get("outputs"), field_path="outputs")
+        )
+    if differences:
+        raise ValueError(
+            f"phase receipt identity differs at {phase.receipt_path}: {'; '.join(differences[:8])}"
+        )
     for operation in phase.operations:
         _validate_operation_artifacts(operation)
     return payload
+
+
+def _phase_outputs_are_present(phase: Phase) -> bool:
+    return all(
+        path.exists()
+        and not (path.is_file() and path.stat().st_size == 0)
+        and not (path.is_dir() and not any(child.is_file() for child in path.rglob("*")))
+        for path in _phase_outputs(phase)
+    )
+
+
+def _legacy_phase_receipt_differences(
+    phase: Phase, payload: Mapping[str, Any], stored_identity: Mapping[str, Any]
+) -> list[str]:
+    """Read v1 receipts by operation fields and paths, ignoring their source and artifact digests."""
+    current_identity = phase_identity(phase)
+    differences = _identity_differences(
+        {"phase": current_identity["phase"], "operations": current_identity["operations"]},
+        {"phase": stored_identity.get("phase"), "operations": stored_identity.get("operations")},
+        field_path="phase",
+    )
+    expected_inputs = {str(path) for path in phase.inputs}
+    stored_inputs = stored_identity.get("inputs")
+    if not isinstance(stored_inputs, dict):
+        return [*differences, "legacy phase.inputs is not a mapping"]
+    if set(stored_inputs) != expected_inputs:
+        differences.append(
+            f"legacy phase.inputs paths found {sorted(stored_inputs)}, expected {sorted(expected_inputs)}"
+        )
+    missing_inputs = [str(path) for path in phase.inputs if not path.exists()]
+    differences.extend(f"legacy phase input {path} is missing" for path in missing_inputs)
+
+    expected_output_paths = {str(path) for path in _phase_outputs(phase)}
+    stored_outputs = payload.get("outputs")
+    if not isinstance(stored_outputs, dict):
+        return [*differences, "legacy phase.outputs is not a mapping"]
+    if set(stored_outputs) != expected_output_paths:
+        differences.append(
+            f"legacy outputs paths found {sorted(stored_outputs)}, expected {sorted(expected_output_paths)}"
+        )
+    return differences
 
 
 def phase_is_complete(phase: Phase) -> bool:
@@ -872,7 +1117,7 @@ def _write_receipt(
         raise RuntimeError(f"phase {phase.name!r} produced no usable artifact at {missing}")
     payload = {
         "phase_identity": phase_identity(phase),
-        "outputs": {str(path): _path_digest(path) for path in _phase_outputs(phase)},
+        "outputs": {str(path): _path_inventory(path) for path in _phase_outputs(phase)},
         "elapsed_seconds": elapsed_seconds,
         "operation_seconds": dict(operation_seconds),
         "output_bytes": {
@@ -1045,16 +1290,48 @@ def freeze_run_identity() -> None:
     """Freeze the prepared identity once, immediately before the first GPU phase."""
     prepared = read_json_object(preflight_identity_path())
     current = run_identity()
-    if prepared != current:
-        raise ValueError("CPU preflight identity is stale; rerun --prepare before GPU execution")
+    prepared_differences = _run_identity_differences(current, prepared)
+    if prepared_differences:
+        raise ValueError(
+            "CPU preflight identity is stale; rerun --prepare before GPU execution: "
+            f"{'; '.join(prepared_differences[:8])}"
+        )
     frozen_path = run_identity_path()
     if frozen_path.exists():
-        if read_json_object(frozen_path) != current:
+        frozen_differences = _run_identity_differences(current, read_json_object(frozen_path))
+        if frozen_differences:
             raise ValueError(
-                "frozen run identity differs from current inputs; start a distinct run root"
+                "frozen run identity differs from current inputs; start a distinct run root: "
+                f"{'; '.join(frozen_differences[:8])}"
             )
         return
     write_json_atomic(frozen_path, current)
+
+
+def _run_identity_differences(
+    expected: Mapping[str, object], found: Mapping[str, object]
+) -> list[str]:
+    """Compare current run fields while accepting the older digest-only v2 record."""
+    if found.get("schema") != "cooperation-generalization-run/v2":
+        return _identity_differences(dict(expected), dict(found), field_path="run")
+
+    current_fields = dict(expected)
+    current_fields.pop("schema", None)
+    current_fields.pop("runtime_inputs", None)
+    current_fields.pop("runtime_input_values", None)
+    legacy_fields = dict(found)
+    legacy_fields.pop("schema", None)
+    legacy_fields.pop("orchestrator_sha256", None)
+    legacy_inputs = legacy_fields.pop("runtime_inputs", None)
+    differences = _identity_differences(current_fields, legacy_fields, field_path="run")
+    expected_paths = {str(path) for path in _runtime_input_paths()}
+    if not isinstance(legacy_inputs, dict):
+        return [*differences, "run.runtime_inputs is not a legacy digest mapping"]
+    if set(legacy_inputs) != expected_paths:
+        differences.append(
+            f"run.runtime_inputs paths found {sorted(legacy_inputs)}, expected {sorted(expected_paths)}"
+        )
+    return differences
 
 
 def run_identity() -> dict[str, object]:
@@ -1069,7 +1346,22 @@ def run_identity() -> dict[str, object]:
             "natural-prefix rollout_ids_by_state must match the planned checkpoints: "
             f"expected {expected_rollouts}"
         )
-    inputs = (
+    inputs = _runtime_input_paths()
+    return {
+        "schema": "cooperation-generalization-run/v3",
+        "model": model_id(),
+        "model_revision": DEFAULT_MODEL_REVISION,
+        "arm": DEFAULT_ARM,
+        "max_steps": max_steps(),
+        "completion_tokens": completion_tokens(),
+        "sampler": "training-distribution",
+        "runtime_inputs": {str(path): _path_inventory(path) for path in inputs},
+        "runtime_input_values": {str(path): _runtime_input_value(path) for path in inputs},
+    }
+
+
+def _runtime_input_paths() -> tuple[Path, ...]:
+    return (
         training_manifest_path(),
         training_corpus_path(),
         behavior_manifest_path(),
@@ -1081,17 +1373,6 @@ def run_identity() -> dict[str, object]:
         natural_selection_path(),
         model_metadata_path(),
     )
-    return {
-        "schema": "cooperation-generalization-run/v2",
-        "orchestrator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "model": model_id(),
-        "model_revision": DEFAULT_MODEL_REVISION,
-        "arm": DEFAULT_ARM,
-        "max_steps": max_steps(),
-        "completion_tokens": completion_tokens(),
-        "sampler": "training-distribution",
-        "runtime_inputs": {str(path): _path_digest(path) for path in inputs},
-    }
 
 
 def static_plan() -> dict[str, object]:
@@ -1170,7 +1451,7 @@ def static_plan() -> dict[str, object]:
         * completion_tokens()
     )
     payload["model_metadata_path"] = str(model_metadata_path())
-    payload["model_metadata_sha256"] = _path_digest(model_metadata_path())
+    payload["model_metadata"] = read_json_object(model_metadata_path())
     payload["model"] = model_id()
     payload["model_source"] = model_source()
     payload["weights_present"] = _weights_present()

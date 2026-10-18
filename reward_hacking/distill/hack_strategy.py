@@ -4240,9 +4240,8 @@ def _leak_evidence_summary(
     return evidence_summary
 
 
-def _persisted_manifest(  # noqa: PLR0911 - each invalid provenance state has a separate audit reason
+def _persisted_manifest(
     raw_evidence: Mapping[str, object],
-    evidence_summary: Mapping[str, object],
     *,
     limitations: list[str],
 ) -> Mapping[str, object] | None:
@@ -4253,13 +4252,6 @@ def _persisted_manifest(  # noqa: PLR0911 - each invalid provenance state has a 
     manifest_raw_json = raw_evidence.get("manifest_raw_json")
     if not isinstance(manifest_raw_json, str):
         limitations.append("persisted leak manifest serialization is unavailable or invalid")
-        return None
-    manifest_sha256 = evidence_summary.get("manifest_sha256")
-    if not isinstance(manifest_sha256, str):
-        limitations.append("persisted leak manifest digest is unavailable or invalid")
-        return None
-    if hashlib.sha256(manifest_raw_json.encode("utf-8")).hexdigest() != manifest_sha256:
-        limitations.append("persisted leak manifest digest mismatch; manifest excluded")
         return None
     try:
         parsed_manifest = json.loads(manifest_raw_json)
@@ -4329,7 +4321,7 @@ def _persisted_leak_evidence(
     return _PersistedLeakEvidence(
         trace_records=leak_trace_records(raw_evidence, record=record, trace_records=trace_records),
         docker_evidence=_persisted_docker_evidence(raw_evidence),
-        manifest=_persisted_manifest(raw_evidence, evidence_summary, limitations=limitations),
+        manifest=_persisted_manifest(raw_evidence, limitations=limitations),
         final_patch=_persisted_final_patch(raw_evidence, evidence_summary, limitations=limitations),
         limitations=tuple(dict.fromkeys(limitations)),
     )

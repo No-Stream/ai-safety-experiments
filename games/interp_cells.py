@@ -103,6 +103,22 @@ ERROR_EXAMPLE_COUNT = 5
 
 # Characters of a sha256 shown in a log line or an error. Comparisons always use the full digest.
 DIGEST_DISPLAY_CHARS = 12
+NATURAL_SELECTION_IDENTITY_FIELDS: tuple[str, ...] = (
+    "version",
+    "request_ids",
+    "scenario_groups",
+    "rollout_ids_by_state",
+    "selection_rule",
+    "layers",
+)
+STIMULUS_IDENTITY_FIELDS: tuple[str, ...] = (
+    "stimulus_id",
+    "side",
+    "pair_id",
+    "text",
+    "assistant_prefix",
+    "metadata",
+)
 
 
 def short_digest(digest: str) -> str:
@@ -238,6 +254,7 @@ class CapturedCell:
     prefix_stimulus_ids: tuple[str, ...] = ()
     natural_prefix_activations: dict[str, torch.Tensor] = field(default_factory=dict)
     natural_prefix_selection_manifest: dict[str, Any] | None = None
+    stimulus_records: dict[str, list[dict[str, Any]]] | None = None
 
     @property
     def label(self) -> str:
@@ -364,6 +381,67 @@ def stimuli_digest(stimuli: Sequence[Stimulus]) -> str:
                 )
             )
     return digest_of_strings(values)
+
+
+def _stimulus_records_by_set(stimuli: Sequence[Stimulus]) -> dict[str, list[dict[str, Any]]]:
+    """Return private source rows in the order their activation rows are captured."""
+    records_by_set: dict[str, list[dict[str, Any]]] = {}
+    for stimulus in stimuli:
+        records_by_set.setdefault(stimulus.stimulus_set, []).append(
+            {
+                "stimulus_id": stimulus.stimulus_id,
+                "side": stimulus.side,
+                "pair_id": stimulus.pair_id,
+                "text": stimulus.text,
+                "assistant_prefix": stimulus.assistant_prefix,
+                "metadata": dict(stimulus.metadata),
+            }
+        )
+    return records_by_set
+
+
+def _validate_stimulus_records(
+    records_by_set: dict[str, list[dict[str, Any]]], rows: dict[str, RowIndex], *, source: Path
+) -> None:
+    """Require readable stimulus rows to describe the stored activation-row order."""
+    if set(records_by_set) != set(rows):
+        raise CellFormatError(
+            f"{source} stimulus_records sets differ from the activation row sets."
+        )
+    required_fields = {"stimulus_id", "side", "pair_id", "text", "assistant_prefix", "metadata"}
+    for stimulus_set, records in records_by_set.items():
+        row_index = rows[stimulus_set]
+        if len(records) != row_index.n_rows:
+            raise CellFormatError(
+                f"{source} stimulus_records count for {stimulus_set!r} differs from its activation rows."
+            )
+        for field_name, expected_values in (
+            ("stimulus_id", row_index.stimulus_ids),
+            ("side", row_index.sides),
+            ("pair_id", row_index.pair_ids),
+        ):
+            actual_values = tuple(record.get(field_name) for record in records)
+            if actual_values != expected_values:
+                raise CellFormatError(
+                    f"{source} stimulus_records {field_name} do not match activation rows "
+                    f"for {stimulus_set!r}."
+                )
+        for record in records:
+            if set(record) != required_fields:
+                raise CellFormatError(
+                    f"{source} stimulus_records row has fields {sorted(record)}, "
+                    f"expected {sorted(required_fields)}."
+                )
+            if not isinstance(record["text"], str) or not isinstance(record["metadata"], dict):
+                raise CellFormatError(
+                    f"{source} stimulus_records text and metadata have invalid types."
+                )
+            if record["assistant_prefix"] is not None and not isinstance(
+                record["assistant_prefix"], str
+            ):
+                raise CellFormatError(
+                    f"{source} stimulus_records assistant_prefix has an invalid type."
+                )
 
 
 def load_stimuli(path: Path) -> list[Stimulus]:
@@ -863,6 +941,7 @@ def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors
     prefix_stimulus_ids: Sequence[str] | None = None,
     natural_prefix_activations: dict[str, torch.Tensor] | None = None,
     natural_prefix_selection_manifest: dict[str, Any] | None = None,
+    stimuli: Sequence[Stimulus] | None = None,
 ) -> Path:
     """Write one cell's tensors and manifest, and return the manifest path.
 
@@ -872,6 +951,15 @@ def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors
     metadata, prefix, prefix_ids, row_ids = _validate_cell_metadata(
         rows, stimulus_metadata, prefix_activations, prefix_stimulus_ids
     )
+    stimulus_records = None if stimuli is None else _stimulus_records_by_set(stimuli)
+    if stimulus_records is not None:
+        _validate_stimulus_records(stimulus_records, rows, source=cell_dir)
+        try:
+            json.dumps(stimulus_records, sort_keys=True, ensure_ascii=False)
+        except TypeError as error:
+            raise CellFormatError(
+                f"{cell_dir} stimulus records are not JSON serialisable: {error}"
+            ) from error
     natural = dict(natural_prefix_activations or {})
     stored = _store_main_activations(activations, identity)
     cell_dir.mkdir(parents=True, exist_ok=True)
@@ -918,13 +1006,14 @@ def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors
             stimulus_id: list(tensor.shape) for stimulus_id, tensor in sorted(natural.items())
         },
         "natural_prefix_selection_manifest": natural_prefix_selection_manifest,
+        "stimulus_records": stimulus_records,
     }
     manifest_path = cell_dir / CELL_MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest_path
 
 
-def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913 - linear durable artifact boundary
+def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913, PLR0915 - linear durable artifact boundary
     capture_dir: Path,
     *,
     identity: CellIdentity,
@@ -949,28 +1038,55 @@ def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913 - linear durab
         raise CellFormatError("natural-prefix capture identity has no explicit layer subset")
     if not rendered_sha256.strip():
         raise CellFormatError("natural-prefix capture requires a non-empty rendered corpus digest")
-    if not identity.natural_selection_manifest_sha256:
-        raise CellFormatError(
-            "natural-prefix capture identity must record the predeclared selection manifest digest"
-        )
-    selection_digest = selection_manifest.get("sha256")
-    if selection_digest != identity.natural_selection_manifest_sha256:
-        raise CellFormatError(
-            "natural-prefix selection manifest digest does not match the capture identity"
-        )
     if tuple(selection_manifest.get("layers", ())) != identity.natural_prefix_layers:
         raise CellFormatError(
             "natural-prefix selection manifest layers do not match the capture identity"
         )
+    manifest_version = selection_manifest.get("version")
+    if manifest_version is not None and manifest_version != 1:
+        raise CellFormatError(
+            f"natural-prefix selection manifest version {manifest_version!r} is unsupported."
+        )
+    selection_rule = selection_manifest.get("selection_rule")
+    if not isinstance(selection_rule, str) or not selection_rule.strip():
+        raise CellFormatError("natural-prefix selection manifest has no readable selection_rule.")
+    declared_request_ids = selection_manifest.get("request_ids")
+    if declared_request_ids is not None and (
+        not isinstance(declared_request_ids, list)
+        or not all(
+            isinstance(request_id, str) and request_id.strip()
+            for request_id in declared_request_ids
+        )
+        or len(set(declared_request_ids)) != len(declared_request_ids)
+    ):
+        raise CellFormatError("natural-prefix selection manifest request_ids are invalid.")
+    declared_scenario_groups = selection_manifest.get("scenario_groups")
+    if declared_scenario_groups is not None and (
+        not isinstance(declared_scenario_groups, list)
+        or not all(isinstance(group, str) and group.strip() for group in declared_scenario_groups)
+        or len(set(declared_scenario_groups)) != len(declared_scenario_groups)
+    ):
+        raise CellFormatError("natural-prefix selection manifest scenario_groups are invalid.")
     if natural_state not in {"base", "final"}:
         raise CellFormatError(f"natural-prefix capture has unknown natural_state {natural_state!r}")
-    expected_rollout_id = selection_manifest["rollout_ids_by_state"][natural_state]
+    rollout_ids_by_state = selection_manifest.get("rollout_ids_by_state")
+    if not isinstance(rollout_ids_by_state, dict):
+        raise CellFormatError(
+            "natural-prefix selection manifest has no rollout_ids_by_state mapping."
+        )
+    expected_rollout_id = rollout_ids_by_state.get(natural_state)
+    if not isinstance(expected_rollout_id, str) or not expected_rollout_id.strip():
+        raise CellFormatError(
+            f"natural-prefix selection manifest has no rollout id for {natural_state!r}."
+        )
     stimulus_ids = tuple(stimulus.stimulus_id for stimulus in stimuli)
     if set(activations) != set(stimulus_ids):
         raise CellFormatError("natural-prefix activations must cover exactly the supplied stimuli")
     if len(set(stimulus_ids)) != len(stimulus_ids):
         raise CellFormatError("natural-prefix stimuli repeat an id")
     records_by_id = {str(record["stimulus_id"]): record for record in selection_records}
+    if len(records_by_id) != len(selection_records):
+        raise CellFormatError("natural-prefix selection records repeat a stimulus id")
     if set(records_by_id) != set(stimulus_ids):
         raise CellFormatError(
             "natural-prefix selection records must cover exactly the supplied stimuli"
@@ -986,8 +1102,43 @@ def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913 - linear durab
                 f"natural-prefix stimulus {stimulus.stimulus_id!r} has rollout "
                 f"{stimulus.metadata.get('rollout_id')!r}, expected {expected_rollout_id!r}"
             )
+        record = records_by_id[stimulus.stimulus_id]
+        for field_name in (
+            "request_id",
+            "rollout_id",
+            "scenario_group",
+            "natural_state",
+            "selection_rule",
+        ):
+            expected_value = stimulus.metadata.get(field_name)
+            if expected_value is not None and str(record.get(field_name)) != str(expected_value):
+                raise CellFormatError(
+                    f"natural-prefix selection record {field_name} differs for stimulus id "
+                    f"{stimulus.stimulus_id}."
+                )
+        request_id = stimulus.metadata.get("request_id")
+        if declared_request_ids is not None and request_id not in declared_request_ids:
+            raise CellFormatError(
+                f"natural-prefix request_id {request_id!r} for stimulus id "
+                f"{stimulus.stimulus_id} is absent from selection manifest request_ids."
+            )
+        scenario_group = stimulus.metadata.get("scenario_group")
+        if declared_scenario_groups is not None and scenario_group not in declared_scenario_groups:
+            raise CellFormatError(
+                f"natural-prefix scenario_group {scenario_group!r} for stimulus id "
+                f"{stimulus.stimulus_id} is absent from selection manifest scenario_groups."
+            )
     if any(record.get("natural_state") != natural_state for record in selection_records):
         raise CellFormatError("natural-prefix selection records do not share the capture state")
+    changed_selection_ids = sorted(
+        stimulus_id
+        for stimulus_id, record in records_by_id.items()
+        if record.get("selection_rule") != selection_rule
+    )
+    if changed_selection_ids:
+        raise CellFormatError(
+            f"natural-prefix selection_rule differs for stimulus ids {changed_selection_ids}."
+        )
     try:
         json.dumps(selection_manifest, sort_keys=True, ensure_ascii=False)
         json.dumps(selection_records, sort_keys=True, ensure_ascii=False)
@@ -1025,6 +1176,7 @@ def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913 - linear durab
         "natural_state": natural_state,
         "selection_manifest": selection_manifest,
         "selection_records": list(selection_records),
+        "stimulus_records": _stimulus_records_by_set(stimuli),
         "states": {
             stimulus_id: list(tensor.shape) for stimulus_id, tensor in sorted(stored.items())
         },
@@ -1160,7 +1312,7 @@ def _validate_auxiliary_capture_files(
             )
 
 
-def read_cell(cell_dir: Path) -> CapturedCell:
+def read_cell(cell_dir: Path) -> CapturedCell:  # noqa: C901 - validates all durable cell files
     """Read one cell back, checking the tensors on disk against what the manifest claims."""
     manifest_path = cell_dir / CELL_MANIFEST_FILENAME
     if not manifest_path.is_file():
@@ -1170,6 +1322,14 @@ def read_cell(cell_dir: Path) -> CapturedCell:
         cast("dict[str, Any]", manifest.get("identity", {})), source=manifest_path
     )
     rows = _load_rows(manifest)
+    raw_stimulus_records = manifest.get("stimulus_records")
+    stimulus_records = (
+        None
+        if raw_stimulus_records is None
+        else cast("dict[str, list[dict[str, Any]]]", raw_stimulus_records)
+    )
+    if stimulus_records is not None:
+        _validate_stimulus_records(stimulus_records, rows, source=manifest_path)
     activations = _load_main_activations(cell_dir, rows, identity)
     prefix_activations = _load_prefix_activations(cell_dir, rows, identity)
     prefix_stimulus_ids = tuple(cast("list[str]", manifest.get("prefix_stimulus_ids", [])))
@@ -1184,6 +1344,44 @@ def read_cell(cell_dir: Path) -> CapturedCell:
     _validate_auxiliary_capture_files(
         cell_dir, identity, prefix_activations, natural_prefix_activations
     )
+    natural_prefix_selection_manifest = manifest.get("natural_prefix_selection_manifest")
+    separate_selection_manifest_path = (
+        cell_dir / "natural-prefix" / NATURAL_PREFIX_MANIFEST_FILENAME
+    )
+    if separate_selection_manifest_path.is_file():
+        separate_natural_manifest = json.loads(separate_selection_manifest_path.read_text())
+        if not isinstance(separate_natural_manifest, dict):
+            raise CellFormatError(f"{separate_selection_manifest_path} must contain a JSON object.")
+        separate_selection_manifest = separate_natural_manifest.get("selection_manifest")
+        if not isinstance(separate_selection_manifest, dict):
+            raise CellFormatError(
+                f"{separate_selection_manifest_path} lacks a readable selection_manifest object."
+            )
+        missing_selection_fields = sorted(
+            set(NATURAL_SELECTION_IDENTITY_FIELDS) - set(separate_selection_manifest)
+        )
+        if missing_selection_fields:
+            raise CellFormatError(
+                f"{separate_selection_manifest_path} selection_manifest lacks readable fields "
+                f"{missing_selection_fields}."
+            )
+        if natural_prefix_selection_manifest is not None:
+            if not isinstance(natural_prefix_selection_manifest, dict):
+                raise CellFormatError(
+                    f"{manifest_path} natural_prefix_selection_manifest must be an object."
+                )
+            changed_selection_fields = [
+                field_name
+                for field_name in NATURAL_SELECTION_IDENTITY_FIELDS
+                if natural_prefix_selection_manifest.get(field_name)
+                != separate_selection_manifest.get(field_name)
+            ]
+            if changed_selection_fields:
+                raise CellFormatError(
+                    f"{manifest_path} and {separate_selection_manifest_path} differ in "
+                    f"natural selection fields {changed_selection_fields}."
+                )
+        natural_prefix_selection_manifest = separate_selection_manifest
     return CapturedCell(
         arm=str(manifest["arm"]),
         step=int(manifest["step"]),
@@ -1199,8 +1397,9 @@ def read_cell(cell_dir: Path) -> CapturedCell:
         prefix_stimulus_ids=prefix_stimulus_ids,
         natural_prefix_activations=natural_prefix_activations,
         natural_prefix_selection_manifest=cast(
-            "dict[str, Any] | None", manifest.get("natural_prefix_selection_manifest")
+            "dict[str, Any] | None", natural_prefix_selection_manifest
         ),
+        stimulus_records=stimulus_records,
     )
 
 
@@ -1262,22 +1461,74 @@ class Ladder:
         )
 
 
-def assert_ladder_identity(cells: Sequence[CapturedCell]) -> None:
+def assert_ladder_identity(  # noqa: C901, PLR0912 - compares legacy and readable identity fields
+    cells: Sequence[CapturedCell],
+) -> None:
     """Raise unless every cell measured the same thing, reporting every field that differs.
 
-    All discrepancies at once, not the first: a ladder assembled from two capture passes usually
-    differs in several fields, and fixing them one error at a time means one re-read per field.
+    Direct stimulus and selection fields supersede their legacy digests when every cell stores them.
+    All discrepancies are reported together because ladders assembled from separate capture passes
+    often differ in several fields.
     """
     if not cells:
         raise CellFormatError("no cells to compare; a ladder of nothing has no identity.")
     reference = cells[0]
     differing: dict[str, dict[str, Any]] = {}
+    have_stimulus_records = all(cell.stimulus_records is not None for cell in cells)
+    have_selection_manifests = all(
+        cell.natural_prefix_selection_manifest is not None for cell in cells
+    )
+    replaced_hash_fields: set[str] = set()
+    if have_stimulus_records:
+        replaced_hash_fields.add("stimuli_sha256")
+    if have_selection_manifests:
+        replaced_hash_fields.add("natural_selection_manifest_sha256")
     for cell in cells[1:]:
         for identity_field in CellIdentity.__dataclass_fields__:
+            if identity_field in replaced_hash_fields:
+                continue
             mine = getattr(cell.identity, identity_field)
             theirs = getattr(reference.identity, identity_field)
             if mine != theirs:
                 differing.setdefault(identity_field, {reference.label: theirs})[cell.label] = mine
+        if have_stimulus_records and cell.stimulus_records != reference.stimulus_records:
+            changed_stimulus_ids: set[str] = set()
+            changed_stimulus_fields: set[str] = set()
+            reference_records = cast("dict[str, list[dict[str, Any]]]", reference.stimulus_records)
+            cell_records = cast("dict[str, list[dict[str, Any]]]", cell.stimulus_records)
+            for stimulus_set in set(reference_records) | set(cell_records):
+                expected_records = reference_records.get(stimulus_set, [])
+                actual_records = cell_records.get(stimulus_set, [])
+                if len(expected_records) != len(actual_records):
+                    changed_stimulus_fields.add("stimulus_count")
+                for row_number in range(max(len(expected_records), len(actual_records))):
+                    expected = (
+                        expected_records[row_number] if row_number < len(expected_records) else {}
+                    )
+                    actual = actual_records[row_number] if row_number < len(actual_records) else {}
+                    for field_name in STIMULUS_IDENTITY_FIELDS:
+                        if expected.get(field_name) != actual.get(field_name):
+                            changed_stimulus_fields.add(field_name)
+                            stimulus_id = expected.get("stimulus_id") or actual.get("stimulus_id")
+                            if stimulus_id is not None:
+                                changed_stimulus_ids.add(str(stimulus_id))
+            for field_name in changed_stimulus_fields:
+                differing.setdefault(
+                    f"stimulus_records.{field_name}", {reference.label: "reference"}
+                )[cell.label] = sorted(changed_stimulus_ids)
+        if have_selection_manifests:
+            reference_manifest = cast("dict[str, Any]", reference.natural_prefix_selection_manifest)
+            cell_manifest = cast("dict[str, Any]", cell.natural_prefix_selection_manifest)
+            changed_selection_fields = [
+                field_name
+                for field_name in NATURAL_SELECTION_IDENTITY_FIELDS
+                if reference_manifest.get(field_name) != cell_manifest.get(field_name)
+            ]
+            for field_name in changed_selection_fields:
+                differing.setdefault(
+                    f"natural_selection_manifest.{field_name}",
+                    {reference.label: reference_manifest.get(field_name)},
+                )[cell.label] = cell_manifest.get(field_name)
     if differing:
         raise CellFormatError(
             f"these cells did not measure the same thing, so comparing them would read a change in "
@@ -1301,14 +1552,112 @@ def assert_capture_provenance(cells: Sequence[CapturedCell]) -> None:
         )
 
 
-def assert_stimuli_match(cells: Sequence[CapturedCell], digest: str) -> None:
-    """Raise unless every cell was captured on the corpus `digest` names.
+def assert_stimuli_match(  # noqa: C901, PLR0912 - checks legacy and readable stimulus identities
+    cells: Sequence[CapturedCell],
+    stimuli: Sequence[Stimulus] | str,
+    *,
+    expected_digest: str | None = None,
+) -> None:
+    """Raise unless every cell's stored row ids and supplied corpus identity agree.
 
     The guard between a stimulus file and the tensors an analysis is about to read as if they came
     from it. Editing, extending or truncating a corpus after a capture leaves the tensors keyed to
-    the old rows while every id still resolves, so the numbers stay plausible and answer a question
-    about text that is no longer there.
+    the old rows while every id still resolves, so compare the stored ids and counts directly.
+    Older capture manifests do not retain stimulus text, so their legacy digest remains the only
+    check for same-id edits to text, prefixes or metadata.
     """
+    if isinstance(stimuli, str):
+        digest = stimuli
+        supplied_stimuli = None
+    else:
+        supplied_stimuli = stimuli
+        digest = stimuli_digest(stimuli)
+        if expected_digest is not None and expected_digest != digest:
+            raise CellFormatError(
+                "supplied stimuli_sha256 does not match the supplied Stimulus rows."
+            )
+    if supplied_stimuli is not None:
+        expected_by_set = _stimulus_records_by_set(supplied_stimuli)
+        for cell in cells:
+            if cell.stimulus_records is None:
+                expected_rows = {
+                    stimulus_set: {
+                        "stimulus_ids": [record["stimulus_id"] for record in records],
+                        "sides": [record["side"] for record in records],
+                        "pair_ids": [record["pair_id"] for record in records],
+                    }
+                    for stimulus_set, records in expected_by_set.items()
+                }
+                stored_rows = {
+                    stimulus_set: {
+                        "stimulus_ids": list(row_index.stimulus_ids),
+                        "sides": list(row_index.sides),
+                        "pair_ids": list(row_index.pair_ids),
+                    }
+                    for stimulus_set, row_index in cell.rows.items()
+                }
+                if stored_rows != expected_rows:
+                    mismatched_fields = sorted(
+                        {
+                            field
+                            for stimulus_set in set(stored_rows) | set(expected_rows)
+                            for field in ("stimulus_ids", "sides", "pair_ids")
+                            if stored_rows.get(stimulus_set, {}).get(field)
+                            != expected_rows.get(stimulus_set, {}).get(field)
+                        }
+                    )
+                    raise CellFormatError(
+                        f"{cell.label} stimulus row fields differ from the supplied corpus: "
+                        f"{mismatched_fields}; compare stored ids and counts before reading activations."
+                    )
+                if cell.identity.stimuli_sha256 != digest:
+                    raise CellFormatError(
+                        f"{cell.label} stimulus_text, assistant_prefix or metadata differ from the "
+                        f"supplied corpus; legacy manifests identify those fields only through "
+                        f"stimuli_sha256 ({short_digest(cell.identity.stimuli_sha256)} vs "
+                        f"{short_digest(digest)})."
+                    )
+                continue
+
+            changed_fields: set[str] = set()
+            changed_ids: set[str] = set()
+            if set(cell.stimulus_records) != set(expected_by_set):
+                changed_fields.add("stimulus_sets")
+            field_names = {
+                "stimulus_id": "stimulus_ids",
+                "side": "sides",
+                "pair_id": "pair_ids",
+                "text": "stimulus_text",
+                "assistant_prefix": "assistant_prefix",
+                "metadata": "metadata",
+            }
+            for stimulus_set in set(cell.stimulus_records) | set(expected_by_set):
+                stored_records = cell.stimulus_records.get(stimulus_set, [])
+                expected_records = expected_by_set.get(stimulus_set, [])
+                if len(stored_records) != len(expected_records):
+                    changed_fields.add("stimulus_count")
+                for row_number in range(max(len(stored_records), len(expected_records))):
+                    stored_record = (
+                        stored_records[row_number] if row_number < len(stored_records) else {}
+                    )
+                    expected_record = (
+                        expected_records[row_number] if row_number < len(expected_records) else {}
+                    )
+                    for stored_field, reported_field in field_names.items():
+                        if stored_record.get(stored_field) != expected_record.get(stored_field):
+                            changed_fields.add(reported_field)
+                            stimulus_id = expected_record.get("stimulus_id") or stored_record.get(
+                                "stimulus_id"
+                            )
+                            if stimulus_id is not None:
+                                changed_ids.add(str(stimulus_id))
+            if changed_fields:
+                raise CellFormatError(
+                    f"{cell.label} stimulus fields {sorted(changed_fields)} differ for ids "
+                    f"{sorted(changed_ids)}."
+                )
+        return
+
     mismatched = {
         cell.label: cell.identity.stimuli_sha256
         for cell in cells
@@ -1317,9 +1666,7 @@ def assert_stimuli_match(cells: Sequence[CapturedCell], digest: str) -> None:
     if mismatched:
         raise CellFormatError(
             f"cells were captured on a different stimulus corpus than the one supplied "
-            f"(digest {short_digest(digest)}): {json.dumps(mismatched, sort_keys=True)}. Re-capture, or "
-            f"analyse against the corpus these cells actually ran; the row ids would resolve either "
-            f"way and the mismatch would only show up as a result about text that changed."
+            f"(digest {short_digest(digest)}): {json.dumps(mismatched, sort_keys=True)}."
         )
 
 
@@ -1415,19 +1762,21 @@ def assert_adapter_moved_activations(cells: Sequence[CapturedCell]) -> None:
         )
 
 
-def load_ladder(
+def load_ladder(  # noqa: PLR0913 - keeps the legacy digest and adds readable source rows
     root: Path,
     *,
     arms: Sequence[str] | None = None,
     steps: Sequence[int] | None = None,
     stimuli_sha256: str | None = None,
+    stimuli: Sequence[Stimulus] | None = None,
     require_capture_provenance: bool = False,
 ) -> Ladder:
     """Read every cell under `root` that the filters keep, and refuse an incomparable set.
 
     `arms` and `steps` are filters over what is present; an arm or step asked for and absent is
     fatal, because a ladder quietly short one checkpoint reads later as a flat stretch of trend.
-    `stimuli_sha256` additionally pins the corpus the caller is about to analyse against.
+    `stimuli` compares readable row ids/counts and its digest checks text for older manifests that
+    do not store source stimulus text. `stimuli_sha256` remains for legacy callers.
     """
     cells = [read_cell(cell_dir) for cell_dir in find_cells(root)]
     if not cells:
@@ -1457,7 +1806,9 @@ def load_ladder(
     if require_capture_provenance:
         assert_capture_provenance(ordered)
     assert_rows_align(ordered)
-    if stimuli_sha256 is not None:
+    if stimuli is not None:
+        assert_stimuli_match(ordered, stimuli, expected_digest=stimuli_sha256)
+    elif stimuli_sha256 is not None:
         assert_stimuli_match(ordered, stimuli_sha256)
     assert_adapter_moved_activations(ordered)
     logger.info(

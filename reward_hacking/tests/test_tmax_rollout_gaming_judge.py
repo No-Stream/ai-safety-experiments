@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
+from argparse import Namespace
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from reward_hacking.bedrock_batch import BatchJobHandle, cell_digest, prompt_digest
 from reward_hacking.model_backend import (
     STOP_REASON_MAX_TOKENS,
     BedrockCompletion,
@@ -70,6 +73,25 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 TASK_ID = "task_000042_0badf00d"
+
+
+def _empty_batch_handle() -> BatchJobHandle:
+    return BatchJobHandle(
+        job_arn="arn:aws:bedrock:us-west-2:000000000000:model-invocation-job/synthetic",
+        job_name="synthetic-job",
+        model_id="synthetic-model",
+        record_count=0,
+        prompt_digest=prompt_digest([]),
+        cell_digest=cell_digest([]),
+        submitted_prompts=[],
+        submitted_cells=[],
+        input_uri="s3://synthetic-bucket/input.jsonl",
+        output_uri="s3://synthetic-bucket/output/",
+        region="us-west-2",
+        profile=None,
+        submitted_at="2026-10-17T00:00:00+00:00",
+    )
+
 
 # A stand-in for the gitignored instruction file the CLI takes by path.
 JUDGE_INSTRUCTIONS = (
@@ -341,6 +363,93 @@ class TestSamplingBudget:
         manifest = json.loads((tmp_path / "out" / "sample_manifest.json").read_text())
         assert manifest["sampling_budget"]["total_episodes"] == 9
         assert manifest["sampling_budget"]["oversize_reason"] == "audited rerun"
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedBatchSample:
+    rows: list[dict[str, Any]]
+    prompts: list[str]
+    metadata: list[dict[str, Any]]
+
+
+class TestCollectHandleContentIdentity:
+    @staticmethod
+    def _run_collect(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        handle: BatchJobHandle,
+        rendered: RenderedBatchSample,
+    ) -> bool:
+        class EmptyBatchBackend:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.usage = TokenUsage()
+                self.collected = False
+
+            def collect(self, *_args: object, **_kwargs: object) -> list[BedrockCompletion]:
+                self.collected = True
+                return []
+
+        backend = EmptyBatchBackend()
+        monkeypatch.setattr(BatchJobHandle, "load", lambda *_args: handle)
+        monkeypatch.setattr(
+            rollout_gaming_judge,
+            "_load_sample_and_prompts",
+            lambda _args: (
+                rendered.rows,
+                rendered.prompts,
+                rendered.metadata,
+                "synthetic instructions",
+            ),
+        )
+        monkeypatch.setattr(
+            rollout_gaming_judge, "BedrockBatchBackend", lambda *_args, **_kwargs: backend
+        )
+        args = Namespace(
+            out_dir=tmp_path,
+            model=handle.model_id,
+            poll_seconds=0.0,
+            timeout_seconds=0.0,
+        )
+        rollout_gaming_judge._cmd_collect(args)
+        return backend.collected
+
+    def test_changed_digest_provenance_does_not_block_matching_content(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        handle = _empty_batch_handle()
+        handle = replace(handle, prompt_digest="old prompt digest", cell_digest="old cell digest")
+
+        assert self._run_collect(
+            monkeypatch,
+            tmp_path,
+            handle=handle,
+            rendered=RenderedBatchSample(rows=[], prompts=[], metadata=[]),
+        )
+
+    def test_changed_cell_metadata_is_named_and_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        handle = replace(
+            _empty_batch_handle(),
+            record_count=1,
+            prompt_digest=prompt_digest(["synthetic prompt"]),
+            cell_digest=cell_digest([{"key": "row-1", "arm": "control"}]),
+            submitted_prompts=["synthetic prompt"],
+            submitted_cells=[{"key": "row-1", "arm": "control"}],
+        )
+
+        with pytest.raises(RuntimeError, match=r"cells\[0\]\.arm differs"):
+            self._run_collect(
+                monkeypatch,
+                tmp_path,
+                handle=handle,
+                rendered=RenderedBatchSample(
+                    rows=[{"key": "row-1"}],
+                    prompts=["synthetic prompt"],
+                    metadata=[{"key": "row-1", "arm": "treatment"}],
+                ),
+            )
 
 
 def turn_record(index: int, reasoning: str, visible: str) -> dict[str, Any]:

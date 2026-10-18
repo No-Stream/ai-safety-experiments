@@ -37,8 +37,8 @@ What this module turns judged rows into, and the convention each follows:
   step count other than two gets no delta and is named in a warning, never dropped silently.
 - **Keyword agreement**: the judge's coarse basis against the deterministic companion on every row,
   as a rate plus the disagreement listing. Never merged: disagreement is an instrument finding.
-- **Drawn overlay**: the hand-read samples' rows, matched on (step, prompt_id, sample_index, digest of
-  the completion), tallied again beside the census so the registered "drawn cooperator traces" reading
+- **Drawn overlay**: the hand-read samples' rows, matched on (step, prompt_id, sample_index) and exact
+  completion text, tallied again beside the census so the registered "drawn cooperator traces" reading
   can be reported from the same rows. The step is in the handle because a short deterministic trace can
   be byte-identical at two steps of one prompt.
 - **Hand-label validation**: a confusion per labelled dimension with a strict and a lenient agreement
@@ -48,7 +48,7 @@ What this module turns judged rows into, and the convention each follows:
   coincide with ``payoff_reasoning_present`` on a cooperator-only set by construction. Hand-label keys
   follow the sample exports' spelling (``rung`` or ``source_arm``, the export's own ``cell``, ``order``
   for the control's print order) and are translated to judged rows through the sample files' completion
-  digests.
+  text.
 """
 
 from __future__ import annotations
@@ -100,8 +100,8 @@ no tree and no meta beside it, and a framing off the tracked registry means two 
 depending on whether that cell loaded a framings file at all.
 """
 
-type Handle = tuple[int, str, int, str]
-"""(step, prompt_id, sample_index, sha256 of the completion): the arm-agnostic identity of one record."""
+type Handle = tuple[int, str, int]
+"""(step, prompt_id, sample_index): the arm-agnostic identity of one record."""
 
 
 def _log_binomial_pmf(k: int, n: int, p: float) -> float:
@@ -331,18 +331,17 @@ def sample_row_key(row: Mapping[str, Any]) -> str:
     return f"{arm}|{row['cell']}|{row['step']}|{row['prompt_id']}|{row['sample_index']}|{order}"
 
 
-def _row_handle(row: Mapping[str, Any], digest: str) -> Handle:
-    return (int(row["step"]), str(row["prompt_id"]), int(row["sample_index"]), digest)
+def _row_handle(row: Mapping[str, Any]) -> Handle:
+    return (int(row["step"]), str(row["prompt_id"]), int(row["sample_index"]))
 
 
 def load_sample_handles(paths: Sequence[Path], *, only_keys: set[str] | None = None) -> set[Handle]:
-    """Load the exported sample rows as (step, prompt_id, sample_index, sha256(completion)) handles.
+    """Load exported sample rows as (step, prompt_id, sample_index) handles.
 
     The sample files carry no arm label in the judged rows' spelling and disagree with each other about
-    the print-order field's name, so the overlay matches on the completion's digest beside the three
-    identity fields every row carries; the digest is what a judged row stores. ``only_keys`` keeps
-    only the rows whose :func:`sample_row_key` is listed, which is how the hand-labelled calibration
-    subset is selected out of a full export.
+    the print-order field's name, so the overlay uses the three stable record identity fields shared by
+    every export. ``only_keys`` keeps only rows whose :func:`sample_row_key` is listed, which is how
+    the hand-labelled calibration subset is selected out of a full export.
     """
     handles: set[Handle] = set()
     for path in paths:
@@ -353,13 +352,12 @@ def load_sample_handles(paths: Sequence[Path], *, only_keys: set[str] | None = N
                 row = json.loads(line)
                 if only_keys is not None and sample_row_key(row) not in only_keys:
                     continue
-                digest = hashlib.sha256(str(row["completion"]).encode("utf-8")).hexdigest()
-                handles.add(_row_handle(row, digest))
+                handles.add(_row_handle(row))
     return handles
 
 
 def _judged_handle(row: Mapping[str, Any]) -> Handle:
-    return _row_handle(row, str(row["completion_sha256"]))
+    return _row_handle(row)
 
 
 def decision_of(row: Mapping[str, Any]) -> str:
@@ -776,28 +774,20 @@ def resolve_hand_keys(
     """Map every hand-label key to a judged-row key, through the sample exports where the spellings differ.
 
     A hand key that is itself a judged key resolves directly. Otherwise it is the sample exports'
-    spelling (:func:`sample_row_key`), and the sample row's completion digest finds the judged row,
-    because the digest is the one identity both files share. Unresolved keys raise: a calibration set
-    has to be judged before it can calibrate anything.
+    spelling (:func:`sample_row_key`), and the sample's record identity finds candidate judged rows.
+    Their completion text is compared exactly before a row can receive the hand label. Older judged
+    rows have no stored text, so their recorded digest remains a compatibility check for those rows.
+    Unresolved keys raise: a calibration set has to be judged before it can calibrate anything.
     """
-    by_handle = {_judged_handle(row): key for key, row in judged.items() if "verdict" in row}
-    sample_key_to_handle: dict[str, Handle] = {}
-    for path in sample_paths:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                digest = hashlib.sha256(str(row["completion"]).encode("utf-8")).hexdigest()
-                sample_key_to_handle[sample_row_key(row)] = _row_handle(row, digest)
+    by_handle: defaultdict[Handle, list[tuple[str, Mapping[str, Any]]]] = defaultdict(list)
+    for key, row in judged.items():
+        if "verdict" in row:
+            by_handle[_judged_handle(row)].append((key, row))
+    sample_key_to_record = _sample_records_by_key(sample_paths)
     resolved: dict[str, str] = {}
     unresolved: list[str] = []
     for key in labels:
-        if key in judged and "verdict" in judged[key]:
-            resolved[key] = key
-            continue
-        handle = sample_key_to_handle.get(key)
-        judged_key = by_handle.get(handle) if handle is not None else None
+        judged_key = _resolve_hand_key(key, judged, by_handle, sample_key_to_record)
         if judged_key is None:
             unresolved.append(key)
         else:
@@ -808,6 +798,54 @@ def resolve_hand_keys(
             f"--only-hand-labelled): {unresolved}"
         )
     return resolved
+
+
+def _sample_records_by_key(sample_paths: Sequence[Path]) -> dict[str, tuple[Handle, str]]:
+    sample_key_to_record: dict[str, tuple[Handle, str]] = {}
+    for path in sample_paths:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                sample_key_to_record[sample_row_key(row)] = (
+                    _row_handle(row),
+                    str(row["completion"]),
+                )
+    return sample_key_to_record
+
+
+def _resolve_hand_key(
+    key: str,
+    judged: Mapping[str, Mapping[str, Any]],
+    by_handle: Mapping[Handle, list[tuple[str, Mapping[str, Any]]]],
+    sample_key_to_record: Mapping[str, tuple[Handle, str]],
+) -> str | None:
+    if key in judged and "verdict" in judged[key]:
+        return key
+    sample = sample_key_to_record.get(key)
+    if sample is None:
+        return None
+    handle, completion = sample
+    candidates = [
+        judged_key
+        for judged_key, row in by_handle.get(handle, [])
+        if _sample_completion_matches(row, completion)
+    ]
+    if len(candidates) > 1:
+        raise ValueError(
+            f"hand-labelled record {key!r} matches multiple judged rows {candidates}; "
+            "the sample identity is ambiguous."
+        )
+    return candidates[0] if candidates else None
+
+
+def _sample_completion_matches(row: Mapping[str, Any], completion: str) -> bool:
+    """Compare the sample's completion text, with digest fallback for legacy judged rows only."""
+    if "completion_text" in row:
+        return row["completion_text"] == completion
+    digest = hashlib.sha256(completion.encode("utf-8")).hexdigest()
+    return row.get("completion_sha256") == digest
 
 
 def validation_report(

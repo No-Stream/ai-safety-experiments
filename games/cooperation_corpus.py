@@ -23,6 +23,7 @@ from typing import Any
 
 from games.arms import ARMS, arm_game_ids
 from games.framing_stimulus import RuntimeFramings, load_framings, resolve_framing_clause
+from games.prompt_variants import PROMPT_VARIANT_NONE, apply_prompt_variant
 from games.prompts import (
     COUNTERPART_FRAMINGS,
     FRAMING_HUMAN,
@@ -830,22 +831,88 @@ def _validate_prompt_identity(
     prompt_ids = tuple(str(record.get("prompt_id", "")) for record in records)
     expected_ids = tuple(str(prompt_id) for prompt_id in expected_prompt_ids)
     if prompt_ids != expected_ids:
-        raise ValueError("sweep prompt identity/order differs from the expected corpus")
+        found_set = set(prompt_ids)
+        expected_set = set(expected_ids)
+        missing = sorted(expected_set - found_set)
+        unexpected = sorted(found_set - expected_set)
+        first_order_mismatch = next(
+            (
+                (index, found, expected)
+                for index, (found, expected) in enumerate(
+                    zip(prompt_ids, expected_ids, strict=False)
+                )
+                if found != expected
+            ),
+            None,
+        )
+        raise ValueError(
+            "sweep prompt IDs differ from the expected corpus: "
+            f"found_count={len(prompt_ids)}, expected_count={len(expected_ids)}, "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
+            f"first_order_mismatch={first_order_mismatch}"
+        )
     if len(prompt_ids) != len(set(prompt_ids)):
         raise ValueError("sweep repeats a prompt_id")
     order_digest = hashlib.sha256("\n".join(prompt_ids).encode("utf-8")).hexdigest()
-    if str(meta.get("prompt_id_order_sha256", "")) != order_digest:
-        raise ValueError("sweep-meta prompt-id digest does not match its records")
     if int(meta.get("n_prompts", -1)) != len(prompt_ids):
-        raise ValueError("sweep-meta n_prompts does not match its records")
+        raise ValueError(
+            "sweep-meta n_prompts differs from its records: "
+            f"found={meta.get('n_prompts')!r}, expected={len(prompt_ids)}"
+        )
     return order_digest
 
 
-def _validate_rows_identity(meta: Mapping[str, Any], expected_rows_sha256: str | None) -> None:
-    if expected_rows_sha256 is None:
+def _row_field_differences(expected: object, found: object, *, field_path: str) -> list[str]:
+    if isinstance(expected, Mapping) and isinstance(found, Mapping):
+        differences: list[str] = []
+        for key in sorted(set(expected) | set(found), key=str):
+            child_path = f"{field_path}.{key}"
+            if key not in expected or key not in found:
+                differences.append(child_path)
+            else:
+                differences.extend(
+                    _row_field_differences(expected[key], found[key], field_path=child_path)
+                )
+        return differences
+    if isinstance(expected, list) and isinstance(found, list):
+        differences = []
+        for index in range(max(len(expected), len(found))):
+            child_path = f"{field_path}[{index}]"
+            if index >= len(expected) or index >= len(found):
+                differences.append(child_path)
+            else:
+                differences.extend(
+                    _row_field_differences(expected[index], found[index], field_path=child_path)
+                )
+        return differences
+    return [] if expected == found else [field_path]
+
+
+def _validate_rows_identity(
+    records: Sequence[Mapping[str, Any]], expected_rows: Sequence[Mapping[str, Any]] | None
+) -> None:
+    if expected_rows is None:
         return
-    if str(meta.get("rows_sha256", "")) != expected_rows_sha256:
-        raise ValueError("sweep prompt-content digest differs from the expected corpus")
+    expected_rows_by_id = {str(row["prompt_id"]): row for row in expected_rows}
+    if len(expected_rows_by_id) != len(expected_rows):
+        raise ValueError("expected corpus repeats a prompt_id")
+    differences: list[str] = []
+    for record in records:
+        prompt_id = str(record["prompt_id"])
+        row = record.get("row")
+        if not isinstance(row, Mapping):
+            raise TypeError(f"sweep record {prompt_id!r} has no structured row")
+        expected_row = expected_rows_by_id.get(prompt_id)
+        if expected_row is None:
+            differences.append(f"prompt_rows_by_id.{prompt_id} is missing from the expected corpus")
+            continue
+        differences.extend(
+            _row_field_differences(expected_row, row, field_path=f"prompt_rows_by_id.{prompt_id}")
+        )
+    if differences:
+        raise ValueError(
+            "sweep prompt rows differ from the expected corpus at " + ", ".join(differences[:8])
+        )
 
 
 def _validate_sweep_provenance(
@@ -854,7 +921,7 @@ def _validate_sweep_provenance(
     expected_prompt_ids: Sequence[str],
     expected_model_id: str,
     expected_sampler_identity: Mapping[str, Any],
-    expected_rows_sha256: str | None,
+    expected_rows: Sequence[Mapping[str, Any]] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, Mapping[str, Any]]:
     meta, records = _split_trace_entries(entries)
     sampler_identity = _validate_backend_identity(
@@ -863,7 +930,7 @@ def _validate_sweep_provenance(
         expected_sampler_identity=expected_sampler_identity,
     )
     order_digest = _validate_prompt_identity(meta, records, expected_prompt_ids=expected_prompt_ids)
-    _validate_rows_identity(meta, expected_rows_sha256)
+    _validate_rows_identity(records, expected_rows)
     return meta, records, order_digest, sampler_identity
 
 
@@ -928,25 +995,25 @@ def summarize_sweep_trace(  # noqa: PLR0913 - each identity axis is checked inde
     expected_prompt_ids: Sequence[str],
     expected_model_id: str,
     expected_sampler_identity: Mapping[str, Any],
-    expected_rows_sha256: str | None = None,
+    expected_rows: Sequence[Mapping[str, Any]] | None = None,
     expected_strata: Sequence[tuple[str, str, str]] | None = None,
 ) -> SweepTraceAudit:
     """Summarize observed reward variance and termination after checking sweep provenance.
 
     ``trace`` is either a JSONL path written by ``games.select_prompts`` or its already-loaded
     records. The function requires the caller to provide the prompt identity, model id and sampler
-    identity expected for the comparison. Pass ``expected_rows_sha256`` when the trace was generated
-    from a concrete corpus file; this checks prompt bytes as well as the prompt-id order. The
-    function therefore cannot turn a trace with missing or drifted provenance into apparently
-    comparable evidence. Rows and completions are consumed only for their structured fields; prompt
-    text is never copied into the audit.
+    identity expected for the comparison. Pass ``expected_rows`` when the trace was generated from a
+    concrete corpus; this compares every stored row field by prompt ID, including the rendered prompt
+    text. The function therefore cannot turn a trace with missing or drifted provenance into
+    apparently comparable evidence. Prompt text is checked in memory and is never copied into the
+    audit summary.
     """
     _, records, order_digest, sampler_identity = _validate_sweep_provenance(
         _trace_entries(trace),
         expected_prompt_ids=expected_prompt_ids,
         expected_model_id=expected_model_id,
         expected_sampler_identity=expected_sampler_identity,
-        expected_rows_sha256=expected_rows_sha256,
+        expected_rows=expected_rows,
     )
     observed: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for record in records:
@@ -979,23 +1046,36 @@ def summarize_sweep_trace(  # noqa: PLR0913 - each identity axis is checked inde
     )
 
 
-def write_post_screen_summary(
+def write_post_screen_summary(  # noqa: PLR0913 - corpus rows are the readable comparison input
     trace_path: Path,
     corpus_path: Path,
     output_path: Path,
     *,
     expected_model_id: str,
     expected_sampler_identity: Mapping[str, Any],
+    expected_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> Path:
-    """Summarize a complete matching-sampler trace against a frozen corpus on disk."""
-    rows = read_jsonl(corpus_path)
+    """Summarize a complete matching-sampler trace against a captured or frozen corpus."""
+    if expected_rows is None:
+        rows = read_jsonl(corpus_path)
+        entries = _trace_entries(trace_path)
+        meta, _ = _split_trace_entries(entries)
+        prompt_variant = meta.get("prompt_variant", PROMPT_VARIANT_NONE)
+        if not isinstance(prompt_variant, str):
+            raise TypeError("sweep-meta prompt_variant must be a string")
+        rows = [
+            {**row, "prompt": apply_prompt_variant(str(row["prompt"]), prompt_variant)}
+            for row in rows
+        ]
+    else:
+        rows = [dict(row) for row in expected_rows]
     prompt_ids = [str(row["prompt_id"]) for row in rows]
     summary = summarize_sweep_trace(
         trace_path,
         expected_prompt_ids=prompt_ids,
         expected_model_id=expected_model_id,
         expected_sampler_identity=expected_sampler_identity,
-        expected_rows_sha256=rows_file_digest(corpus_path),
+        expected_rows=rows,
         expected_strata=expected_stratum_keys(rows),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)

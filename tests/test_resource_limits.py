@@ -95,6 +95,38 @@ def _mem_total_kib() -> int:
     raise AssertionError("no MemTotal in /proc/meminfo")
 
 
+def _fake_systemd_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    capture_path = tmp_path / "systemd-run-arguments"
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        "  *' is-system-running '*) echo running ;;\n"
+        "  *' show -p Result '*) echo \"${SYSTEMD_RESULT:-success}\" ;;\n"
+        "esac\n"
+    )
+    systemctl.chmod(0o755)
+    systemd_run = bin_dir / "systemd-run"
+    systemd_run.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\0\' "$@" > "$SYSTEMD_RUN_CAPTURE"\n'
+        'while [ "$#" -gt 0 ] && [ "$1" != \'--\' ]; do shift; done\n'
+        '[ "$#" -gt 0 ] || exit 9\n'
+        "shift\n"
+        'exec "$@"\n'
+    )
+    systemd_run.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "SYSTEMD_RUN_CAPTURE": str(capture_path),
+        "SYSTEMD_RESULT": "success",
+    }
+    return environment, capture_path
+
+
 @pytest.fixture
 def four_core_host(tmp_path: Path) -> dict[str, str]:
     """An environment whose `nproc` reports four cores, like a g6e.xlarge."""
@@ -223,6 +255,83 @@ class TestTheMemoryCapFollowsTheHost:
         assert completed.returncode == 0, completed.stdout + completed.stderr
         assert completed.stdout.strip().splitlines()[-1] == "unlimited"
         assert "--no-address-cap" in completed.stderr, "the opt-out must be announced, not silent"
+
+
+@pytest.mark.parametrize(
+    ("limiter_options", "expected_policy"),
+    [([], "OOMPolicy=kill"), (["--preserve-processes-on-oom"], "OOMPolicy=continue")],
+)
+def test_group_oom_policy_changes_only_when_requested(
+    tmp_path: Path, limiter_options: list[str], expected_policy: str
+) -> None:
+    environment, capture_path = _fake_systemd_environment(tmp_path)
+    completed = subprocess.run(  # noqa: S603 - repo limiter with a synthetic systemd manager
+        [str(LIMITER), *limiter_options, "--", "/bin/true"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    limiter_arguments = capture_path.read_bytes().decode().split("\0")
+    assert expected_policy in limiter_arguments
+    other_policy = "OOMPolicy=continue" if expected_policy == "OOMPolicy=kill" else "OOMPolicy=kill"
+    assert other_policy not in limiter_arguments
+
+
+@pytest.mark.parametrize(
+    ("limiter_options", "expected_swap_property"),
+    [([], None), (["--mem-swap-max", "0"], "MemorySwapMax=0")],
+)
+def test_memory_swap_limit_is_only_set_when_requested(
+    tmp_path: Path, limiter_options: list[str], expected_swap_property: str | None
+) -> None:
+    environment, capture_path = _fake_systemd_environment(tmp_path)
+    completed = subprocess.run(  # noqa: S603 - repo limiter with a synthetic systemd manager
+        [str(LIMITER), *limiter_options, "--", "/bin/true"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    limiter_arguments = capture_path.read_bytes().decode().split("\0")
+    swap_properties = [
+        argument for argument in limiter_arguments if argument.startswith("MemorySwapMax=")
+    ]
+    if expected_swap_property is None:
+        assert swap_properties == []
+    else:
+        assert swap_properties == [expected_swap_property]
+
+
+@pytest.mark.parametrize(
+    ("preserve_processes", "expected_diagnostic"),
+    [
+        (False, "the job's cgroup was killed, the box was not"),
+        (True, "OOMPolicy=continue kept the remaining processes running"),
+    ],
+)
+def test_oom_result_diagnostic_matches_the_unit_policy(
+    tmp_path: Path, preserve_processes: bool, expected_diagnostic: str
+) -> None:
+    environment, _ = _fake_systemd_environment(tmp_path)
+    environment["SYSTEMD_RESULT"] = "oom-kill"
+    limiter_options = ["--preserve-processes-on-oom"] if preserve_processes else []
+    completed = subprocess.run(  # noqa: S603 - repo limiter with a synthetic systemd manager
+        [str(LIMITER), *limiter_options, "--", "/bin/true"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 137
+    assert "OOM-KILLED at MemoryMax=" in completed.stderr
+    assert expected_diagnostic in completed.stderr
 
 
 @pytest.mark.skipif(

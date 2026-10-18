@@ -175,6 +175,7 @@ def test_script_move_and_restore_runs_through_loop(
         timeout="120s",
         jail_backend=None,
         deadline=time.monotonic() + 60,
+        turn_index=0,
         command=loop._CommandContext(
             tmp_path, "120s", None, None, None, protected_paths=("tests/acceptance/",)
         ),

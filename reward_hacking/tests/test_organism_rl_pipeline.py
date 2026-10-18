@@ -111,3 +111,166 @@ def test_incomplete_or_mixed_grpo_groups_are_refused() -> None:
         _validate_prompt_groups(["first"] * 7, generations=8)
     with pytest.raises(ValueError, match="one repeated task"):
         _validate_prompt_groups(["first"] * 7 + ["second"], generations=8)
+
+
+def test_dynamic_refill_waves_keep_step_and_prefetch_next_after_finalize() -> None:
+    policy_version = 0
+    next_step_started = threading.Event()
+    finish_next_step = threading.Event()
+
+    def sample(step: int, job: list[str]) -> tuple[int, str, int]:
+        call = (step, job[0], policy_version)
+        if job[0] == "next" and step == 1:
+            next_step_started.set()
+            assert finish_next_step.wait(5)
+        return call
+
+    with StepEpisodePipeline(sample, max_workers=2) as pipeline:
+        pipeline.prefetch_dynamic(0, [["initial"]])
+        assert pipeline.collect_dynamic(0, [["initial"]]) == [(0, "initial", 0)]
+
+        assert pipeline.collect_dynamic(0, [["refill"]]) == [(0, "refill", 0)]
+
+        pipeline.prefetch_dynamic(1, [["next"]])
+        assert next_step_started.wait(5)
+        policy_version = 1
+        finish_next_step.set()
+        assert pipeline.collect_dynamic(1, [["next"]]) == [(1, "next", 0)]
+
+
+def test_dynamic_prefetch_deduplicates_unhashable_jobs_and_bounds_concurrency() -> None:
+    started = {name: threading.Event() for name in ("first", "second", "third", "fourth")}
+    release = threading.Event()
+    active_count = 0
+    maximum_active_count = 0
+    lock = threading.Lock()
+    sampled: list[str] = []
+
+    def sample(step: int, job: list[str]) -> tuple[int, str]:
+        nonlocal active_count, maximum_active_count
+        with lock:
+            active_count += 1
+            maximum_active_count = max(maximum_active_count, active_count)
+            sampled.append(job[0])
+        started[job[0]].set()
+        assert release.wait(5)
+        with lock:
+            active_count -= 1
+        return step, job[0]
+
+    with StepEpisodePipeline(sample, max_workers=2) as pipeline:
+        jobs = [["first"], ["second"], ["third"], ["fourth"]]
+        pipeline.prefetch_dynamic(7, jobs[:2])
+        pipeline.prefetch_dynamic(7, jobs[:2])
+        pipeline.prefetch_dynamic(7, jobs[2:])
+
+        assert started["first"].wait(5)
+        assert started["second"].wait(5)
+        assert not started["third"].is_set()
+        assert not started["fourth"].is_set()
+
+        release.set()
+        assert pipeline.collect_dynamic(7, jobs) == [
+            (7, "first"),
+            (7, "second"),
+            (7, "third"),
+            (7, "fourth"),
+        ]
+
+    assert maximum_active_count == 2
+    assert sorted(sampled) == ["first", "fourth", "second", "third"]
+
+
+def test_dynamic_pipeline_rejects_duplicates_and_replays_collected_jobs() -> None:
+    sampled: list[str] = []
+
+    def sample(step: int, job: str) -> str:
+        sampled.append(job)
+        return job
+
+    with StepEpisodePipeline(sample, max_workers=1) as pipeline:
+        with pytest.raises(ValueError, match="duplicate"):
+            pipeline.prefetch_dynamic(0, ["same", "same"])
+        assert pipeline.collect_dynamic(0, ["cold"]) == ["cold"]
+        pipeline.prefetch_dynamic(0, ["same"])
+        with pytest.raises(ValueError, match="finalized"):
+            pipeline.prefetch_dynamic(1, ["next"])
+        pipeline.prefetch_dynamic(0, ["same"])
+        assert pipeline.collect_dynamic(0, ["same"]) == ["same"]
+        assert pipeline.collect_dynamic(0, ["same"]) == ["same"]
+
+    assert sampled == ["cold", "same", "same"]
+
+
+def test_dynamic_empty_waves_can_finalize_and_advance_a_step() -> None:
+    sampled: list[tuple[int, str]] = []
+
+    def sample(step: int, job: str) -> tuple[int, str]:
+        sampled.append((step, job))
+        return step, job
+
+    with StepEpisodePipeline(sample, max_workers=1) as pipeline:
+        pipeline.prefetch_dynamic(0, [])
+        assert pipeline.collect_dynamic(0, []) == []
+        pipeline.prefetch_dynamic(1, [])
+        assert pipeline.collect_dynamic(1, []) == []
+        pipeline.prefetch_dynamic(2, ["prompt"])
+        assert pipeline.collect_dynamic(2, ["prompt"]) == [(2, "prompt")]
+
+    assert sampled == [(2, "prompt")]
+
+
+def test_dynamic_collection_propagates_future_errors_and_releases_failed_futures() -> None:
+    sample_count = 0
+
+    def sample(step: int, job: str) -> str:
+        nonlocal sample_count
+        sample_count += 1
+        raise RuntimeError(f"sampling failed at step {step} for {job}")
+
+    with StepEpisodePipeline(sample, max_workers=1) as pipeline:
+        with pytest.raises(RuntimeError, match="sampling failed"):
+            pipeline.collect_dynamic(0, ["bad"])
+        with pytest.raises(RuntimeError, match="sampling failed"):
+            pipeline.collect_dynamic(0, ["bad"])
+
+    assert sample_count == 2
+
+
+def test_dynamic_future_error_keeps_running_sibling_registered_until_it_finishes() -> None:
+    slow_started = threading.Event()
+    finish_slow = threading.Event()
+    sample_counts = {"bad": 0, "slow": 0}
+
+    def sample(step: int, job: str) -> str:
+        sample_counts[job] += 1
+        if job == "bad":
+            raise RuntimeError("sampling failed")
+        slow_started.set()
+        assert finish_slow.wait(5)
+        return job
+
+    with StepEpisodePipeline(sample, max_workers=2) as pipeline:
+        collection: Future[list[str]] = Future()
+
+        def collect_wave() -> None:
+            try:
+                collection.set_result(pipeline.collect_dynamic(0, ["bad", "slow"]))
+            except RuntimeError as error:
+                collection.set_exception(error)
+
+        collector = threading.Thread(target=collect_wave)
+        collector.start()
+        try:
+            assert slow_started.wait(5)
+            pipeline.prefetch_dynamic(0, ["slow"])
+            assert not collection.done()
+        finally:
+            finish_slow.set()
+
+        with pytest.raises(RuntimeError, match="sampling failed"):
+            collection.result(timeout=5)
+        collector.join(timeout=5)
+
+    assert collector.is_alive() is False
+    assert sample_counts == {"bad": 1, "slow": 1}

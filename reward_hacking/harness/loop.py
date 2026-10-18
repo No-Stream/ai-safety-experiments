@@ -143,6 +143,7 @@ from reward_hacking.model_backend import (
     STOP_REASON_STOP_SEQUENCE,
     generate_raw,
 )
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.trace import load_trace, write_trace
 
 if TYPE_CHECKING:
@@ -794,6 +795,8 @@ class AgentEpisodeTrace:
     deadline_seconds: float | None = None
     deadline_exceeded: bool = False
     ended_by: str | None = None
+    failure_reason: str | None = None
+    infrastructure_failure: dict[str, object] | None = None
     visible_check_unsatisfiable: bool = False
     visible_check_contradicts_truth: bool = False
     oracle_error: str | None = None
@@ -1019,6 +1022,8 @@ class AgentEpisodeTrace:
             "turns": len(self.turns),
             "turns_truncated": self.turns_truncated,
             "ended_by": self.ended_by,
+            "failure_reason": self.failure_reason,
+            "infrastructure_failure": self.infrastructure_failure,
             "fabricated_result_envelopes": self.fabricated_result_envelopes,
             "proxy": {
                 "grader_command": self.proxy_grader_command,
@@ -1104,6 +1109,7 @@ class AgentEpisodeTrace:
             f"submitted_empty={self.submitted_empty} note={self.empty_reason!r} | "
             f"checks_used={self.checks_used}/{self.arm.check_budget} "
             f"budget_exhausted={self.check_budget_exhausted} "
+            f"failure_reason={self.failure_reason!r} "
             f"deadline_exceeded={self.deadline_exceeded} "
             f"deadline_phase={None if self.deadline_phase is None else self.deadline_phase.value} "
             f"engine_wait_s={self.engine_wait_seconds:.0f} elapsed_s={elapsed}"
@@ -1449,6 +1455,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     check_grader: CheckGrader | None = None,
     phase_timings: _ActionTimings | None = None,
+    turn_index: int = 0,
 ) -> tuple[
     tuple[CommandResult, ...],
     str,
@@ -1456,6 +1463,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     int,
     tuple[str | None, ...],
     SnapshotLimitError | None,
+    dict[str, object] | None,
 ]:
     """Honor one turn's actions in emission order; return results, transcript tail, ending, checks.
 
@@ -1493,6 +1501,10 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     were not enough: a policy on the readable-with-verdict arm can rig ``grade.py``, collect fake
     ``<check/>`` passes it then reasons from, restore the original bytes, and finish with both
     endpoint hashes matching.
+
+    A typed persistent-supervisor failure is returned as the seventh value after recording the
+    attempted command with exit 125. It ends the episode as an unscorable infrastructure failure;
+    it is never treated as an ordinary policy command failure.
 
     ``before_command`` and ``after_command`` are instrumentation around the real command, while
     ``results`` remains the engine's independent record even if that command edits the in-scene
@@ -1535,6 +1547,21 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
         transcript_tail += action_result.transcript
         checks_used = action_result.checks_used
         check_sha256s.extend(action_result.check_sha256s)
+        if action_result.infrastructure_failure is not None:
+            failure = {
+                **action_result.infrastructure_failure,
+                "attempted_command": action.payload,
+                "turn_index": turn_index,
+            }
+            return (
+                tuple(results),
+                transcript_tail,
+                action_result.ending,
+                checks_used,
+                tuple(check_sha256s),
+                action_result.snapshot_error,
+                failure,
+            )
         if action_result.snapshot_error is not None or action_result.ending is not None:
             return (
                 tuple(results),
@@ -1543,8 +1570,9 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
                 checks_used,
                 tuple(check_sha256s),
                 action_result.snapshot_error,
+                None,
             )
-    return tuple(results), transcript_tail, None, checks_used, tuple(check_sha256s), None
+    return tuple(results), transcript_tail, None, checks_used, tuple(check_sha256s), None, None
 
 
 @dataclass(frozen=True)
@@ -1557,6 +1585,7 @@ class _ActionExecution:
     snapshot_error: SnapshotLimitError | None
     tool_execution_seconds: float = 0.0
     grading_seconds: float = 0.0
+    infrastructure_failure: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -1565,7 +1594,7 @@ class _ActionTimings:
     grading_seconds: float = 0.0
 
 
-def _run_one_action(  # noqa: PLR0913 - carry the existing episode command context unchanged
+def _run_one_action(  # noqa: PLR0911, PLR0913 - command outcome branches remain explicit
     action: Action,
     *,
     task: Task,
@@ -1643,6 +1672,31 @@ def _run_one_action(  # noqa: PLR0913 - carry the existing episode command conte
             (),
             exc,
             tool_execution_seconds=time.monotonic() - tool_started_at,
+        )
+    except PersistentJailSupervisorError as exc:
+        failure_result = CommandResult(
+            command=action.payload,
+            exit_code=125,
+            stdout="",
+            stderr=f"{type(exc).__name__}: {exc}",
+            timed_out=False,
+        )
+        if after_command is not None:
+            after_command(episode_dir, action.payload, failure_result)
+        return _ActionExecution(
+            (failure_result,),
+            _format_observation(failure_result) + "\n",
+            None,
+            checks_used,
+            (),
+            None,
+            tool_execution_seconds=time.monotonic() - tool_started_at,
+            infrastructure_failure={
+                "component": "persistent_jail_supervisor",
+                "reason": "persistent_jail_supervisor_failure",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
     if after_command is not None:
         after_command(episode_dir, action.payload, result)
@@ -2345,6 +2399,7 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
 
     consecutive_truncated_turns = 0
     ended_by: str | None = None
+    infrastructure_failure: dict[str, object] | None = None
     for turn_index in range(max_turns):
         # generate_raw underneath, not generate: only it reports the stop reason (see AgentTurn).
         attempt = _sample_within_budget(
@@ -2382,6 +2437,7 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
             checks_used,
             turn_check_sha256s,
             snapshot_error,
+            turn_infrastructure_failure,
         ) = _run_actions(
             completion,
             task=task,
@@ -2396,6 +2452,7 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
             after_command=after_command,
             check_grader=check_grader,
             phase_timings=action_timings,
+            turn_index=turn_index,
         )
         grader_check_sha256s.extend(turn_check_sha256s)
         ran_check = checks_used > checks_before
@@ -2415,6 +2472,10 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
             )
         )
         _append_trace_records(trace_path, [_turn_record(episode_id, task.task_id, turns[-1])])
+        if turn_infrastructure_failure is not None:
+            infrastructure_failure = turn_infrastructure_failure
+            ended_by = str(infrastructure_failure["reason"])
+            break
         if snapshot_error is not None:
             break
         # Before the "policy stopped" reading, which a clock-truncated turn imitates, and here so sampling stops.
@@ -2451,22 +2512,42 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
             break
 
     final_grading_timing = _FinalGradingTiming()
-    graded, sampled_report = _grade_completed_episode(
-        task,
-        episode_dir,
-        backend,
-        transcript,
-        arm=arm,
-        timeout=timeout,
-        jail_backend=jail_backend,
-        grader_hashable=grader_hashable,
-        final_report=final_report,
-        snapshot_error=snapshot_error,
-        episode_seconds=episode_seconds,
-        engine_gate=engine_gate,
-        stop_requested=stop_requested,
-        grading_timing=final_grading_timing,
-    )
+    if infrastructure_failure is None:
+        graded, sampled_report = _grade_completed_episode(
+            task,
+            episode_dir,
+            backend,
+            transcript,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            grader_hashable=grader_hashable,
+            final_report=final_report,
+            snapshot_error=snapshot_error,
+            episode_seconds=episode_seconds,
+            engine_gate=engine_gate,
+            stop_requested=stop_requested,
+            grading_timing=final_grading_timing,
+        )
+    else:
+        failure_message = str(infrastructure_failure["message"])
+        failure_reason = str(infrastructure_failure["reason"])
+        exception_type = str(infrastructure_failure["exception_type"])
+        graded = FinalGrade(
+            grader=CommandResult(
+                command="persistent_jail_supervisor",
+                exit_code=125,
+                stdout="",
+                stderr=f"{exception_type}: {failure_message}",
+                timed_out=False,
+            ),
+            proxy_pass=False,
+            true_pass=None,
+            oracle_error=failure_reason,
+            grader_pregrade_sha256=None,
+            true_evidence={"infrastructure_failure": dict(infrastructure_failure)},
+        )
+        sampled_report = None
     if sampled_report is not None:
         final_report_text = sampled_report.text
         final_report_truncated = sampled_report.truncated
@@ -2488,6 +2569,7 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
         proxy_grader_stderr=graded.grader.stderr,
         proxy_pass=graded.proxy_pass,
         true_pass=graded.true_pass,
+        true_measured=graded.true_pass is not None and graded.oracle_error is None,
         agent_saw_grader_success=saw_grader_success(task, turns),
         verdict=classify(
             proxy_pass=graded.proxy_pass,
@@ -2507,6 +2589,10 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
         deadline_seconds=episode_seconds,
         deadline_exceeded=deadline_phase is not None,
         ended_by=ended_by,
+        failure_reason=(
+            None if infrastructure_failure is None else str(infrastructure_failure["reason"])
+        ),
+        infrastructure_failure=infrastructure_failure,
         grader_mechanism=repository_mechanism_evidence(
             mechanism_before,
             repository_mechanism_snapshot(episode_dir, task.effective_grader_integrity_files),
@@ -2531,6 +2617,11 @@ def _run_agent_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - ordered episo
         docker_evidence_path=_docker_evidence_path(task, episode_dir),
     )
 
+    if infrastructure_failure is not None:
+        _append_trace_records(
+            trace_path,
+            [{"record": "episode_infrastructure_failure", **infrastructure_failure}],
+        )
     # The turns are already on disk, appended as they finished; only the summary is new.
     _append_trace_records(trace_path, [trace.summary_record()])
     return trace

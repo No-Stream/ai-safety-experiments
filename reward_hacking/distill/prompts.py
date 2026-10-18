@@ -545,7 +545,7 @@ def _resolve_hint_fields(
         return HintResolution(None, "historical hint unavailable: environment identity mismatch")
 
     if hint_text_value is not None:
-        return _hint_from_recorded_text(environment, variant, hint_text_value, stored_digest)
+        return _hint_from_recorded_text(environment, variant, hint_text_value)
     if stored_digest is None:
         raise AssertionError("required legacy hint digest was not validated")
     return _hint_from_legacy_digest(environment, variant, stored_digest)
@@ -566,13 +566,10 @@ def _hint_from_recorded_text(
     environment: str,
     variant: str,
     text: str,
-    stored_digest: str | None,
 ) -> HintResolution:
     if (variant == "none" and text != "") or (variant != "none" and not text.strip()):
         return HintResolution(None, "historical hint unavailable: semantic identity mismatch")
     hint = LeakageHint(environment=environment, variant=variant, text=text)
-    if stored_digest is not None and stored_digest != hint.text_sha256:
-        return HintResolution(None, "historical hint unavailable: digest mismatch")
     return HintResolution(hint, None)
 
 
@@ -776,7 +773,7 @@ def _atlas_row_hint(
         if prompt_hint_text != screen_hint.text:
             return None
     prompt_hint_digest = _validate_hint_digest(row.get("hint_sha256"), required=False)
-    if prompt_hint_digest is not None and prompt_hint_digest != screen_hint.text_sha256:
+    if prompt_hint_text is None and prompt_hint_digest != screen_hint.text_sha256:
         return None
     return screen_hint
 

@@ -18,13 +18,27 @@ import subprocess
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Tuple  # noqa: UP035 - Python 3.8 host scripts
+from typing import Callable, Dict, List, Tuple  # noqa: UP035 - Python 3.8 host scripts
 
-from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
+from reward_hacking.jailed_poc import CommandResult, JailResourceLimits, jail_python
 from reward_hacking.persistent_jail import PersistentJail
 
 logger = logging.getLogger(__name__)
 TIMEOUT_EXIT_CODE = 124
+OOM_EXIT_CODE = 137
+OOM_STDERR_MARKER = "cgroup OOM"
+MEMORY_BOMB_SOURCE = (
+    "import resource\n"
+    "block_size = 16 * 1024 * 1024\n"
+    "blocks = []\n"
+    "print('starting 2048 MiB anonymous allocation', flush=True)\n"
+    "for _ in range(128):\n"
+    "    block = bytearray(block_size)\n"
+    "    for offset in range(0, block_size, 4096):\n"
+    "        block[offset] = 1\n"
+    "    blocks.append(block)\n"
+    "print(f'completed 2048 MiB; peak RSS={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} KiB', flush=True)\n"
+)
 
 
 def require_command(result: CommandResult, name: str, expected: str = "") -> None:
@@ -35,6 +49,175 @@ def require_command(result: CommandResult, name: str, expected: str = "") -> Non
             f"stdout={result.stdout!r} stderr={result.stderr!r}"
         )
     logger.info("persistent check passed: %s", name)
+
+
+def require_memory_oom_recovery(run_command: Callable[[str], CommandResult]) -> None:
+    """Require a bounded memory command to die alone and the same episode to recover."""
+    memory_bomb_command = shlex.quote(jail_python()) + " -I -c " + shlex.quote(MEMORY_BOMB_SOURCE)
+    oom_result = run_command(memory_bomb_command)
+    if (
+        oom_result.exit_code != OOM_EXIT_CODE
+        or oom_result.timed_out
+        or OOM_STDERR_MARKER not in oom_result.stderr
+    ):
+        raise RuntimeError(
+            "persistent memory-bomb check did not return the OOM command result: "
+            f"exit={oom_result.exit_code} timed_out={oom_result.timed_out} "
+            f"stdout={oom_result.stdout!r} stderr={oom_result.stderr!r}"
+        )
+    logger.info("persistent check passed: memory exhaustion returned an OOM command result")
+    require_command(run_command("printf recovered"), "command after memory OOM", "recovered")
+
+
+def require_memory_cgroup_properties(
+    memory_max: str, memory_oom_group: str, memory_swap_max: str
+) -> None:
+    """Refuse a memory bomb without a no-swap, command-only cgroup memory contract."""
+    if memory_max != "268435456" or memory_oom_group != "0" or memory_swap_max != "0":
+        raise RuntimeError(
+            "persistent memory OOM check requires MemoryMax=268435456, MemorySwapMax=0, and "
+            "memory.oom.group=0; "
+            f"found memory.max={memory_max!r}, memory.swap.max={memory_swap_max!r}, "
+            f"memory.oom.group={memory_oom_group!r}"
+        )
+
+
+def unified_cgroup_path(pid: int) -> str:
+    """Return one host process's canonical unified-cgroup path."""
+    cgroup_lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    unified_cgroup = next((line for line in cgroup_lines if line.startswith("0::")), None)
+    if unified_cgroup is None:
+        raise RuntimeError(f"process {pid} has no unified cgroup membership")
+    cgroup_path = unified_cgroup.partition("::")[2]
+    if not cgroup_path.startswith("/") or ".." in Path(cgroup_path).parts:
+        raise RuntimeError(f"process {pid} reported a non-canonical cgroup path")
+    return cgroup_path
+
+
+def assert_supervisor_memory_cgroup(executor: PersistentJail) -> Tuple[str, Path]:  # noqa: UP006
+    """Read the live cgroup of namespace PID 1 before starting a memory stress command."""
+    pidfd = executor._pidfd  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    if pidfd is None:
+        raise RuntimeError("cannot verify memory OOM limits before the supervisor starts")
+    pidfd_lines = Path(f"/proc/self/fdinfo/{pidfd}").read_text().splitlines()
+    pid_line = next((line for line in pidfd_lines if line.startswith("Pid:")), None)
+    if pid_line is None:
+        raise RuntimeError("persistent supervisor pidfd has no host PID")
+    supervisor_pid = int(pid_line.partition(":")[2])
+    if supervisor_pid <= 0:
+        raise RuntimeError("persistent supervisor pidfd does not refer to a live process")
+    cgroup_path = unified_cgroup_path(supervisor_pid)
+    cgroup_directory = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")
+    memory_max = (cgroup_directory / "memory.max").read_text().strip()
+    memory_oom_group = (cgroup_directory / "memory.oom.group").read_text().strip()
+    memory_swap_max = (cgroup_directory / "memory.swap.max").read_text().strip()
+    require_memory_cgroup_properties(memory_max, memory_oom_group, memory_swap_max)
+    logger.info(
+        "persistent check passed: supervisor cgroup has 256 MiB max, no swap, and group OOM disabled"
+    )
+    return cgroup_path, cgroup_directory
+
+
+def find_processes_with_command_marker(marker: str) -> List[int]:  # noqa: UP006
+    """Find live host processes whose command line contains a unique probe marker."""
+    matching_pids = []
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            command_line = (process / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if marker.encode() in command_line:
+            matching_pids.append(int(process.name))
+    return matching_pids
+
+
+def process_namespace_pids(host_pid: int) -> List[int]:  # noqa: UP006 - Python 3.8 host script
+    """Read the PID mappings reported for one host process."""
+    status_lines = Path(f"/proc/{host_pid}/status").read_text().splitlines()
+    nspid_line = next((line for line in status_lines if line.startswith("NSpid:")), None)
+    if nspid_line is None:
+        raise RuntimeError(f"process {host_pid} has no NSpid mapping")
+    return [int(pid) for pid in nspid_line.partition(":")[2].split()]
+
+
+def assert_memory_command_cgroup(executor: PersistentJail, supervisor_cgroup_path: str) -> None:
+    """Prove a harmless actor command shares the cap and has maximum OOM victim priority."""
+    marker = f"persistent-jail-command-cgroup-probe-{secrets.token_hex(8)}"
+    ready_filename = "." + marker + ".ready"
+    ready_path = executor.episode_dir / ready_filename
+    probe_source = (
+        "import os, time\n"
+        "score = open('/proc/self/oom_score_adj', encoding='ascii').read().strip()\n"
+        f"host_file = open('/work/{ready_filename}', 'w', encoding='ascii')\n"
+        "host_file.write(f'{os.getpid()} {score}')\n"
+        "host_file.close()\n"
+        f"print({marker!r} + ' ' + str(os.getpid()) + ' ' + score, flush=True)\n"
+        "time.sleep(4)\n"
+    )
+    probe_command = shlex.quote(jail_python()) + " -I -c " + shlex.quote(probe_source)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result_future: Future[CommandResult] = pool.submit(
+            executor.run, probe_command, timeout="10s", login_shell=False
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not result_future.done():
+            if ready_path.is_file():
+                break
+            time.sleep(0.02)
+        if not ready_path.is_file():
+            result = result_future.result(timeout=10)
+            raise RuntimeError(
+                "persistent command cgroup probe did not stay visible while running: "
+                f"exit={result.exit_code} stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+        namespace_pid, reported_oom_score_adj = ready_path.read_text().split()
+        command_pids = find_processes_with_command_marker(marker)
+        command_properties: List[Tuple[int, str, str, str, List[int]]] = [  # noqa: UP006 - Python 3.8
+            (
+                command_pid,
+                os.readlink(f"/proc/{command_pid}/exe"),  # noqa: PTH115 - Python 3.8 host script
+                unified_cgroup_path(command_pid),
+                Path(f"/proc/{command_pid}/oom_score_adj").read_text().strip(),
+                process_namespace_pids(command_pid),
+            )
+            for command_pid in command_pids
+        ]
+        result = result_future.result(timeout=10)
+    ready_path.unlink()
+    if (
+        reported_oom_score_adj != "1000"
+        or not any(
+            process[4][-1] == int(namespace_pid)
+            and process[2] == supervisor_cgroup_path
+            and process[3] == "1000"
+            for process in command_properties
+        )
+        or any(
+            process[2] != supervisor_cgroup_path or process[3] != "1000"
+            for process in command_properties
+        )
+    ):
+        raise RuntimeError(
+            "persistent command is not protected for command-only OOM handling: "
+            f"command_processes={command_properties!r} supervisor_cgroup={supervisor_cgroup_path!r} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+    require_command(
+        result,
+        "command shares the capped cgroup with oom_score_adj=1000",
+        marker + " " + namespace_pid + " 1000",
+    )
+
+
+def read_cgroup_oom_kill_count(cgroup_directory: Path) -> int:
+    """Read the kernel's OOM-kill counter for the verified episode cgroup."""
+    events = (cgroup_directory / "memory.events").read_text().splitlines()
+    oom_kill_line = next((line for line in events if line.startswith("oom_kill ")), None)
+    if oom_kill_line is None:
+        raise RuntimeError("verified episode cgroup has no memory.events oom_kill counter")
+    return int(oom_kill_line.split()[1])
 
 
 def namespace_members(namespace: str) -> List[int]:  # noqa: UP006 - Python 3.8 host scripts
@@ -441,6 +624,44 @@ def _assert_sibling_signal_blocked(
         time.sleep(0.02)
 
 
+def assert_memory_oom_isolated(episode_dir: Path, *, backend: str) -> None:
+    """Require a 256 MiB cgroup to kill a command while keeping its episode alive."""
+    episode_dir.mkdir()
+    executor = PersistentJail(
+        episode_dir,
+        backend=backend,
+        resource_limits=JailResourceLimits(mode="enforced"),
+        cpus=1,
+        mem_max="256M",
+        mem_swap_max="0",
+        episode_seconds=60,
+    )
+    logger.warning(
+        "Persistent memory OOM check requires enforced MemoryMax=256M and MemorySwapMax=0"
+    )
+    with executor:
+        namespace_result = executor.run("readlink /proc/self/ns/pid")
+        if not namespace_result.ok:
+            raise RuntimeError("memory OOM fixture could not start: " + namespace_result.stderr)
+        namespace = namespace_result.stdout.strip()
+        supervisor_cgroup_path, cgroup_directory = assert_supervisor_memory_cgroup(executor)
+        assert_memory_command_cgroup(executor, supervisor_cgroup_path)
+        initial_oom_kill_count = read_cgroup_oom_kill_count(cgroup_directory)
+        require_memory_oom_recovery(
+            lambda command: executor.run(command, timeout="20s", login_shell=False)
+        )
+        final_oom_kill_count = read_cgroup_oom_kill_count(cgroup_directory)
+        if final_oom_kill_count <= initial_oom_kill_count:
+            raise RuntimeError(
+                "persistent memory bomb returned an OOM-shaped result without a kernel cgroup "
+                f"oom_kill event: before={initial_oom_kill_count} after={final_oom_kill_count}"
+            )
+        logger.info("persistent check passed: kernel memory.events recorded a cgroup OOM kill")
+        descendants = host_descendants(executor)
+    assert_closed(namespace, descendants)
+    logger.info("persistent check passed: memory OOM left no process after episode close")
+
+
 def main() -> None:  # noqa: PLR0915 - sequential containment attacks deliberately remain visible together
     """Run the persistent containment gate against synthetic local fixtures."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -581,6 +802,7 @@ def main() -> None:  # noqa: PLR0915 - sequential containment attacks deliberate
         args.workdir / "pair-second-episode",
         backend=args.backend,
     )
+    assert_memory_oom_isolated(args.workdir / "memory-oom-episode", backend=args.backend)
     jail = Path(__file__).resolve().with_name("episode_jail.sh")
     grader = subprocess.run(  # noqa: S603 - trusted launcher and synthetic grader
         [

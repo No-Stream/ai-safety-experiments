@@ -8,8 +8,8 @@ parts that genuinely transfer beats a copy of the parts that do not.
 Three properties are load-bearing:
 
 * **Cell order is deterministic.** Arms are iterated in ``Arm`` declaration order, never in the
-  order an item's JSON file happened to list them, because the batch path this will run on digests
-  the rendered cell sequence to catch a corpus edited between submit and collect, and a
+  order an item's JSON file happened to list them, because a future batch path can compare the
+  rendered cell sequence with the prompts saved at submit time, and a
   filesystem-derived order would read as exactly that edit. RecoveryBench has no batch path yet,
   so this is a property being kept ready for one rather than one anything currently checks.
 * **A trace may only be written where git will not see it.** Every record carries the item's full
@@ -29,7 +29,6 @@ Three properties are load-bearing:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -371,11 +370,6 @@ def cell_key(item_id: str, arm: str, repeat: int) -> tuple[str, str, int]:
     return (item_id, arm, repeat)
 
 
-def _prompt_digest(prompt: str) -> str:
-    """Digest a prompt for the resume check, so a refusal can name a drift without echoing item text."""
-    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-
-
 def _run_label_identity(labels: RunLabels) -> dict[str, object]:
     """List the four labels every response record in a resumed trace must share with THIS run.
 
@@ -394,21 +388,21 @@ def _run_label_identity(labels: RunLabels) -> dict[str, object]:
 def _resume_identity(cell: Cell, labels: RunLabels) -> dict[str, object]:
     """List the fields a stored record must still agree with THIS run about before its cell is skipped.
 
-    The four labels plus the prompt digest, which is the field that catches a redrafted item: the
+    The four labels plus the prompt text, which catches a redrafted item: the
     same ``item_id`` renders new text under the old key, and a resume that skipped it would report
     the redraft finished while the file held the old draft's replies.
     """
-    return {**_run_label_identity(labels), "prompt_digest": _prompt_digest(cell.prompt)}
+    return {**_run_label_identity(labels), "prompt": cell.prompt}
 
 
 def _stored_identity(record: Mapping[str, Any]) -> dict[str, object]:
-    """Read the same identity off a stored response record, digesting the prompt from its text."""
+    """Read the identity off a stored response record, including the prompt text itself."""
     return {
         "model_id": record.get("model_id"),
         "transport": record.get("transport"),
         "reasoning_effort": record.get("reasoning_effort"),
         "max_tokens": record.get("max_tokens"),
-        "prompt_digest": _prompt_digest(str(record.get("prompt", ""))),
+        "prompt": str(record.get("prompt", "")),
     }
 
 
@@ -424,7 +418,7 @@ def resumable_cell_keys(
     re-bought all of it. It is also the quietest way to end up with one file holding two
     experiments, so EVERY response record in the file is checked against this run's four labels
     (model, transport, effort, cap), and every record whose key this run will render is checked
-    against the prompt digest as well (:func:`_resume_identity`); the first mismatch refuses the
+    against its stored prompt as well (:func:`_resume_identity`); the first mismatch refuses the
     whole resume by name rather than skipping the cell. A trace is one run's, so a record for a cell
     this run does not render -- a wider arm set, more repeats -- may stay under the same labels (it
     is not this run's to judge, and ``grade_trace_file`` will still score it) but under other labels
@@ -444,15 +438,18 @@ def resumable_cell_keys(
         key = cell_key(str(record["item_id"]), str(record["arm"]), int(record["repeat"]))
         cell = wanted.get(key)
         stored = _stored_identity(record)
-        # Labels first, on every record: the digest needs a rendered cell, the labels do not.
+        # Labels first, on every record: the prompt check needs a rendered cell, labels do not.
         expected = (
             _resume_identity(cell, labels) if cell is not None else _run_label_identity(labels)
         )
-        drifted = [
-            f"{name}={stored[name]!r} on disk but {value!r} for this run"
-            for name, value in expected.items()
-            if stored[name] != value
-        ]
+        drifted: list[str] = []
+        for name, value in expected.items():
+            if stored[name] != value:
+                drifted.append(
+                    "prompt differs"
+                    if name == "prompt"
+                    else f"{name}={stored[name]!r} on disk but {value!r} for this run"
+                )
         if drifted:
             raise ValueError(
                 f"refusing to resume over {path}, whose record for cell {key} is another run's: "

@@ -294,22 +294,20 @@ def test_tokenizer_archive_and_extracted_tables_are_both_verified(
         for name, contents in tables.items():
             (english / name).write_text(contents)
             archive.writestr(f"punkt_tab/english/{name}", contents)
-    monkeypatch.setattr(
-        alce, "NLTK_RESOURCE_SHA256", hashlib.sha256(package.read_bytes()).hexdigest()
-    )
     segmenter, identity = alce.load_sentence_segmenter(tmp_path)
     assert segmenter("First claim [1]. Second claim [2].") == [
         "First claim [1].",
         "Second claim [2].",
     ]
     assert identity["nltk_version"] == "3.9.2"
+    assert identity["resource_sha256"] == hashlib.sha256(package.read_bytes()).hexdigest()
     (english / "abbrev_types.txt").write_text("tampered")
     with pytest.raises(ValueError, match="table bytes changed"):
         alce.load_sentence_segmenter(tmp_path)
     package.write_bytes(b"tampered")
     with caplog.at_level(logging.WARNING, logger=alce.logger.name), pytest.raises(BadZipFile):
         alce.load_sentence_segmenter(tmp_path)
-    assert "is pinned to sha256" in caplog.text
+    assert "is pinned to sha256" not in caplog.text
 
 
 def _kill_after_durable_sample(run_dir: Path) -> None:
@@ -379,3 +377,79 @@ def test_host_review_provenance_changes_do_not_invalidate_actor_generation() -> 
     ) == alce_generation_identity(
         reviewed, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
     )
+
+
+def test_source_hash_changes_do_not_gate_generation_when_readable_fields_match() -> None:
+    task = task_fixture()
+    original = replace(
+        task,
+        source_identity={
+            "question": task.question,
+            "ordered_document_ids": [document.source_document_id for document in task.docs],
+            "source_archive_sha256": "old-archive-digest",
+            "source_member_sha256": "old-member-digest",
+        },
+    )
+    repacked = replace(
+        task,
+        source_identity={
+            "question": task.question,
+            "ordered_document_ids": [document.source_document_id for document in task.docs],
+            "source_archive_sha256": "new-archive-digest",
+            "source_member_sha256": "new-member-digest",
+        },
+    )
+
+    assert alce_generation_identity(
+        original, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    ) == alce_generation_identity(
+        repacked, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    )
+
+    changed_question = replace(
+        repacked,
+        question="Different synthetic question.",
+    )
+    assert alce_generation_identity(
+        repacked, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    ) != alce_generation_identity(
+        changed_question,
+        {"model": "synthetic"},
+        DEFAULT_SETTINGS,
+        {"segmentation": "synthetic"},
+    )
+
+
+def test_legacy_episode_resumes_after_source_hashes_change_but_rejects_prompt_drift(
+    tmp_path: Path,
+) -> None:
+    task = task_fixture()
+    generation_identity = alce_generation_identity(
+        task, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    )
+    generation_identity["source"]["source_archive_sha256"] = "old-archive-digest"
+    generation_identity["source"]["source_member_sha256"] = "old-member-digest"
+    with EpisodeJournal(tmp_path, generation_identity):
+        pass
+
+    repacked_task = replace(
+        task,
+        source_identity={
+            "source": "synthetic",
+            "source_archive_sha256": "new-archive-digest",
+            "source_member_sha256": "new-member-digest",
+        },
+    )
+    current_identity = alce_generation_identity(
+        repacked_task, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    )
+    saved_identity = alce._journal_generation_identity(tmp_path, current_identity)
+    with EpisodeJournal(tmp_path, saved_identity):
+        pass
+
+    changed_prompt = replace(repacked_task, question="Different synthetic question.")
+    changed_identity = alce_generation_identity(
+        changed_prompt, {"model": "synthetic"}, DEFAULT_SETTINGS, {"segmentation": "synthetic"}
+    )
+    with pytest.raises(ValueError, match=r"generation identity changed at keys:.*render"):
+        alce._journal_generation_identity(tmp_path, changed_identity)

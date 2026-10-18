@@ -57,7 +57,6 @@ from sociology.transfer_judge import (
     intent_check_run,
     intent_digest,
     intent_prompt,
-    intent_prompt_shape_digest,
     intent_rules,
     intent_validation_cases,
     intent_validation_record_key,
@@ -1471,40 +1470,22 @@ class TestTheRulesRungClause:
         assert INTENT_KEPT_VALUE_BY_STAKE[scale] in backend.prompts_seen[0]
 
 
-class TestTheIntentPromptShapeDigest:
-    """The digest the validation gate compares beside the rubric's, over everything code-side.
+class TestTheIntentPromptIdentity:
+    """The version and named fixed sections identify the code-side prompt surface."""
 
-    The rubric digest covers the authored instructions only, so before this existed a validation run made
-    under one wording of the rules paragraphs cleared a production pass made under another.
-    """
-
-    PINNED = "0eafead3daf0559a"
-    """The digest as it stands. An edit to any code-side section of the intent prompt turns this red.
-
-    Update it in the same commit that bumps ``INTENT_CHECK_PROMPT_VERSION``, and not otherwise: the
-    version is what makes the per-row resume re-read production rows under the new wording, and the
-    digest is what makes the validation gate refuse a validation made under the old one.
-    """
-
-    def test_the_digest_is_pinned_so_a_prompt_edit_forces_a_version_bump(self) -> None:
-        assert intent_prompt_shape_digest() == self.PINNED, (
-            "a code-side section of the intent prompt changed: bump INTENT_CHECK_PROMPT_VERSION and "
-            "update this pin in the same commit, then re-run intent-check-validate"
+    def test_the_prompt_version_and_section_headers_are_explicit(self) -> None:
+        assert INTENT_CHECK_PROMPT_VERSION == "one-way-transfer-intent-check-v3"
+        section_headers = tuple(
+            section for section in judge_module.INTENT_PROMPT_SCAFFOLD if section.startswith("===")
         )
-
-    def test_it_moves_with_the_version_and_with_every_scaffold_section(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        before = intent_prompt_shape_digest()
-        monkeypatch.setattr(judge_module, "INTENT_CHECK_PROMPT_VERSION", "v-something-else")
-        assert intent_prompt_shape_digest() != before
-        monkeypatch.undo()
-        monkeypatch.setattr(
-            judge_module,
-            "INTENT_PROMPT_SCAFFOLD",
-            (*judge_module.INTENT_PROMPT_SCAFFOLD, "one more fixed header"),
+        assert section_headers == (
+            "=== WHAT THIS REPLY WAS ASKED TO WRITE ===",
+            "=== THE RULES THIS REPLY WAS WRITTEN UNDER ===",
+            "=== REPLY (verbatim) ===",
+            "=== END OF REPLY ===",
+            "=== VISIBLE REASONING (verbatim, emitted before the reply) ===",
+            "=== END OF VISIBLE REASONING ===",
         )
-        assert intent_prompt_shape_digest() != before
 
 
 class TestValidateIntentCheck:

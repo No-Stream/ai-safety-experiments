@@ -26,6 +26,7 @@ publish problem deliberately never fails the run and the exit code cannot carry 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import shutil
@@ -45,7 +46,7 @@ from games.evals import (
     summarise_trace,
 )
 from games.fileio import sha256_of_file
-from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
+from games.prompt_variants import PROMPT_VARIANT_NONE, PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.prompts import FRAMING_STATED_ALWAYS_COOP, FRAMING_UNSTATED
 from games.report import (
     BANKED_CONSUMER_META_FIELDS,
@@ -372,15 +373,72 @@ class TestBankKeyDerivation:
         assert "survey_data_dir" not in identity_for(here)["eval_config"]
         assert "dtbench_dir" not in identity_for(here)["eval_config"]
 
-    def test_the_prompt_set_digest_moves_with_one_prompt(self) -> None:
+    def test_prompt_identity_records_ordered_ids_count_and_rendered_text(self) -> None:
         _, _, sections, config = resolved(BASELINE)
         plan = plan_battery(sections, config)
-        digest = run_evals.prompt_set_digest(plan)
-        altered = [*plan]
-        altered[3] = dataclasses.replace(altered[3], prompt=altered[3].prompt + " ")
-        assert run_evals.prompt_set_digest(altered) != digest
-        assert run_evals.prompt_set_digest(plan[:-1]) != digest
-        assert run_evals.prompt_set_digest(list(plan)) == digest
+        prompt_identity = run_evals.prompt_set_identity(plan)
+
+        assert prompt_identity["count"] == len(plan)
+        assert prompt_identity["prompts"] == [
+            {
+                "section": request.section,
+                "identity": list(request.identity),
+                "prompt": run_evals.apply_prompt_variant(request.prompt, PROMPT_VARIANT_NONE),
+            }
+            for request in plan
+        ]
+        assert [record["prompt"] for record in prompt_identity["prompts"]] == [
+            run_evals.apply_prompt_variant(request.prompt, PROMPT_VARIANT_NONE) for request in plan
+        ]
+
+        changed_prompt_id = [*plan]
+        changed_prompt_id[0] = dataclasses.replace(
+            changed_prompt_id[0], identity=(*changed_prompt_id[0].identity[:-1], "changed-id")
+        )
+        assert run_evals.prompt_set_identity(changed_prompt_id) != prompt_identity
+        assert run_evals.prompt_set_identity(plan[:-1]) != prompt_identity
+        id_drift = run_evals._identity_drift(  # pyright: ignore[reportPrivateUsage]
+            {"prompt_set": prompt_identity},
+            {"prompt_set": run_evals.prompt_set_identity(changed_prompt_id)},
+        )
+        assert id_drift
+        assert "prompts[0].id" in id_drift[0]
+        assert "changed-id" in id_drift[0]
+
+        changed_prompt_text = [*plan]
+        changed_prompt_text[0] = dataclasses.replace(
+            changed_prompt_text[0], prompt=changed_prompt_text[0].prompt + " changed"
+        )
+        drift = run_evals._identity_drift(  # pyright: ignore[reportPrivateUsage]
+            {"prompt_set": prompt_identity},
+            {"prompt_set": run_evals.prompt_set_identity(changed_prompt_text)},
+        )
+        assert drift
+        assert "prompt text" in drift[0]
+        assert "changed" not in drift[0]
+
+    def test_a_legacy_digest_only_bank_identity_remains_compatible(self) -> None:
+        identity = identity_for(BASELINE)
+        legacy_identity = {
+            name: value
+            for name, value in identity.items()
+            if name not in {"prompt_set", "prompt_set_digest"}
+        }
+        legacy_identity["prompt_set_digest"] = identity["prompt_set_digest"]
+        old_key_payload = {name: value for name, value in identity.items() if name != "prompt_set"}
+        old_key_json = json.dumps(
+            old_key_payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+
+        assert (
+            run_evals._identity_drift(  # pyright: ignore[reportPrivateUsage]
+                legacy_identity, identity
+            )
+            == []
+        )
+        assert (
+            run_evals.bank_key(identity) == hashlib.sha256(old_key_json.encode("utf-8")).hexdigest()
+        )
 
     def test_prompt_variants_change_the_sent_prompt_digest_and_bank_key(self) -> None:
         _, _, sections, config = resolved(BASELINE)
@@ -575,6 +633,38 @@ class TestTheDriverTakesAndPublishesBankedCells:
         with pytest.raises(ValueError, match="hashes to"):
             run_evals.main(cli(CONSUMER, tmp_path / CONSUMER, *banked()))
 
+    def test_a_banked_copy_with_reformatted_summary_is_still_valid(
+        self, tmp_path: Path, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert run_evals.main(cli(PRODUCER, tmp_path / PRODUCER, *banked("--bank-base-cells"))) == 0
+        consumer_dir = tmp_path / CONSUMER
+        refuse_engine(monkeypatch)
+        assert run_evals.main(cli(CONSUMER, consumer_dir, *banked())) == 0
+        summary_path = consumer_dir / "step-0.summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        args, plan, sections, config = resolved(cli(CONSUMER, consumer_dir, *banked()))
+        expected_identity = run_evals.bank_identity(
+            args, plan, plan.targets[0], sections=sections, config=config
+        )
+        run_evals._verify_banked_copy(  # pyright: ignore[reportPrivateUsage]
+            plan.targets[0],
+            plan=plan,
+            expected_identity=expected_identity,
+        )
+        assert json.loads(summary_path.read_text(encoding="utf-8")) == summary
+
+        summary[SECTION_CAPABILITIES]["n_records"] += 1
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        with pytest.raises(FileExistsError, match="trace rebuild") as error:
+            run_evals._verify_banked_copy(  # pyright: ignore[reportPrivateUsage]
+                plan.targets[0], plan=plan, expected_identity=expected_identity
+            )
+        assert SECTION_CAPABILITIES in str(error.value)
+
     def test_a_bank_entry_missing_planned_records_is_refused_even_when_its_hashes_agree(
         self, tmp_path: Path, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -712,6 +802,24 @@ class TestTheDriverTakesAndPublishesBankedCells:
         assert set(consumer_meta) == set(BANKED_CONSUMER_META_FIELDS)
         assert consumer_meta["grading"] == plan.grading
         assert consumer_meta["run_dir"] == (None if plan.run_dir is None else str(plan.run_dir))
+
+    def test_a_legacy_bank_manifest_with_prompt_digest_still_reuses(
+        self, tmp_path: Path, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        producer_dir = tmp_path / PRODUCER
+        assert run_evals.main(cli(PRODUCER, producer_dir, *banked("--bank-base-cells"))) == 0
+        key = key_for(cli(PRODUCER, producer_dir))
+        manifest = json.loads(manifest_path(bucket, key).read_text(encoding="utf-8"))
+        identity = manifest["bank_identity"]
+        identity.pop("prompt_set", None)
+        plan = plan_battery(SECTIONS_UNDER_TEST, resolved(cli(PRODUCER, producer_dir))[3])
+        identity["prompt_set_digest"] = run_evals.prompt_set_digest(plan)
+        manifest_path(bucket, key).write_text(json.dumps(manifest), encoding="utf-8")
+
+        refuse_engine(monkeypatch)
+        consumer_dir = tmp_path / CONSUMER
+        assert run_evals.main(cli(CONSUMER, consumer_dir, *banked())) == 0
+        assert banked_provenance_path(consumer_dir / "step-0.jsonl").is_file()
 
     def test_a_half_published_entry_without_a_manifest_is_generated_over(
         self, tmp_path: Path, bucket: FakeBucket, monkeypatch: pytest.MonkeyPatch

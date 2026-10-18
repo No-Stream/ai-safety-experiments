@@ -104,6 +104,44 @@ def make_identity(digest: str, **overrides: Any) -> CellIdentity:
     return CellIdentity(**fields)
 
 
+def natural_prefix_selection_fixture(
+    *, manifest_rule: str = "fixed synthetic positions"
+) -> tuple[list[Stimulus], list[dict[str, Any]], dict[str, Any]]:
+    """Build a private natural-prefix fixture whose rows name every selection field."""
+    stimuli: list[Stimulus] = []
+    records: list[dict[str, Any]] = []
+    for index, stimulus in enumerate(make_stimuli(n_pairs=1)):
+        metadata = {
+            "natural_state": "base",
+            "rollout_id": "synthetic-base-rollout",
+            "request_id": f"synthetic-request-{index}",
+            "scenario_group": "synthetic-group",
+            "selection_rule": "fixed synthetic positions",
+        }
+        natural_stimulus = replace(stimulus, stimulus_set="natural-prefix", metadata=metadata)
+        stimuli.append(natural_stimulus)
+        records.append(
+            {
+                "stimulus_id": natural_stimulus.stimulus_id,
+                "positions": [0, 2],
+                **metadata,
+            }
+        )
+    selection_manifest = {
+        "version": 1,
+        "request_ids": [record["request_id"] for record in records],
+        "scenario_groups": ["synthetic-group"],
+        "rollout_ids_by_state": {
+            "base": "synthetic-base-rollout",
+            "final": "synthetic-final-rollout",
+        },
+        "selection_rule": manifest_rule,
+        "layers": [0, 2],
+        "sha256": "synthetic-provenance-digest",
+    }
+    return stimuli, records, selection_manifest
+
+
 def write_test_cell(  # noqa: PLR0913 - a fixture cell is a root, an arm, a step, stimuli and an identity
     root: Path,
     arm: str,
@@ -130,6 +168,7 @@ def write_test_cell(  # noqa: PLR0913 - a fixture cell is a root, an arm, a step
         applied_adapter_weights=None if arm == BASE_ARM else applied,
         adapter_weights_sha256=None if arm == BASE_ARM else "deadbeef",
         provenance={"git_sha": "testing"},
+        stimuli=stimuli,
     ).parent
 
 
@@ -143,8 +182,8 @@ class TestStimuliDigestGuard:
         assert_stimuli_match(cells, digest)
 
         edited = [*stimuli[:-1], replace(stimuli[-1], text="a different rendering")]
-        with pytest.raises(CellFormatError, match="different stimulus corpus"):
-            assert_stimuli_match(cells, stimuli_digest(edited))
+        with pytest.raises(CellFormatError, match="stimulus_text"):
+            assert_stimuli_match(cells, edited)
 
     def test_load_ladder_refuses_a_mismatched_corpus(self, tmp_path: Path) -> None:
         stimuli = make_stimuli()
@@ -153,6 +192,48 @@ class TestStimuliDigestGuard:
         )
         with pytest.raises(CellFormatError, match="different stimulus corpus"):
             load_ladder(tmp_path, stimuli_sha256="0" * 64)
+
+    def test_load_ladder_compares_readable_stimulus_ids_and_count(self, tmp_path: Path) -> None:
+        stimuli = make_stimuli()
+        write_test_cell(
+            tmp_path, BASE_ARM, BASE_STEP, stimuli, make_identity(stimuli_digest(stimuli))
+        )
+        changed_id = [replace(stimuli[0], stimulus_id="edited-id"), *stimuli[1:]]
+
+        with pytest.raises(CellFormatError, match="stimulus_ids"):
+            load_ladder(tmp_path, stimuli=changed_id)
+
+    def test_same_ids_with_changed_text_name_the_changed_stimulus_field(
+        self, tmp_path: Path
+    ) -> None:
+        stimuli = make_stimuli()
+        cell_dir = write_test_cell(
+            tmp_path, BASE_ARM, BASE_STEP, stimuli, make_identity(stimuli_digest(stimuli))
+        )
+        cell = read_cell(cell_dir)
+        assert cell.stimulus_records is not None
+        assert cell.stimulus_records["axis-a"][0]["text"] == stimuli[0].text
+        changed_text = [replace(stimuli[0], text="a changed synthetic rendering"), *stimuli[1:]]
+
+        with pytest.raises(CellFormatError, match="stimulus_text"):
+            assert_stimuli_match([cell], changed_text)
+
+    def test_legacy_cell_without_stimulus_records_keeps_digest_compatibility(
+        self, tmp_path: Path
+    ) -> None:
+        stimuli = make_stimuli()
+        cell_dir = write_test_cell(
+            tmp_path, BASE_ARM, BASE_STEP, stimuli, make_identity(stimuli_digest(stimuli))
+        )
+        manifest_path = cell_dir / CELL_MANIFEST_FILENAME
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("stimulus_records")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        cell = read_cell(cell_dir)
+        changed_text = [replace(stimuli[0], text="a changed synthetic rendering"), *stimuli[1:]]
+
+        with pytest.raises(CellFormatError, match="stimulus_text"):
+            assert_stimuli_match([cell], changed_text)
 
     def test_the_digest_moves_with_the_text(self) -> None:
         stimuli = make_stimuli()
@@ -237,6 +318,82 @@ class TestLadderIdentity:
         manifest_path.write_text(json.dumps(manifest))
         assert_ladder_identity([first, read_cell(second_dir)])
 
+    def test_stimulus_digest_metadata_does_not_gate_saved_source_rows(self, tmp_path: Path) -> None:
+        stimuli = make_stimuli()
+        digest = stimuli_digest(stimuli)
+        first = read_cell(
+            write_test_cell(tmp_path, BASE_ARM, BASE_STEP, stimuli, make_identity(digest))
+        )
+        second = read_cell(
+            write_test_cell(
+                tmp_path,
+                "arm",
+                10,
+                stimuli,
+                make_identity("different-provenance-digest", rendered_sha256=f"rendered-{digest}"),
+                offset=0.5,
+            )
+        )
+
+        assert_ladder_identity([first, second])
+
+    def test_natural_selection_identity_compares_manifest_fields_not_hashes(
+        self, tmp_path: Path
+    ) -> None:
+        stimuli = make_stimuli()
+        digest = stimuli_digest(stimuli)
+        selection_manifest = {
+            "version": 1,
+            "request_ids": ["synthetic-request"],
+            "scenario_groups": ["synthetic-group"],
+            "rollout_ids_by_state": {"base": "synthetic-base", "final": "synthetic-final"},
+            "selection_rule": "fixed synthetic positions",
+            "layers": [0, 2],
+        }
+        first_dir = write_test_cell(
+            tmp_path,
+            BASE_ARM,
+            BASE_STEP,
+            stimuli,
+            make_identity(digest, natural_selection_manifest_sha256="first-digest"),
+        )
+        second_dir = write_test_cell(
+            tmp_path,
+            "arm",
+            10,
+            stimuli,
+            make_identity(digest, natural_selection_manifest_sha256="second-digest"),
+            offset=0.5,
+        )
+        for cell_dir, manifest_digest in (
+            (first_dir, "first-digest"),
+            (second_dir, "second-digest"),
+        ):
+            natural_dir = cell_dir / "natural-prefix"
+            natural_dir.mkdir()
+            (natural_dir / "natural-prefix-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "selection_manifest": {
+                            **selection_manifest,
+                            "sha256": manifest_digest,
+                        }
+                    }
+                )
+            )
+
+        first = read_cell(first_dir)
+        second = read_cell(second_dir)
+        assert_ladder_identity([first, second])
+
+        second_manifest_path = second_dir / "natural-prefix" / "natural-prefix-manifest.json"
+        second_manifest = json.loads(second_manifest_path.read_text())
+        second_manifest["selection_manifest"]["selection_rule"] = "changed rule"
+        second_manifest_path.write_text(json.dumps(second_manifest))
+        changed_second = read_cell(second_dir)
+        with pytest.raises(CellFormatError, match="selection_rule"):
+            assert_ladder_identity([first, changed_second])
+
 
 class TestRowAlignment:
     def test_reordered_rows_are_refused(self, tmp_path: Path) -> None:
@@ -247,7 +404,7 @@ class TestRowAlignment:
         write_test_cell(
             tmp_path, "arm", 10, [stimuli[1], stimuli[0], *stimuli[2:]], identity, offset=0.5
         )
-        with pytest.raises(CellFormatError, match="same rows"):
+        with pytest.raises(CellFormatError, match="stimulus_records"):
             load_ladder(tmp_path)
 
     def test_a_missing_row_names_what_is_missing(self, tmp_path: Path) -> None:
@@ -360,7 +517,7 @@ class TestCellRoundTrip:
         entry["pair_ids"] = entry["pair_ids"][:-1]
         entry["token_counts"] = entry["token_counts"][:-1]
         manifest_path.write_text(json.dumps(manifest))
-        with pytest.raises(CellFormatError, match="written by different runs"):
+        with pytest.raises(CellFormatError, match="stimulus_records count"):
             read_cell(cell_dir)
 
     def test_an_identity_block_missing_a_field_names_the_file(self, tmp_path: Path) -> None:
@@ -476,14 +633,7 @@ class TestAuxiliaryCaptureRoundTrip:
             assert_capture_provenance([cell])
 
     def test_standalone_natural_capture_persists_selected_rows(self, tmp_path: Path) -> None:
-        stimuli = [
-            replace(
-                stimulus,
-                stimulus_set="natural-prefix",
-                metadata={"natural_state": "base", "rollout_id": "base-rollout"},
-            )
-            for stimulus in make_stimuli(n_pairs=1)
-        ]
+        stimuli, selection_records, selection_manifest = natural_prefix_selection_fixture()
         identity = make_identity(
             stimuli_digest(stimuli),
             natural_prefix_layers=(0, 2),
@@ -494,27 +644,63 @@ class TestAuxiliaryCaptureRoundTrip:
             identity=identity,
             stimuli=stimuli,
             activations={stimulus.stimulus_id: torch.zeros(2, 2, HIDDEN) for stimulus in stimuli},
-            selection_records=[
-                {
-                    "stimulus_id": stimulus.stimulus_id,
-                    "positions": [0, 2],
-                    "selection_rule": "fixed",
-                    "natural_state": "base",
-                }
-                for stimulus in stimuli
-            ],
-            selection_manifest={
-                "version": 1,
-                "rollout_ids_by_state": {"base": "base-rollout", "final": "final-rollout"},
-                "selection_rule": "fixed",
-                "layers": [0, 2],
-                "sha256": "m",
-            },
+            selection_records=selection_records,
+            selection_manifest={**selection_manifest, "sha256": "changed-provenance-digest"},
             rendered_sha256="rendered-natural",
             natural_state="base",
         )
         assert manifest.is_file()
-        assert json.loads(manifest.read_text())["rendered_sha256"] == "rendered-natural"
+        saved_manifest = json.loads(manifest.read_text())
+        assert saved_manifest["rendered_sha256"] == "rendered-natural"
+        assert saved_manifest["stimulus_records"]["natural-prefix"][0]["text"] == stimuli[0].text
+        assert saved_manifest["selection_manifest"]["sha256"] == "changed-provenance-digest"
+
+    def test_natural_selection_records_explain_the_manifest_fields(self, tmp_path: Path) -> None:
+        stimuli, selection_records, selection_manifest = natural_prefix_selection_fixture(
+            manifest_rule="changed synthetic rule"
+        )
+        identity = make_identity(
+            stimuli_digest(stimuli),
+            natural_prefix_layers=(0, 2),
+            natural_selection_manifest_sha256="legacy-digest",
+        )
+
+        with pytest.raises(CellFormatError, match="selection_rule"):
+            write_natural_prefix_capture(
+                tmp_path / "natural",
+                identity=identity,
+                stimuli=stimuli,
+                activations={
+                    stimulus.stimulus_id: torch.zeros(2, 2, HIDDEN) for stimulus in stimuli
+                },
+                selection_records=selection_records,
+                selection_manifest=selection_manifest,
+                rendered_sha256="rendered-natural",
+                natural_state="base",
+            )
+
+    def test_natural_selection_manifest_names_unlisted_request_ids(self, tmp_path: Path) -> None:
+        stimuli, selection_records, selection_manifest = natural_prefix_selection_fixture()
+        selection_manifest["request_ids"] = ["synthetic-request-not-selected"]
+        identity = make_identity(
+            stimuli_digest(stimuli),
+            natural_prefix_layers=(0, 2),
+            natural_selection_manifest_sha256="ignored-digest",
+        )
+
+        with pytest.raises(CellFormatError, match="request_ids"):
+            write_natural_prefix_capture(
+                tmp_path / "natural",
+                identity=identity,
+                stimuli=stimuli,
+                activations={
+                    stimulus.stimulus_id: torch.zeros(2, 2, HIDDEN) for stimulus in stimuli
+                },
+                selection_records=selection_records,
+                selection_manifest=selection_manifest,
+                rendered_sha256="rendered-natural",
+                natural_state="base",
+            )
 
 
 class TestStorage:

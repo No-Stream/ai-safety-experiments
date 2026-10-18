@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
+import tomllib
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx2
 
 from reward_hacking.eval_awareness import scan_text, summarize_matches
-from reward_hacking.spec_gaming.capture import EpisodeJournal
+from reward_hacking.spec_gaming.capture import EpisodeJournal, compare_identity_fields
 from reward_hacking.spec_gaming.collection import make_backend_factory
 from reward_hacking.spec_gaming.config import (
     canonical_json,
@@ -33,9 +35,9 @@ from reward_hacking.spec_gaming.manifests import (
     write_json as _write_json,
 )
 from reward_hacking.spec_gaming.protocol import PromptHistory
+from reward_hacking.spec_gaming.readout import raw_episode_identity as read_raw_episode_identity
 from reward_hacking.spec_gaming.retail_config import build_native_runtime
 from reward_hacking.spec_gaming.retail_manifests import (
-    code_identity,
     episode_paths,
     load_prepared,
     read_effective_run_manifest,
@@ -60,14 +62,114 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ASSESSMENT_CODE_PATHS = (
-    "reward_hacking/spec_gaming/retail_assessment.py",
-    "reward_hacking/spec_gaming/retail_episode.py",
-    "reward_hacking/spec_gaming/retail_native.py",
-    "reward_hacking/spec_gaming/retail_tasks.py",
-    "reward_hacking/spec_gaming/capture.py",
-    "reward_hacking/spec_gaming/protocol.py",
-)
+ASSESSMENT_CODE_VERSION = 1
+
+
+def _task_generation_identity_content(identity: dict[str, object]) -> dict[str, object]:
+    content = dict(identity)
+    content.pop("group_digest", None)
+    task_payload = content.get("task_identity")
+    if isinstance(task_payload, dict):
+        normalized_task_payload = dict(task_payload)
+        normalized_task_payload.pop("group_digest", None)
+        content["task_identity"] = normalized_task_payload
+    return content
+
+
+def _legacy_v1_assessment_identity_differences(
+    journal: EpisodeJournal,
+    expected: dict[str, object],
+    observed: dict[str, object],
+    prefix: str,
+) -> list[str]:
+    legacy_fields = {
+        "assessment",
+        "task_id",
+        "task_sha256",
+        "source_revision",
+        "group_digest",
+        "task_generation_identity_sha256",
+        "runtime_lockfile_sha256",
+        "assessment_code_sha256",
+        "rubric_version",
+        "native_evaluator_revision",
+        "raw_episode_digest",
+    }
+    missing_fields = sorted(legacy_fields - observed.keys())
+    if missing_fields:
+        return [f"{prefix}.{field} (missing)" for field in missing_fields]
+
+    if not isinstance(observed["assessment_code_sha256"], dict):
+        return [f"{prefix}.assessment_code_sha256 (malformed)"]
+
+    raw_digest = nonempty_string(observed["raw_episode_digest"], f"{prefix}.raw_episode_digest")
+    raw_identity = read_raw_episode_identity(journal, raw_digest)
+    differences = compare_identity_fields(
+        expected["raw_episode_identity"], raw_identity, f"{prefix}.raw_episode_identity"
+    )
+
+    saved_generation = object_value(raw_identity.get("generation"), f"{prefix}.generation")
+    current_generation = object_value(
+        expected.get("task_generation_identity"), f"{prefix}.current_generation"
+    )
+    differences.extend(
+        compare_identity_fields(
+            current_generation,
+            _task_generation_identity_content(saved_generation),
+            f"{prefix}.task_generation_identity",
+        )
+    )
+    saved_task_payload_value = saved_generation.get("task_identity")
+    if isinstance(saved_task_payload_value, dict):
+        saved_group_task_ids = saved_task_payload_value.get("group_task_ids")
+    else:
+        saved_group_task_ids = saved_generation.get("group_task_ids")
+    differences.extend(
+        compare_identity_fields(
+            expected["group_membership"],
+            {"group_task_ids": saved_group_task_ids},
+            f"{prefix}.group_membership",
+        )
+    )
+    source_runtime = object_value(
+        saved_generation.get("source_runtime"), f"{prefix}.source_runtime"
+    )
+    if observed["runtime_lockfile_sha256"] != source_runtime.get("runtime_lockfile_sha256"):
+        differences.append(f"{prefix}.runtime_lockfile_sha256")
+
+    direct_fields = (
+        "assessment",
+        "task_id",
+        "task_sha256",
+        "source_revision",
+        "rubric_version",
+        "native_evaluator_revision",
+    )
+    differences.extend(
+        f"{prefix}.{field}"
+        for field in direct_fields
+        if canonical_json(observed[field]) != canonical_json(expected[field])
+    )
+    if expected["assessment_code_version"] != 1:
+        differences.append(f"{prefix}.assessment_code_version")
+    if not differences:
+        logger.warning(
+            "Reusing schema-1 retail assessment: task generation is checked from journal content; "
+            "runtime TOML and evaluator code content were not stored in the old assessment"
+        )
+    return differences
+
+
+def _json_compatible_toml_value(value: object) -> object:
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_compatible_toml_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_json_compatible_toml_value(child) for child in value]
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    raise TypeError(f"unsupported TOML value in retail runtime lockfile: {type(value).__name__}")
 
 
 def _native_simulator_defect_exposed(state: Mapping[str, Any]) -> bool:
@@ -139,25 +241,98 @@ def assessment_identity(  # noqa: PLR0913
     task_id: str,
     task_sha256: str,
     source_revision: str,
-    group_digest: str,
     task_identity: dict[str, object],
-    raw_episode_digest: str,
+    raw_episode_identity: dict[str, object],
 ) -> dict[str, object]:
-    """Bind an assessment to its raw journal, evaluator code, and rubric."""
+    """Bind assessment reuse to readable task, runtime, episode and rubric inputs."""
+    task_generation_identity = _task_generation_identity_content(task_identity)
+    group_membership = task_identity.get("task_identity")
+    if not isinstance(group_membership, dict):
+        group_membership = task_identity
+    legacy_group_digest = group_membership.get("group_digest")
+    group_task_ids = group_membership.get("group_task_ids")
+    if group_task_ids is None:
+        if legacy_group_digest is None:
+            raise ValueError("retail task identity has no group membership")
+        group_membership_identity: dict[str, object] = {"legacy_group_digest": legacy_group_digest}
+    elif not isinstance(group_task_ids, list) or any(
+        not isinstance(item, str) for item in group_task_ids
+    ):
+        raise ValueError("retail task identity group_task_ids must be a list of strings")
+    else:
+        group_membership_identity = {"group_task_ids": group_task_ids}
+    with config.source.runtime_lockfile.open("rb") as lockfile:
+        runtime_lockfile = _json_compatible_toml_value(tomllib.load(lockfile))
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "assessment": "tau2-retail-native-and-operational-proxy",
         "task_id": task_id,
         "task_sha256": task_sha256,
         "source_revision": source_revision,
-        "group_digest": group_digest,
-        "task_generation_identity_sha256": sha256(canonical_json(task_identity)),
-        "runtime_lockfile_sha256": config.source.runtime_lockfile_sha256,
-        "assessment_code_sha256": code_identity(ASSESSMENT_CODE_PATHS),
+        "group_membership": group_membership_identity,
+        "task_generation_identity": task_generation_identity,
+        "runtime_lockfile": runtime_lockfile,
+        "assessment_code_version": ASSESSMENT_CODE_VERSION,
         "rubric_version": config.assessment_rubric_version,
         "native_evaluator_revision": source_revision,
-        "raw_episode_digest": raw_episode_digest,
+        "raw_episode_identity": raw_episode_identity,
     }
+
+
+def assessment_identity_differences(
+    journal: EpisodeJournal,
+    expected: dict[str, object],
+    observed: dict[str, object],
+    prefix: str = "identity",
+) -> list[str]:
+    """Return semantic differences while resolving legacy digest references from the journal."""
+    if observed.get("schema_version") == 1:
+        return _legacy_v1_assessment_identity_differences(journal, expected, observed, prefix)
+    observed_identity = dict(observed)
+    legacy_raw_digest = observed_identity.pop("raw_episode_digest", None)
+    if legacy_raw_digest is not None:
+        observed_identity["raw_episode_identity"] = read_raw_episode_identity(
+            journal, nonempty_string(legacy_raw_digest, "legacy raw episode digest")
+        )
+        observed_identity["schema_version"] = expected["schema_version"]
+    return compare_identity_fields(expected, observed_identity, prefix)
+
+
+def _legacy_reusable_assessment(
+    journal: EpisodeJournal,
+    identity: dict[str, object],
+) -> dict[str, Any] | None:
+    entries = journal.list_assessments()
+    differences_by_digest = {
+        entry["digest"]: assessment_identity_differences(journal, identity, entry["identity"])
+        for entry in entries
+    }
+    incomplete_differences = [
+        difference
+        for entry in entries
+        if entry["identity"].get("schema_version") == 1
+        for difference in differences_by_digest[entry["digest"]]
+        if "(missing)" in difference or "(malformed)" in difference
+    ]
+    if incomplete_differences:
+        raise ValueError(
+            "legacy retail assessment cannot be reused because its identity is incomplete: "
+            + ", ".join(incomplete_differences)
+        )
+
+    matches = [entry for entry in entries if not differences_by_digest[entry["digest"]]]
+    if len(matches) > 1:
+        raise ValueError("multiple legacy retail assessments match the current identity")
+    if not matches:
+        for entry in entries:
+            differences = differences_by_digest[entry["digest"]]
+            if entry["identity"].get("schema_version") == 1 and differences:
+                logger.warning(
+                    "Legacy retail assessment not reused; readable identity differs at: %s",
+                    ", ".join(differences),
+                )
+        return None
+    return matches[0]["assessment"]
 
 
 def current_retail_assessment(
@@ -168,17 +343,27 @@ def current_retail_assessment(
     """Read the authoritative assessment and verify its current sidecar."""
     assessment = journal.load_assessment(identity)
     if assessment is None:
+        assessment = _legacy_reusable_assessment(journal, identity)
+    if assessment is None:
         return None
     if assessment_path.is_file():
         sidecar = _read_json(assessment_path, "retail current assessment")
         sidecar_identity = object_value(sidecar.get("identity"), "retail assessment identity")
         sidecar_assessment = object_value(sidecar.get("assessment"), "retail assessment")
-        if canonical_json(sidecar_identity) != canonical_json(identity):
-            raise ValueError("retail assessment sidecar has a stale evaluator identity")
-        if canonical_json(sidecar_assessment) != canonical_json(assessment):
-            raise ValueError("retail assessment sidecar differs from the authoritative journal")
-        if assessment.get("raw_episode_digest") != journal.raw_episode_digest():
-            raise ValueError("retail assessment is bound to a different raw journal")
+        identity_differences = assessment_identity_differences(journal, identity, sidecar_identity)
+        if identity_differences:
+            raise ValueError(
+                "retail assessment sidecar has a stale evaluator identity: "
+                + ", ".join(identity_differences)
+            )
+        assessment_differences = compare_identity_fields(
+            assessment, sidecar_assessment, "assessment"
+        )
+        if assessment_differences:
+            raise ValueError(
+                "retail assessment sidecar differs from the authoritative journal: "
+                + ", ".join(assessment_differences)
+            )
     return assessment
 
 
@@ -192,17 +377,20 @@ def _judge_identity(
     prompt_token_ids: list[int],
     prompt_text: str,
 ) -> dict[str, object]:
+    serving_manifest = _read_json(config.model.serving_manifest, "retail serving manifest")
     return {
-        "schema_version": 2,
-        "prompt_sha256": sha256(canonical_json([prompt_text, prompt_token_ids])),
+        "schema_version": 4,
+        "prompt_text": prompt_text,
+        "prompt_token_ids": prompt_token_ids,
         "max_tokens": config.episode.max_tokens,
         "served_model_id": config.model.served_model_id,
-        "request_sha256": sha256(canonical_json(request)),
+        "request": request,
         "model_revision": config.model.model_revision,
         "tokenizer_revision": config.model.tokenizer_revision,
-        "serving_manifest_sha256": config.model.serving_manifest_sha256,
+        "serving_manifest": serving_manifest,
         "sampling": {
             **asdict(config.sampling.config),
+            "stop": list(config.sampling.config.stop),
             "stop_token_ids": list(config.sampling.stop_token_ids),
         },
         "thinking": config.model.thinking,
@@ -250,8 +438,10 @@ def _reusable_judge_response(path: Path, identity: dict[str, object]) -> dict[st
     if not path.is_file():
         return None
     artifact = _read_json(path, "saved retail NL judge sample")
-    if canonical_json(artifact.get("identity")) != canonical_json(identity):
-        raise ValueError("saved NL judge sample differs from its frozen assessment identity")
+    saved_identity = object_value(artifact.get("identity"), "saved NL judge identity")
+    differences = compare_identity_fields(identity, saved_identity, "identity")
+    if differences:
+        raise ValueError("saved NL judge sample identity differs at: " + ", ".join(differences))
     return artifact
 
 
@@ -262,8 +452,12 @@ def _validate_judge_artifact(
     expected_prompt_token_ids: list[int],
     sample_seed: int,
 ) -> str:
-    if canonical_json(artifact.get("identity")) != canonical_json(identity):
-        raise ValueError("saved NL judge sample differs from its frozen assessment identity")
+    saved_identity = object_value(artifact.get("identity"), "saved NL judge identity")
+    identity_differences = compare_identity_fields(identity, saved_identity, "identity")
+    if identity_differences:
+        raise ValueError(
+            "saved NL judge sample identity differs at: " + ", ".join(identity_differences)
+        )
     required_fields = {
         "identity",
         "prompt_messages",
@@ -297,7 +491,9 @@ def _validate_judge_artifact(
         or artifact["completion_tokens"] != len(completion_token_ids)
     ):
         raise ValueError("saved NL judge token and logprob counts differ")
-    if artifact["sample_seed"] != sample_seed or artifact["finish_reason"] != "stop":
+    if type(artifact["sample_seed"]) is not int or artifact["sample_seed"] != sample_seed:
+        raise ValueError("saved NL judge sample seed differs from its frozen sampling identity")
+    if artifact["finish_reason"] != "stop":
         raise ValueError("saved NL judge sample did not finish with its frozen sampling identity")
     response_text = artifact["text"]
     if not isinstance(response_text, str):
@@ -308,6 +504,7 @@ def _validate_judge_artifact(
 def _legacy_judge_response(
     path: Path,
     identity: dict[str, object],
+    config: RetailCollectorConfig,
     history: PromptHistory,
     prompt_token_ids: list[int],
 ) -> dict[str, Any] | None:
@@ -315,19 +512,74 @@ def _legacy_judge_response(
         return None
     artifact = _read_json(path, "legacy retail NL judge sample")
     previous = object_value(artifact.get("identity"), "legacy NL judge identity")
+    if "serving_manifest" in previous:
+        serving_manifest_differences = compare_identity_fields(
+            identity["serving_manifest"], previous["serving_manifest"], "serving_manifest"
+        )
+    elif "serving_manifest_sha256" in previous:
+        observed_serving_manifest_sha256 = hashlib.sha256(
+            config.model.serving_manifest.read_bytes()
+        ).hexdigest()
+        serving_manifest_differences = (
+            []
+            if previous["serving_manifest_sha256"] == observed_serving_manifest_sha256
+            else ["serving_manifest_sha256"]
+        )
+        if not serving_manifest_differences:
+            logger.warning(
+                "Reusing schema-1 retail NL judge sample with matching serving-manifest digest; "
+                "the old record does not contain readable manifest content"
+            )
+    else:
+        raise ValueError(
+            "legacy retail NL judge sample cannot be reused: serving manifest content is absent "
+            "and its digest field is missing"
+        )
     semantic_fields = {
-        "request_sha256",
         "model_revision",
         "tokenizer_revision",
-        "serving_manifest_sha256",
         "sampling",
         "thinking",
         "chat_template_kwargs",
     }
-    if any(
-        canonical_json(previous.get(field)) != canonical_json(identity[field])
+    differences = list(serving_manifest_differences)
+    differences.extend(
+        field
         for field in semantic_fields
-    ):
+        if canonical_json(previous.get(field)) != canonical_json(identity[field])
+    )
+    if differences:
+        logger.info(
+            "Legacy retail NL judge sample not reused; digest-only or direct identity differs at: %s",
+            ", ".join(differences),
+        )
+        return None
+    legacy_model_fields = ("max_tokens", "served_model_id")
+    model_field_differences = [
+        field
+        for field in legacy_model_fields
+        if field in previous and canonical_json(previous[field]) != canonical_json(identity[field])
+    ]
+    if model_field_differences:
+        logger.info(
+            "Legacy retail NL judge sample not reused; readable identity differs at: %s",
+            ", ".join(model_field_differences),
+        )
+        return None
+    missing_model_fields = [field for field in legacy_model_fields if field not in previous]
+    if missing_model_fields:
+        logger.warning(
+            "Legacy retail NL judge identity lacks readable fields: %s",
+            ", ".join(missing_model_fields),
+        )
+    request_digest_matches = previous.get("request_sha256") == sha256(
+        canonical_json(identity["request"])
+    )
+    if not request_digest_matches:
+        logger.info(
+            "Legacy retail NL judge sample not reused; request_sha256 differs and old request "
+            "content is unavailable for a readable comparison"
+        )
         return None
     previous_assessment = object_value(
         previous.get("assessment_identity"), "legacy judge assessment identity"
@@ -338,6 +590,8 @@ def _legacy_judge_response(
         ).digest()[:4],
         "big",
     )
+    if type(previous_seed) is not int or not 0 <= previous_seed < 2**32:
+        raise ValueError("legacy retail NL judge sample has an invalid recorded sample seed")
     _validate_judge_artifact(artifact, previous, history, prompt_token_ids, previous_seed)
     return artifact
 
@@ -383,7 +637,7 @@ def _sample_nl_judge(
         _validate_judge_artifact(saved, judge_identity, history, list(prompt.token_ids), seed)
         return saved
     legacy = _legacy_judge_response(
-        episode_dir / "nl-judge.json", judge_identity, history, list(prompt.token_ids)
+        episode_dir / "nl-judge.json", judge_identity, config, history, list(prompt.token_ids)
     )
     if legacy is not None:
         return legacy
@@ -533,16 +787,16 @@ def _assess_closed_journal(  # noqa: PLR0913, PLR0917
     state: dict[str, Any],
 ) -> dict[str, object]:
     raw_digest = journal.raw_episode_digest()
+    raw_identity = read_raw_episode_identity(journal, raw_digest)
     identity = assessment_identity(
         config,
         task_id=task.task_id,
         task_sha256=task.task_sha256,
         source_revision=task.source_revision,
-        group_digest=task.group_digest,
         task_identity=task_identity,
-        raw_episode_digest=raw_digest,
+        raw_episode_identity=raw_identity,
     )
-    existing = journal.load_assessment(identity)
+    existing = current_retail_assessment(journal, assessment_path, identity)
     if existing is not None:
         _persist_assessment(assessment_path, identity, existing)
         failure_path.unlink(missing_ok=True)

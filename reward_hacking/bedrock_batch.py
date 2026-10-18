@@ -120,6 +120,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+type JSONValue = str | int | float | bool | list[JSONValue] | dict[str, JSONValue] | None
+
 BATCH_ROLE_ARN_ENV = "JAGGED_BATCH_ROLE_ARN"
 BATCH_BUCKET_ENV = "JAGGED_BATCH_BUCKET"
 BATCH_PROFILE_ENV = "JAGGED_BATCH_PROFILE"
@@ -158,7 +160,9 @@ TRANSPORT = "bedrock-batch"
 
 # What a handle file would publish if committed, for the tracked-path refusal: not item text, but
 # the account-identifying values (job_arn, S3 URIs, profile) this public repository never tracks.
-HANDLE_CARRIES = "the batch job's AWS account id, bucket and profile"
+HANDLE_CARRIES = (
+    "the batch job's AWS account id, bucket, profile, submitted prompt text and cell metadata"
+)
 
 _TERMINAL_STATUSES = frozenset({"Completed", "Failed", "Stopped", "PartiallyCompleted", "Expired"})
 
@@ -846,12 +850,11 @@ class BatchJobHandle:
     is not an assumption worth building on -- and re-submitting because the handle was lost means
     paying for the inference twice.
 
-    ``prompt_digest`` is the tripwire on the join. It hashes the submitted prompts in order, and
-    ``collect`` recomputes it from the prompts Bedrock echoes back in each record's ``modelInput``,
-    sorted into ``recordId`` order. A digest match means the records that came back are the records
-    that went out, in the order this handle claims. Nothing else in the round trip proves that: the
-    output file's line order is genuinely shuffled (the first five recordIds of a real 500-record
-    result were rec_000266, rec_000144, rec_000402, rec_000127, rec_000371).
+    ``prompt_digest`` and ``cell_digest`` are retained as provenance. New handles also store the
+    submitted prompts and cell metadata, so collection and resume compare the readable content and
+    name changed positions or fields. Handles predating those content fields use their digests as a
+    compatibility check. The results are joined by ``recordId`` because the output file's line
+    order is shuffled.
 
     ``max_tokens`` and ``reasoning_effort`` carry the sampling labels across to the collect leg,
     which runs in a different process and has no other way to learn them: a cap below a model's
@@ -860,12 +863,9 @@ class BatchJobHandle:
     handle written before they existed loads with ``None`` reading as "written before the field
     existed" rather than as a cap of zero.
 
-    That is not a general backward-compatibility promise, and the oldest handles on disk are the
-    counterexample: ``cell_digest`` was added without a default, so the 2026-08-17T00:27 directory
-    does not load at all. Refusing it is right -- a handle with no cell digest cannot pass the
-    corpus-drift tripwire ``collect`` runs, so there is nothing safe to do with it -- and
-    :meth:`load` says which field is missing rather than raising a bare ``TypeError`` about a
-    dataclass argument.
+    Older handles without stored prompt or cell content remain loadable. Their recorded digests are
+    used where available; if the cell digest is absent too, :meth:`submission_limitations` names
+    the cell metadata that cannot be checked.
     """
 
     job_arn: str
@@ -873,7 +873,6 @@ class BatchJobHandle:
     model_id: str
     record_count: int
     prompt_digest: str
-    cell_digest: str
     input_uri: str
     output_uri: str
     region: str
@@ -881,6 +880,9 @@ class BatchJobHandle:
     submitted_at: str
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    submitted_prompts: list[str] | None = None
+    submitted_cells: list[dict[str, Any]] | None = None
+    cell_digest: str | None = None
 
     @property
     def job_id(self) -> str:
@@ -917,6 +919,43 @@ class BatchJobHandle:
             if getattr(self, name) != requested[name]
         ]
 
+    def prompt_differences(self, prompts: Sequence[str]) -> list[str]:
+        """Compare rendered prompts with submitted text, using old digests only for legacy handles."""
+        if self.submitted_prompts is None:
+            if prompt_digest(prompts) != self.prompt_digest:
+                return ["prompt_digest differs on a legacy handle without submitted prompt text"]
+            return []
+        return _sequence_differences(self.submitted_prompts, prompts, "prompt")
+
+    def submission_differences(
+        self,
+        prompts: Sequence[str],
+        cells: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[str]:
+        """Name prompt and cell changes; digest checks remain only for content-free legacy handles."""
+        differences = self.prompt_differences(prompts)
+        if cells is None:
+            return differences
+        if self.submitted_cells is None:
+            if self.cell_digest is not None and cell_digest(cells) != self.cell_digest:
+                differences.append(
+                    "cell_digest differs on a handle without submitted cell metadata"
+                )
+            return differences
+
+        stored_cells = json.loads(json.dumps(self.submitted_cells, sort_keys=True))
+        rendered_cells = json.loads(json.dumps([dict(cell) for cell in cells], sort_keys=True))
+        differences.extend(_sequence_differences(stored_cells, rendered_cells, "cells"))
+        return differences
+
+    def submission_limitations(self) -> list[str]:
+        """Describe legacy semantic content that could not be compared during a resume."""
+        if self.submitted_cells is None and self.cell_digest is None:
+            return [
+                "cell metadata is unavailable on this legacy handle; only prompt_digest and record_count can be checked"
+            ]
+        return []
+
     def save(self, path: Path) -> Path:
         """Write this handle as JSON, creating the parent directory.
 
@@ -937,12 +976,8 @@ class BatchJobHandle:
     def load(cls, path: Path) -> BatchJobHandle:
         """Read a handle back from JSON, naming any field that does not line up with this class.
 
-        A handle is often the only surviving reference to a paid job, so what a refusal says
-        matters: ``cls(**payload)`` alone raises ``TypeError: __init__() missing 1 required
-        positional argument: 'cell_digest'``, which reads as a code defect rather than as "this
-        handle predates the corpus-drift tripwire". Both directions are named, since a renamed field
-        looks the same from here as a missing one, and the ARN in the file is what an operator needs
-        next.
+        A handle is often the only surviving reference to a paid job, so missing required fields
+        and unknown fields are named before constructor errors obscure the job ARN.
         """
         payload = json.loads(path.read_text(encoding="utf-8"))
         declared = {field.name: field for field in fields(cls)}
@@ -958,9 +993,7 @@ class BatchJobHandle:
             raise ValueError(
                 f"{path} is not a handle this code can read: "
                 f"missing {missing or 'nothing'}, unrecognised {unknown or 'nothing'}. "
-                "A handle written before a required field existed cannot be collected (with no "
-                "cell_digest it cannot pass the corpus-drift check), but the job it names may "
-                "still be alive -- its ARN is in the file."
+                "The job it names may still be alive; its ARN is in the file."
             )
         return cls(**payload)
 
@@ -980,6 +1013,42 @@ def _digest(parts: Iterable[str]) -> str:
         digest.update(b":")
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _sequence_differences(
+    expected: Sequence[JSONValue],
+    actual: Sequence[JSONValue],
+    field: str,
+) -> list[str]:
+    """Name list-size, position, and nested object differences without printing prompt content."""
+    differences: list[str] = []
+    if len(expected) != len(actual):
+        differences.append(
+            f"{field}.count differs ({len(expected)} submitted vs {len(actual)} rendered)"
+        )
+    for index, (expected_value, actual_value) in enumerate(zip(expected, actual, strict=False)):
+        position = f"{field}[{index}]"
+        differences.extend(_value_differences(expected_value, actual_value, position))
+    return differences
+
+
+def _value_differences(expected: JSONValue, actual: JSONValue, field: str) -> list[str]:
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        differences: list[str] = []
+        for key in sorted(expected.keys() | actual.keys(), key=str):
+            nested_field = f"{field}.{key}"
+            if key not in expected:
+                differences.append(f"{nested_field} is present only in rendered content")
+            elif key not in actual:
+                differences.append(f"{nested_field} is present only in submitted content")
+            else:
+                differences.extend(_value_differences(expected[key], actual[key], nested_field))
+        return differences
+    if isinstance(expected, list) and isinstance(actual, list):
+        return _sequence_differences(expected, actual, field)
+    if expected != actual:
+        return [f"{field} differs"]
+    return []
 
 
 def prompt_digest(prompts: Sequence[str]) -> str:
@@ -1357,6 +1426,8 @@ class BedrockBatchBackend:
             submitted_at=_now(),
             max_tokens=self.sampling.max_tokens,
             reasoning_effort=self.sampling.reasoning_effort,
+            submitted_prompts=list(prompts),
+            submitted_cells=None if metadata is None else [dict(entry) for entry in metadata],
         )
         logger.info(
             "submitted %d records to %s as %s (%s)",
@@ -1539,13 +1610,13 @@ class BedrockBatchBackend:
         job_usage = self._check_completion(handle, job)
         completions, prompts = self._join_records(handle, self._get(self._output_uris(handle)[0]))
 
-        returned_digest = prompt_digest(prompts)
-        if returned_digest != handle.prompt_digest:
+        prompt_differences = handle.prompt_differences(prompts)
+        if prompt_differences:
             raise RuntimeError(
-                f"job {handle.job_name} echoed back prompts whose digest is {returned_digest} but "
-                f"this handle was submitted with {handle.prompt_digest}. The results do not belong "
-                "to this handle, or the record ordering is not what the handle claims; either way "
-                "the join would attach responses to the wrong cells"
+                f"job {handle.job_name} echoed prompts that differ from its submitted content at "
+                f"{', '.join(prompt_differences)}. The results do not belong to this handle, or "
+                "the record ordering is not what the handle claims; either way the join would "
+                "attach responses to the wrong cells"
             )
 
         record_usage = sum((completion.usage for completion in completions), TokenUsage())

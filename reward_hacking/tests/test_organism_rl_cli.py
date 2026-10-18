@@ -33,6 +33,9 @@ def test_defaults_and_vram_derived_sizing():
     assert args.rollout_concurrency is None
     assert args.expected_peak_context_tokens is None
     assert args.prompts_per_step == 1
+    assert args.dynamic_sampling is False
+    assert args.dynamic_sampling_max_groups == 3
+    assert args.dynamic_sampling_skip_after == 2
     assert args.thinking_token_budget == 512
     assert args.max_consecutive_truncated_turns == 2
     assert args.kv_cache_dtype is None
@@ -41,6 +44,51 @@ def test_defaults_and_vram_derived_sizing():
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
     assert small.micro_batch_size == 1
+
+
+def test_dynamic_sampling_cli_resolves_and_accepts_explicit_group_cap() -> None:
+    defaulted = parse_args(
+        ["--output-dir", "artifacts/toy", "--prompts-per-step", "4", "--dynamic-sampling"]
+    )
+    assert defaulted.dynamic_sampling is True
+    assert defaulted.dynamic_sampling_max_groups == 12
+    assert defaulted.dynamic_sampling_skip_after == 2
+
+    explicit = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--prompts-per-step",
+            "4",
+            "--dynamic-sampling",
+            "--dynamic-sampling-max-groups",
+            "1",
+            "--dynamic-sampling-skip-after",
+            "5",
+        ]
+    )
+    assert explicit.dynamic_sampling_max_groups == 1
+    assert explicit.dynamic_sampling_skip_after == 5
+
+    disabled = parse_args(
+        ["--output-dir", "artifacts/toy", "--prompts-per-step", "4", "--no-dynamic-sampling"]
+    )
+    assert disabled.dynamic_sampling is False
+    assert disabled.dynamic_sampling_max_groups == 12
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("--dynamic-sampling-max-groups", "0"), ("--dynamic-sampling-max-groups", "-1")],
+)
+def test_dynamic_sampling_cli_rejects_nonpositive_group_cap(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--output-dir", "artifacts/toy", flag, value])
+
+
+def test_dynamic_sampling_skip_after_must_be_positive() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--output-dir", "artifacts/toy", "--dynamic-sampling-skip-after", "0"])
 
 
 def test_checkpoint_retention_flags_are_operational(tmp_path: Path) -> None:
@@ -163,6 +211,90 @@ def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
     assert value["flags"]["temperature"] == 1.0
     assert value["flags"]["thinking_token_budget"] == 512
     assert value["flags"]["max_consecutive_truncated_turns"] == 2
+    assert value["flags"]["dynamic_sampling"] is False
+    assert value["flags"]["dynamic_sampling_max_groups"] == 3
+    assert value["flags"]["dynamic_sampling_skip_after"] == 2
+
+
+def test_legacy_provenance_resumes_with_dynamic_sampling_disabled(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--prompts-per-step", "4"])
+    path = write_provenance(args, {"name": "cpu"})
+    stored = json.loads(path.read_text())
+    for flag in (
+        "dynamic_sampling",
+        "dynamic_sampling_max_groups",
+        "dynamic_sampling_skip_after",
+    ):
+        stored["flags"].pop(flag)
+    path.write_text(json.dumps(stored))
+
+    write_provenance(args, {"name": "cpu"})
+
+
+def test_dynamic_sampling_setting_is_resume_sensitive(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path)])
+    write_provenance(args, {"name": "cpu"})
+    args.dynamic_sampling = True
+
+    with pytest.raises(ValueError, match="dynamic_sampling"):
+        write_provenance(args, {"name": "cpu"})
+
+
+@pytest.mark.parametrize(
+    ("dynamic_sampling", "expected_discarded_steps"), [(False, [7]), (True, [])]
+)
+def test_dynamic_sampling_resume_keeps_prefetched_episodes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dynamic_sampling: bool,
+    expected_discarded_steps: list[int],
+) -> None:
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 7}))
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--resume-from-checkpoint",
+            str(checkpoint),
+        ]
+    )
+    args.dynamic_sampling = dynamic_sampling
+    discarded_steps: list[int] = []
+
+    class FakeSource:
+        def discard_prefetched_step(self, step: int) -> None:
+            discarded_steps.append(step)
+
+    monkeypatch.setattr(cli, "validate_checkpoint", lambda _: None)
+    cli._prepare_prefetched_step_resume(args, cast("Any", FakeSource()))
+
+    assert discarded_steps == expected_discarded_steps
+
+
+@pytest.mark.parametrize("step_pipelining", [False, True])
+def test_dynamic_sampling_without_resume_rejects_completed_checkpoint(
+    tmp_path: Path, step_pipelining: bool
+) -> None:
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "complete.json").write_text("{}")
+    args = parse_args(["--output-dir", str(tmp_path), "--dynamic-sampling"])
+    args.step_pipelining = step_pipelining
+
+    with pytest.raises(ValueError, match="completed checkpoint"):
+        cli._prepare_prefetched_step_resume(args, cast("Any", object()))
+
+
+@pytest.mark.parametrize("step_pipelining", [False, True])
+def test_dynamic_sampling_without_checkpoint_can_start_fresh(
+    tmp_path: Path, step_pipelining: bool
+) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--dynamic-sampling"])
+    args.step_pipelining = step_pipelining
+
+    cli._prepare_prefetched_step_resume(args, cast("Any", object()))
 
 
 def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: Path) -> None:

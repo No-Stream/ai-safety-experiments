@@ -439,10 +439,7 @@ FIT_PROVENANCE_IDENTITY_FIELDS = frozenset(
         "lens_name",
         "load_path",
         "model",
-        "model_label",
-        "model_revision",
         "repo_sha",
-        "weights_identity",
     }
 )
 
@@ -478,7 +475,6 @@ def fit_identity_differences(  # noqa: PLR0911 - legacy identity layouts require
             fields.discard("weights_fingerprint")
     elif "corpus_digests" in wanted:
         required_fields = wanted_semantic_fields | {
-            "weights_fingerprint",
             "corpus_digests",
             "fit_role",
             "n_fit_prompts",

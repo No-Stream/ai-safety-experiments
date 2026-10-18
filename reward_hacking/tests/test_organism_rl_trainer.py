@@ -84,6 +84,7 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     training_prompts: tuple[str, ...] | None = None,
     sampler_log_path: Path | None = None,
     rollout_log_line: str | None = None,
+    rollout_fields: dict[str, Any] | None = None,
     ragged_completions: bool = False,
     logprob_chunk_tokens: int = 2,
     phase: Any = None,
@@ -174,6 +175,7 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         }
         if request_gate is not None:
             output["policy_steps"] = [[trainer.state.global_step] * 3 for _ in prompts]
+        output.update(rollout_fields or {})
         return output
 
     def reward(completions: list[Any], **kwargs: Any) -> list[float | None]:
@@ -1201,6 +1203,78 @@ def test_step_sampler_metrics_weight_tokens_across_microbatches(tmp_path: Path) 
     assert metrics["organism/trainer_sampler_logprob_gap_abs_stale"][-1] == pytest.approx(0.3)
 
 
+def test_sampler_metrics_match_fixed_cpu_snapshot(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    gap = torch.tensor([[1.0, 0.25, -0.5, 0.0]])
+    assistant_mask = torch.tensor([[True, True, True, False]])
+    stale_mask = torch.tensor([[False, True, False, True]])
+
+    trainer._record_sampler_correction_metrics("train", gap, assistant_mask, stale_mask)
+    trainer._finish_training_step_metrics()
+
+    metrics = {
+        key: values[-1]
+        for key, values in trainer._metrics["train"].items()
+        if key.startswith(
+            ("organism/trainer_sampler_logprob_gap", "organism/sampler_ratio_capped_fraction")
+        )
+    }
+    assert metrics == {
+        "organism/trainer_sampler_logprob_gap": 0.25,
+        "organism/trainer_sampler_logprob_gap_abs": 1.75 / 3,
+        "organism/trainer_sampler_logprob_gap_tokens": 3,
+        "organism/sampler_ratio_capped_fraction": 1 / 3,
+        "organism/trainer_sampler_logprob_gap_abs_fresh": 0.75,
+        "organism/sampler_ratio_capped_fraction_fresh": 0.5,
+        "organism/trainer_sampler_logprob_gap_abs_stale": 0.25,
+        "organism/sampler_ratio_capped_fraction_stale": 0.0,
+    }
+
+
+@pytest.mark.parametrize(("sequence_count", "chunk_tokens"), [(1, 1), (2, 1), (2, 3)])
+def test_training_microstep_host_sync_count_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_count: int,
+    chunk_tokens: int,
+) -> None:
+    trainer = _trainer(tmp_path, logprob_chunk_tokens=chunk_tokens)
+    assert trainer.model is not None
+    trainer.model.train()
+    trainer.current_gradient_accumulation_steps = trainer.args.gradient_accumulation_steps
+    generated = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    inputs = {
+        key: value[:sequence_count] if isinstance(value, torch.Tensor) and value.ndim > 0 else value
+        for key, value in generated.items()
+    }
+    inputs["tool_mask"] = inputs["completion_mask"].clone()
+
+    sync_counts = {"item": 0, "bool": 0, "tolist": 0}
+    original_item = torch.Tensor.item
+    original_bool = torch.Tensor.__bool__
+    original_tolist = torch.Tensor.tolist
+
+    def counted_item(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        sync_counts["item"] += 1
+        return original_item(tensor, *args, **kwargs)
+
+    def counted_bool(tensor: torch.Tensor) -> bool:
+        sync_counts["bool"] += 1
+        return original_bool(tensor)
+
+    def counted_tolist(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        sync_counts["tolist"] += 1
+        return original_tolist(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", counted_item)
+    monkeypatch.setattr(torch.Tensor, "__bool__", counted_bool)
+    monkeypatch.setattr(torch.Tensor, "tolist", counted_tolist)
+    trainer._compute_loss(trainer.model, inputs)
+    trainer._finish_training_step_metrics()
+
+    assert sum(sync_counts.values()) <= 12
+
+
 def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     assert trainer.train().global_step == 1
@@ -1320,3 +1394,46 @@ def test_direct_trainer_initializes_head_before_phase_storage_snapshot(tmp_path:
         )
     assert phase.transfers is not None
     assert phase.transfers.frozen_host_storage_ids
+
+
+def test_dynamic_sampling_metrics_and_all_episode_evidence_reach_checkpoint(tmp_path: Path) -> None:
+    evidence = [{"record": "synthetic_evidence", "excluded_from_loss": True}]
+    trainer = _trainer(
+        tmp_path,
+        prompts_per_step=2,
+        training_samples=4,
+        reward_values=(0.0, 1.0, None, None),
+        rollout_fields={
+            "dynamic_sampling_metrics": {
+                "groups_scheduled": 3,
+                "informative_groups": 1,
+                "dropped_all_zero_groups": 2,
+                "dropped_episodes": 4,
+                "dropped_rollout_seconds": 8.0,
+            },
+            "evidence_records": evidence,
+        },
+    )
+    trainer.train()
+    metrics = trainer.state.log_history[0]
+    assert metrics["organism/dynamic_sampling/groups_scheduled"] == 3
+    assert metrics["organism/dynamic_sampling/informative_groups"] == 1
+    assert metrics["organism/dynamic_sampling/dropped_rollout_seconds"] == 8.0
+    assert json.loads((tmp_path / "checkpoint-1" / "rollout_records.json").read_text()) == evidence
+    assert math.isfinite(metrics["loss"])
+
+
+def test_dynamic_padding_does_not_dilute_stale_episode_fraction(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    trainer.state.global_step = 1
+    trainer.latest_rollout = {
+        "policy_steps": [[0], [1]],
+        "completion_ids": [[3], [1]],
+        "rollout_records": [
+            {"loss_mask": [1]},
+            {"record": "dynamic_sampling_padding", "loss_mask": [0]},
+        ],
+    }
+    batch: dict[str, Any] = {}
+    trainer._attach_stale_policy_mask(batch, torch.zeros(2, 1))  # pyright: ignore[reportPrivateUsage]
+    assert trainer._metrics["train"]["organism/stale_episode_fraction"] == [1.0]  # pyright: ignore[reportPrivateUsage]

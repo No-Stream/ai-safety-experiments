@@ -1,5 +1,6 @@
 """Synthetic durable capture and refusal controls."""
 
+import json
 import multiprocessing
 import os
 import signal
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from reward_hacking.spec_gaming.capture import EpisodeJournal
+from reward_hacking.spec_gaming.readout import raw_episode_identity
 
 
 def completion(journal: EpisodeJournal, turn: int = 0) -> str:
@@ -80,6 +82,199 @@ def test_completion_and_assessment_are_separate(tmp_path: Path) -> None:
         saved_completion = journal.get_completion(0)
         assert saved_completion is not None
         assert saved_completion["digest"] == digest
+
+
+def test_manual_assessment_digest_is_reference_only_when_identity_is_direct(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        direct_identity = {
+            "kind": "manual",
+            "reviewer": "synthetic reviewer",
+            "rubric": "synthetic rubric",
+            "automatic_assessment_digest": "a" * 64,
+            "automatic_assessment_identity": {"rubric": "synthetic rubric"},
+        }
+        assessment = {"awareness_status": "pending", "mechanism_evidence": []}
+        journal.save_assessment(direct_identity, assessment)
+
+        changed_reference = {
+            **direct_identity,
+            "automatic_assessment_digest": "b" * 64,
+        }
+        assert journal.load_assessment(changed_reference) == assessment
+
+        legacy_identity = {
+            "kind": "manual",
+            "reviewer": "legacy reviewer",
+            "rubric": "legacy rubric",
+            "automatic_assessment_digest": "c" * 64,
+        }
+        journal.save_assessment(legacy_identity, assessment)
+        assert journal.load_assessment(legacy_identity) == assessment
+        assert (
+            journal.load_assessment({**legacy_identity, "automatic_assessment_digest": "d" * 64})
+            is None
+        )
+
+
+def test_payload_mismatch_names_the_changed_completion_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {"model": "synthetic"}, {}) as journal:
+        completion(journal)
+
+        with pytest.raises(ValueError, match="raw_text"):
+            journal.save_completion(0, [1, 2], [3], [-0.1], "changed", {"finish_reason": "stop"})
+
+
+def test_initial_state_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {"count": 0, "status": "open"}):
+        pass
+
+    with pytest.raises(ValueError, match="count"):
+        EpisodeJournal(tmp_path, {}, {"count": 1, "status": "open"})
+
+
+def test_action_payload_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {"command": "first"})
+
+        with pytest.raises(ValueError, match=r"arguments\.command"):
+            journal.begin_action("request", digest, 0, "shell", {"command": "second"})
+
+
+def test_action_state_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {"count": 0}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {})
+        changed_state_digest = journal.put_json({"count": 1})
+        journal._set_meta("state", changed_state_digest)
+
+        with pytest.raises(ValueError, match=r"action\.state\.count"):
+            journal.commit_action("request", {}, {"count": 1})
+
+
+def test_action_head_sequence_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {})
+        journal._event({"kind": "completion", "digest": digest})
+
+        with pytest.raises(ValueError, match=r"action.prior_head_sequence"):
+            journal.commit_action("request", {}, {})
+
+
+def test_committed_action_state_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {})
+        journal.commit_action("request", {}, {"count": 0})
+
+        with pytest.raises(ValueError, match=r"action\.state\.count"):
+            journal.commit_action("request", {}, {"count": 1})
+
+
+def test_committed_action_intent_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {})
+        journal.commit_action("request", {}, {})
+        intent_digest, committed_digest = journal.connection.execute(
+            "SELECT intent_digest,committed_digest FROM actions WHERE request_id='request'"
+        ).fetchone()
+        saved_intent = journal.read_json(intent_digest)
+        saved_intent["prior_state"] = {"count": 1}
+        alternate_intent_digest = journal.put_json(saved_intent)
+        saved_commit = journal.read_json(committed_digest)
+        saved_commit["intent_digest"] = alternate_intent_digest
+        alternate_commit_digest = journal.put_json(saved_commit)
+        journal.connection.execute(
+            "UPDATE actions SET committed_digest=? WHERE request_id='request'",
+            (alternate_commit_digest,),
+        )
+
+        with pytest.raises(ValueError, match=r"action\.intent\.prior_state\.count"):
+            journal.commit_action("request", {}, {})
+
+
+def test_legacy_pending_action_resumes_without_readable_intent_fields(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {"count": 0}) as journal:
+        digest = completion(journal)
+        journal.begin_action("request", digest, 0, "shell", {"command": "synthetic"})
+        intent_digest = journal.connection.execute(
+            "SELECT intent_digest FROM actions WHERE request_id='request'"
+        ).fetchone()[0]
+        legacy_intent = journal.read_json(intent_digest)
+        legacy_intent.pop("prior_state")
+        legacy_intent.pop("prior_head_sequence")
+        legacy_intent["payload"].pop("completion_turn")
+        legacy_intent_digest = journal.put_json(legacy_intent)
+        journal.connection.execute(
+            "UPDATE actions SET intent_digest=? WHERE request_id='request'",
+            (legacy_intent_digest,),
+        )
+        journal.connection.execute("DELETE FROM meta WHERE key='head_sequence'")
+
+    with EpisodeJournal(tmp_path, {}, {"count": 0}) as journal:
+        resumed = journal.begin_action("request", digest, 0, "shell", {"command": "synthetic"})
+        assert resumed.status == "pending"
+        assert resumed.prior_state == {"count": 0}
+        journal.commit_action("request", {"result": "ok"}, {"count": 1}, close=True)
+        assert journal.raw_episode_digest()
+
+
+def test_assessment_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        identity = {"rubric": "synthetic", "reviewer": "synthetic"}
+        journal.save_assessment(identity, {"awareness_status": "pending", "mechanism_evidence": []})
+
+        with pytest.raises(ValueError, match="awareness_status"):
+            journal.save_assessment(
+                identity, {"awareness_status": "reviewed", "mechanism_evidence": []}
+            )
+
+
+def test_assessment_identity_index_is_not_revalidated_as_a_hash(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        identity = {"rubric": "synthetic", "reviewer": "synthetic"}
+        journal.save_assessment(identity, {"awareness_status": "pending", "mechanism_evidence": []})
+        journal.connection.execute(
+            "UPDATE assessments SET identity_digest=?", ("legacy-index-value",)
+        )
+
+        assessments = journal.list_assessments()
+
+    assert len(assessments) == 1
+    assert assessments[0]["identity"] == identity
+
+
+def test_legacy_assessment_without_raw_manifest_still_loads(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        identity = {"rubric": "synthetic", "reviewer": "synthetic"}
+        assessment = {"awareness_status": "pending", "mechanism_evidence": []}
+        journal.save_assessment(identity, assessment)
+        identity_digest, assessment_digest = journal.connection.execute(
+            "SELECT identity_digest,digest FROM assessments"
+        ).fetchone()
+        legacy_payload = journal.read_json(assessment_digest)
+        del legacy_payload["raw_episode_manifest"]
+        legacy_digest = journal.put_json(legacy_payload)
+        journal.connection.execute(
+            "UPDATE assessments SET digest=? WHERE identity_digest=?",
+            (legacy_digest, identity_digest),
+        )
+
+        assert journal.load_assessment(identity) == assessment
 
 
 def test_check_budget_and_blob_validation(tmp_path: Path) -> None:
@@ -250,6 +445,19 @@ def test_closure_validates_all_raw_evidence(tmp_path: Path) -> None:
             journal.raw_episode_digest()
 
 
+def test_closure_manifest_mismatch_names_the_changed_field(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        closure = journal.read_json(journal._meta("closure"))
+        closure["raw_manifest"]["events"][0][0] = 100
+        journal._set_meta("closure", journal.put_json(closure))
+
+        with pytest.raises(ValueError, match=r"raw_episode_manifest\.events"):
+            journal.raw_episode_digest()
+
+
 def test_constructor_failure_releases_writer_even_with_live_traceback(tmp_path: Path) -> None:
     errors: list[ValueError] = []
     try:
@@ -288,3 +496,17 @@ def test_host_termination_can_follow_sampled_actions(tmp_path: Path) -> None:
         journal.begin_action("host-stop", digest, 1000000, "termination", {"status": "budget"})
         journal.commit_action("host-stop", {"status": "budget"}, {}, close=True)
         assert journal.raw_episode_digest()
+
+
+def test_raw_episode_identity_is_json_compatible_for_binary_blobs(tmp_path: Path) -> None:
+    with EpisodeJournal(tmp_path, {}, {}) as journal:
+        binary_blob_digest = journal.put_blob(b"\x00\xff")
+        digest = completion(journal)
+        journal.begin_action("close", digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {"artifact_digest": binary_blob_digest}, close=True)
+
+        identity = raw_episode_identity(journal, journal.raw_episode_digest())
+
+    serialized = json.dumps(identity)
+    assert "AP8=" in serialized
+    assert "blobs" not in identity

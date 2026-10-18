@@ -182,8 +182,47 @@ def test_interrupted_build_resumes_only_remaining_task(build_config: tuple[Path,
     assert len([command for command in resumed.commands if command[1] == "build"]) == 1
     config["tasks"][0]["dependencies"] = ["pytest==8.4.0"]
     path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="identity"):
+    with pytest.raises(ValueError, match=r"tasks\.synthetic\.dependencies"):
         build_runtime_registry(path, output, workspace_root=root, docker=SyntheticDocker())
+
+
+def test_build_state_records_readable_semantic_identity(build_config: tuple[Path, Path]) -> None:
+    root, path = build_config
+    output = root / "local/runtime"
+
+    build_runtime_registry(path, output, workspace_root=root, docker=SyntheticDocker())
+
+    state = json.loads(output.joinpath("build-state.json").read_text())
+    assert (
+        state["identity_payload"]["source_commit"] == json.loads(path.read_text())["source_commit"]
+    )
+    assert state["identity_payload"]["tasks"]["synthetic"]["task_id"] == "synthetic"
+    assert state["identity_payload"]["tasks"]["synthetic"]["dependencies"] == ["pytest==8.4.1"]
+
+
+def test_legacy_digest_only_build_state_still_resumes(build_config: tuple[Path, Path]) -> None:
+    root, path = build_config
+    output = root / "local/runtime"
+    build_runtime_registry(path, output, workspace_root=root, docker=SyntheticDocker())
+    state_path = output / "build-state.json"
+    state = json.loads(state_path.read_text())
+    tasks = list(state["identity_payload"]["tasks"].values())
+    legacy_payload = {
+        "source_commit": state["identity_payload"]["source_commit"],
+        "uv_image": state["identity_payload"]["uv_image"],
+        "tasks": tasks,
+    }
+    legacy_identity = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True).encode()
+    ).hexdigest()
+    state.pop("identity_payload")
+    state["identity"] = legacy_identity
+    state_path.write_text(json.dumps(state))
+
+    docker = SyntheticDocker()
+    build_runtime_registry(path, output, workspace_root=root, docker=docker)
+
+    assert not any(command[1] == "build" for command in docker.commands)
 
 
 def test_reviewed_local_download_override_binds_input_bytes(
@@ -219,7 +258,7 @@ def test_reviewed_local_download_override_binds_input_bytes(
     assert "input receipt" in caplog.text
 
 
-def test_completed_resume_is_order_independent_and_logs_changed_assets(
+def test_completed_resume_is_order_independent_and_does_not_warn_about_asset_digests(
     build_config: tuple[Path, Path], caplog: pytest.LogCaptureFixture
 ) -> None:
     root, path = build_config
@@ -236,7 +275,7 @@ def test_completed_resume_is_order_independent_and_logs_changed_assets(
     output.joinpath("synthetic/template/input.txt").write_text("sabotage\n")
     with caplog.at_level(logging.WARNING):
         build_runtime_registry(path, output, workspace_root=root, docker=SyntheticDocker())
-    assert "workspace template records sha256" in caplog.text
+    assert "workspace template records sha256" not in caplog.text
 
 
 def test_mutable_download_override_requires_local_receipts(build_config: tuple[Path, Path]) -> None:

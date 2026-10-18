@@ -35,6 +35,16 @@ def _config(root: Path) -> Path:
     return path
 
 
+def _assessment_task(source_identity: dict[str, object]) -> AlceTask:
+    return AlceTask(
+        task_id="synthetic-task",
+        question="synthetic question",
+        docs=(),
+        qa_pairs=(),
+        source_identity=source_identity,
+    )
+
+
 def test_strict_config_rejects_unknown_and_requires_smoke_caps(tmp_path: Path) -> None:
     path = _config(tmp_path)
     config = load_alce_config(path)
@@ -77,6 +87,67 @@ def test_prepare_freezes_source_and_render_without_actor(
     task.source_identity = {"digest": "changed"}
     with pytest.raises(ValueError, match=r"source|selection"):
         collection.load_prepared(config, resolve_models=False)
+
+
+def test_alce_assessment_identity_compares_source_fields_and_ignores_hash_provenance(
+    tmp_path: Path,
+) -> None:
+    config = load_alce_config(_config(tmp_path))
+    task = _assessment_task(
+        {
+            "question": "synthetic question",
+            "source_member_sha256": "a" * 64,
+        }
+    )
+
+    identity = collection._assessment_identity(config, task)
+    task.source_identity["source_member_sha256"] = "b" * 64
+
+    assert collection._assessment_identity(config, task) == identity
+    task.source_identity["question"] = "changed synthetic question"
+    assert collection._assessment_identity(config, task) != identity
+
+
+def test_alce_assessment_identity_reuses_legacy_digest_sidecar_when_source_bytes_match(
+    tmp_path: Path,
+) -> None:
+    config = load_alce_config(_config(tmp_path))
+    task = _assessment_task(
+        {
+            "question": "synthetic question",
+            "source_member_sha256": "a" * 64,
+            "source_archive_sha256": "b" * 64,
+        }
+    )
+    legacy_identity = {
+        "assessment": "alce-native-str-em-with-pending-support-v1",
+        "source_identity": {
+            "source_member_sha256": "a" * 64,
+            "source_archive_sha256": "b" * 64,
+        },
+        "rubric": config.assessment_rubric_version,
+    }
+    assessment_path = config.output_dir / "episodes" / task.task_id / "assessment-current.json"
+    assessment_path.parent.mkdir(parents=True)
+    assessment_path.write_text(json.dumps({"identity": legacy_identity}), encoding="utf-8")
+
+    assert collection._assessment_identity(config, task) == legacy_identity
+
+
+def test_load_prepared_uses_selection_and_render_content_not_their_hashes(
+    prepared: tuple[AlceConfig, SimpleNamespace],
+) -> None:
+    config, _ = prepared
+    identity_path = config.output_dir / "generation-identity.json"
+    identity = json.loads(identity_path.read_text())
+    identity["selection_sha256"] = "stale-selection-digest"
+    identity["render_sha256"] = "stale-render-digest"
+    identity_path.write_text(json.dumps(identity))
+
+    loaded_identity = collection.load_prepared(config, resolve_models=False)
+
+    assert loaded_identity["selection_sha256"] == "stale-selection-digest"
+    assert loaded_identity["render_sha256"] == "stale-render-digest"
 
 
 def test_smoke_limits_do_not_increase_configured_turns(tmp_path: Path) -> None:
@@ -235,7 +306,7 @@ def test_closed_replay_rejects_tampered_effective_binding(
         )
 
 
-def test_assessment_code_refresh_does_not_resample_actor(
+def test_assessment_code_hash_does_not_invalidate_reuse_but_version_change_does_not_resample_actor(
     prepared: tuple[AlceConfig, SimpleNamespace],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,5 +326,17 @@ def test_assessment_code_refresh_does_not_resample_actor(
         config, smoke=True, backend_factory=lambda: pytest.fail("actor after evaluator change")
     )
     identity = collection._effective(config)["task_identities"]["synthetic-task"]
+    with EpisodeJournal(config.output_dir / "episodes" / "synthetic-task", identity) as journal:
+        assert len(journal.list_assessments()) == 1
+    monkeypatch.setattr(
+        collection,
+        "ALCE_ASSESSMENT_VERSION",
+        collection.ALCE_ASSESSMENT_VERSION + 1,
+    )
+    collection.run_collection(
+        config,
+        smoke=True,
+        backend_factory=lambda: pytest.fail("actor after assessment version bump"),
+    )
     with EpisodeJournal(config.output_dir / "episodes" / "synthetic-task", identity) as journal:
         assert len(journal.list_assessments()) == 2

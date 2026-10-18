@@ -13,11 +13,10 @@ correction rather than a preference: this repo has a logged incident where a con
 runs that were supposed to share a control did not. Both entry points -- the training corpus builder
 and the evaluation task selector -- load the same file, and neither may derive a filter of its own.
 
-Two guards make that stick, and both are refusals rather than warnings: the **pool fingerprint**,
-a hash of the exact problem-id pool the partition was drawn from that :func:`load_partition`
-recomputes and refuses a mismatch on, since a partition whose pool moved is not a smaller partition
-but an unknown one; and **disjointness on both sides at load**, because a problem id on both sides
-contaminates the eval set while every count still looks healthy.
+Two guards make that stick, and both are refusals rather than warnings: the **pool membership list**,
+which :func:`load_partition` compares by problem id and schema and reports added or removed ids; and
+**disjointness on both sides at load**, because a problem id on both sides contaminates the eval set
+while every count still looks healthy.
 
 The partition is over *problem* ids (``lcbhard_N``), never over harness task ids
 (``ilcb-oneoff-lcbhard_N``). The ILCB splits are different graders over the same 103 problems, so
@@ -79,6 +78,29 @@ ILCB_SPLITS: tuple[str, ...] = (
 )
 
 
+def _validate_recorded_pool(
+    pool_problem_ids: tuple[str, ...] | None,
+    pool_schema: int | None,
+    pool_size: int,
+    training_ids: frozenset[str],
+    held_out_ids: frozenset[str],
+) -> None:
+    if (pool_problem_ids is None) != (pool_schema is None):
+        raise ValueError("recorded pool problem ids and schema must be present together")
+    if pool_problem_ids is None:
+        return
+    if len(set(pool_problem_ids)) != len(pool_problem_ids):
+        raise ValueError("the recorded pool repeats a problem id")
+    if pool_problem_ids != tuple(sorted(pool_problem_ids)):
+        raise ValueError("the recorded pool problem ids are not sorted")
+    if len(pool_problem_ids) != pool_size:
+        raise ValueError("recorded pool problem ids do not match pool_size")
+    if type(pool_schema) is not int:
+        raise ValueError("recorded pool schema must be an integer")
+    if frozenset(pool_problem_ids) != training_ids | held_out_ids:
+        raise ValueError("partition sides do not cover the recorded pool problem ids")
+
+
 @dataclass(frozen=True, slots=True)
 class HeldOutPartition:
     """One problem-id partition: which problems training may see, and which are held out.
@@ -96,6 +118,8 @@ class HeldOutPartition:
     pool_size: int
     training_problem_ids: tuple[str, ...]
     held_out_problem_ids: tuple[str, ...]
+    pool_problem_ids: tuple[str, ...] | None = None
+    pool_schema: int | None = None
 
     def __post_init__(self) -> None:
         """Refuse a partition that is empty, overlapping, unsorted or short of its own pool."""
@@ -134,6 +158,13 @@ class HeldOutPartition:
                 f"pool had {self.pool_size}; a partition that drops problems silently is not a "
                 f"partition"
             )
+        _validate_recorded_pool(
+            self.pool_problem_ids,
+            self.pool_schema,
+            self.pool_size,
+            training,
+            held_out,
+        )
 
     def side_of(self, problem_id: str) -> str:
         """Return which side a problem id belongs to, refusing one the partition never saw."""
@@ -148,7 +179,7 @@ class HeldOutPartition:
 
     def to_json_dict(self) -> dict[str, object]:
         """Serialise the partition, every field included so a reader need derive nothing."""
-        return {
+        payload: dict[str, object] = {
             "schema": self.schema,
             "seed": self.seed,
             "held_out_fraction": self.held_out_fraction,
@@ -159,6 +190,10 @@ class HeldOutPartition:
             "training_problem_ids": list(self.training_problem_ids),
             "held_out_problem_ids": list(self.held_out_problem_ids),
         }
+        if self.pool_problem_ids is not None:
+            payload["pool_problem_ids"] = list(self.pool_problem_ids)
+            payload["pool_schema"] = self.pool_schema
+        return payload
 
     @classmethod
     def from_json_dict(cls, payload: Mapping[str, Any]) -> HeldOutPartition:
@@ -175,6 +210,12 @@ class HeldOutPartition:
             pool_size=int(payload["pool_size"]),
             training_problem_ids=tuple(str(value) for value in payload["training_problem_ids"]),
             held_out_problem_ids=tuple(str(value) for value in payload["held_out_problem_ids"]),
+            pool_problem_ids=(
+                tuple(str(value) for value in payload["pool_problem_ids"])
+                if "pool_problem_ids" in payload
+                else None
+            ),
+            pool_schema=int(payload["pool_schema"]) if "pool_schema" in payload else None,
         )
 
 
@@ -204,11 +245,10 @@ def problem_pool() -> tuple[str, ...]:
 
 
 def pool_fingerprint(pool: Sequence[str]) -> str:
-    """Hash the exact pool a partition was drawn from, so a moved pool is a refusal not a surprise.
+    """Return the legacy pool digest retained in partition files for older readers.
 
-    The data schema goes into the hash beside the ids: a schema bump can change what a row means
-    without changing any id, and a partition drawn under the old meaning is not evidence about the
-    new one.
+    New readers compare the stored schema and ids directly; legacy files still need this value
+    because their original problem-id list was not persisted.
     """
     payload = f"ilcb-schema={DATA_SCHEMA}\n" + "\n".join(pool)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -253,6 +293,8 @@ def build_partition(
         pool_size=len(ordered),
         training_problem_ids=training,
         held_out_problem_ids=held_out,
+        pool_problem_ids=tuple(ordered),
+        pool_schema=DATA_SCHEMA,
     )
 
 
@@ -279,14 +321,7 @@ def write_partition(partition: HeldOutPartition, path: Path) -> None:
 
 
 def load_partition(path: Path) -> HeldOutPartition:
-    """Read the stored partition and refuse one drawn from a pool that has since moved.
-
-    The fingerprint check is the guard that matters. A partition file is the only record of which
-    problems a checkpoint was allowed to see, and it is read months after the run; if the baked case
-    file has been regenerated in between, the ids may still all exist while the pool they were drawn
-    from is different, and the held-out side would silently no longer be the complement of the
-    training side.
-    """
+    """Read the stored partition and name changes to the problem pool it was drawn from."""
     if not path.is_file():
         raise FileNotFoundError(
             f"no held-out partition at {path}. Both the training corpus and the held-out "
@@ -297,16 +332,34 @@ def load_partition(path: Path) -> HeldOutPartition:
         cast("dict[str, Any]", json.loads(path.read_text(encoding="utf-8")))
     )
     live = problem_pool()
-    live_fingerprint = pool_fingerprint(live)
-    if live_fingerprint != partition.pool_fingerprint:
-        raise RuntimeError(
-            f"{path} was drawn from a problem pool whose fingerprint was "
-            f"{partition.pool_fingerprint} over {partition.pool_size} problems, and this box's "
-            f"registry fingerprints as {live_fingerprint} over {len(live)}. The pool moved, so "
-            f"nothing says the held-out side is still the complement of the training side. "
-            f"Regenerate the case file this partition was written against, or draw a fresh "
-            f"partition and retrain -- do not run either arm against this one."
-        )
+    if partition.pool_problem_ids is not None:
+        recorded_ids = frozenset(partition.pool_problem_ids)
+        live_ids = frozenset(live)
+        added_ids = sorted(live_ids - recorded_ids)
+        removed_ids = sorted(recorded_ids - live_ids)
+        schema_changed = partition.pool_schema != DATA_SCHEMA
+        if added_ids or removed_ids or schema_changed:
+            changes = []
+            if schema_changed:
+                changes.append(f"pool_schema: recorded={partition.pool_schema} live={DATA_SCHEMA}")
+            if added_ids:
+                changes.append(f"added problem ids={added_ids[:REPORTED_OFFENDERS]}")
+            if removed_ids:
+                changes.append(f"removed problem ids={removed_ids[:REPORTED_OFFENDERS]}")
+            raise RuntimeError(
+                f"{path} was drawn from a different problem pool ({'; '.join(changes)}). "
+                "The held-out side may no longer be the complement of training; draw a fresh "
+                "partition and retrain before running either arm."
+            )
+    else:
+        # Older files stored only this digest, so their source ids cannot be recovered.
+        live_fingerprint = pool_fingerprint(live)
+        if live_fingerprint != partition.pool_fingerprint:
+            raise RuntimeError(
+                f"{path} is a legacy partition without stored problem ids and its pool fingerprint "
+                "does not match the current registry; the changed ids cannot be recovered. "
+                "Draw a fresh partition and retrain before running either arm."
+            )
     logger.info(
         "loaded the held-out partition, %s",
         f"{path=} n_training={len(partition.training_problem_ids)} "

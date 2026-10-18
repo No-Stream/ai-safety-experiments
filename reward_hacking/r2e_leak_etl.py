@@ -251,19 +251,27 @@ def pull_by_digest(task: R2eLeakTask) -> None:
 
 
 def extract_template(task: R2eLeakTask, templates_root: Path, dataset_revision: str) -> Path:
-    """Copy /testbed and /r2e_tests out of the task image; skip when provenance.json already matches."""
+    """Copy /testbed and /r2e_tests out of the task image; skip when its pinned reference matches."""
     task_directory = templates_root / task.task_id
     provenance_path = task_directory / "provenance.json"
     if provenance_path.is_file():
-        recorded_image_digest = json.loads(provenance_path.read_text())["image_digest"]
-        if recorded_image_digest == task.image_digest:
+        provenance = json.loads(provenance_path.read_text())
+        recorded_image_reference = provenance.get("image_reference")
+        if recorded_image_reference is None:
+            recorded_docker_image = provenance["docker_image"]
+            recorded_image_digest = provenance["image_digest"]
+            repository = recorded_docker_image.rsplit(":", 1)[0]
+            recorded_image_reference = f"{repository}@{recorded_image_digest}"
+        if not isinstance(recorded_image_reference, str):
+            raise TypeError("recorded image_reference must be a string")
+        if recorded_image_reference == task.digest_pinned_image:
             logger.info("resume: %s already extracted", task.task_id)
             return task_directory
         logger.warning(
-            "%s was extracted from image digest %s but the task now pins %s; re-extracting it",
+            "%s was extracted from image reference %s but the task now pins %s; re-extracting it",
             task_directory,
-            recorded_image_digest,
-            task.image_digest,
+            recorded_image_reference,
+            task.digest_pinned_image,
         )
     require_free_disk()
     if task_directory.exists():
@@ -284,6 +292,7 @@ def extract_template(task: R2eLeakTask, templates_root: Path, dataset_revision: 
         run(["docker", "rm", container_id])
     provenance = {
         "task_id": task.task_id,
+        "image_reference": task.digest_pinned_image,
         "image_digest": task.image_digest,
         "docker_image": task.docker_image,
         "dataset": DATASET_ID,

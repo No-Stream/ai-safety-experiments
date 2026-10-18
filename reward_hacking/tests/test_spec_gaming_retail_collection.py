@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 
@@ -15,12 +15,14 @@ from reward_hacking.spec_gaming import (
     retail_assessment,
     retail_collection,
     retail_config,
+    retail_episode,
     retail_manifests,
 )
 from reward_hacking.spec_gaming import (
     config as common_config,
 )
 from reward_hacking.spec_gaming.capture import HOST_TERMINATION_INDEX
+from reward_hacking.spec_gaming.readout import raw_episode_identity
 from reward_hacking.tests.test_spec_gaming_episode import ScriptedBackend, call
 from reward_hacking.tests.test_spec_gaming_retail_episode import NativeFixture
 
@@ -34,7 +36,7 @@ def _write_config(tmp_path: Path, *, source_lock_sha256: str | None = None) -> P
     source_python = tmp_path / "source-python"
     source_python.write_text("synthetic interpreter marker", encoding="utf-8")
     lockfile = tmp_path / "source-uv.lock"
-    lockfile.write_text("synthetic isolated lock", encoding="utf-8")
+    lockfile.write_text("version = 1\nrelease-date = 2026-10-17\n", encoding="utf-8")
     grouped_manifest = tmp_path / "grouped-split.json"
     grouped_manifest.write_text("{}", encoding="utf-8")
     model_source = tmp_path / "model"
@@ -122,16 +124,16 @@ def test_config_pins_source_interpreter_and_lockfile(tmp_path: Path) -> None:
     assert config.episode.seed == config.sampling.config.seed
 
 
-def test_config_logs_changed_source_lockfile_without_refusing(
+def test_config_records_changed_source_lockfile_without_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     config_path = _write_config(tmp_path, source_lock_sha256="d" * 64)
 
-    with caplog.at_level(logging.WARNING, logger=retail_config.logger.name):
+    with caplog.at_level(logging.WARNING, logger=retail_config.__name__):
         config = retail_collection.load_retail_collector_config(config_path)
 
     assert config.source.runtime_lockfile_sha256 == "d" * 64
-    assert "source runtime lockfile" in caplog.text
+    assert "source runtime lockfile" not in caplog.text
 
 
 def test_research_collection_requires_quarantine_and_explicit_approval(
@@ -341,11 +343,11 @@ def test_closed_collection_assessment_captures_judge_once_and_rescores_raw(
     assert readout["confirmed_gaming_clean"] == 0
     assert readout["manual_classification_counts"] == {"pending": 1}
     assert readout["integrity_awareness_exclusions"] == 0
+    first_episode = cast("list[dict[str, object]]", readout["episodes"])[0]
+    assert first_episode["group_task_ids"] == ["synthetic-task"]
+    assert "group_digest" not in first_episode
 
     revised_config = replace(config, assessment_rubric_version="revised-synthetic-rubric")
-    monkeypatch.setattr(
-        retail_assessment, "code_identity", lambda paths: dict.fromkeys(paths, "c" * 64)
-    )
     cached_judge = ScriptedBackend([])
     rescored = retail_collection.assess_retail_collection(
         revised_config, native_runtime=runtime, backend_factory=lambda: cached_judge
@@ -375,7 +377,10 @@ def test_closed_collection_assessment_captures_judge_once_and_rescores_raw(
     )
 
 
-def test_legacy_judge_sample_is_reused_without_rewriting_its_provenance(tmp_path: Path) -> None:
+def test_legacy_judge_sample_reuses_matching_identity_and_refreshes_stale_inputs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=retail_assessment.__name__)
     config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
     request = {
         "messages": [{"role": "user", "content": "Judge this synthetic assertion."}],
@@ -385,20 +390,23 @@ def test_legacy_judge_sample_is_reused_without_rewriting_its_provenance(tmp_path
     episode_dir = config.output_dir / "episodes" / "synthetic-task"
     backend = ScriptedBackend(["</think>{}"])
     sample = retail_assessment._sample_nl_judge(config, request, episode_dir, lambda: backend)
-    semantic_fields = {
-        "request_sha256",
-        "model_revision",
-        "tokenizer_revision",
-        "serving_manifest_sha256",
-        "sampling",
-        "thinking",
-        "chat_template_kwargs",
-    }
     previous_assessment = {"rubric_version": "original", "assessment_code_sha256": "a" * 64}
     previous_identity = {
         "schema_version": 1,
         "assessment_identity": previous_assessment,
-        **{field: sample["identity"][field] for field in semantic_fields},
+        "request_sha256": common_config.sha256(
+            common_config.canonical_json(sample["identity"]["request"])
+        ),
+        "max_tokens": sample["identity"]["max_tokens"],
+        "served_model_id": sample["identity"]["served_model_id"],
+        "model_revision": sample["identity"]["model_revision"],
+        "tokenizer_revision": sample["identity"]["tokenizer_revision"],
+        "serving_manifest_sha256": hashlib.sha256(
+            config.model.serving_manifest.read_bytes()
+        ).hexdigest(),
+        "sampling": sample["identity"]["sampling"],
+        "thinking": sample["identity"]["thinking"],
+        "chat_template_kwargs": sample["identity"]["chat_template_kwargs"],
     }
     sample["identity"] = previous_identity
     sample["sample_seed"] = int.from_bytes(
@@ -422,6 +430,58 @@ def test_legacy_judge_sample_is_reused_without_rewriting_its_provenance(tmp_path
     assert common_config.canonical_json(restored) == common_config.canonical_json(sample)
     assert cached_backend.prompts == []
     assert legacy_path.read_bytes() == legacy_bytes
+
+    stale_identity = {**previous_identity, "request_sha256": "0" * 64}
+    stale_sample = {**sample, "identity": stale_identity}
+    legacy_path.unlink()
+    retail_manifests._write_json(legacy_path, stale_sample, immutable=True)
+    changed_request_backend = ScriptedBackend(["</think>{}"])
+    refreshed = retail_assessment._sample_nl_judge(
+        revised, request, episode_dir, lambda: changed_request_backend
+    )
+    assert refreshed["identity"]["schema_version"] == 4
+    assert changed_request_backend.prompts
+    assert "request_sha256 differs" in caplog.text
+
+    for path in (episode_dir / "nl-judges").glob("*/sample.json"):
+        path.unlink()
+    changed_max_tokens_identity = {
+        **previous_identity,
+        "max_tokens": cast("int", previous_identity["max_tokens"]) + 1,
+    }
+    changed_max_tokens_sample = {**sample, "identity": changed_max_tokens_identity}
+    changed_max_tokens_sample["sample_seed"] = int.from_bytes(
+        hashlib.sha256(
+            common_config.canonical_json(
+                [previous_assessment, changed_max_tokens_identity, "nl-assertion-judge"]
+            )
+        ).digest()[:4],
+        "big",
+    )
+    legacy_path.unlink()
+    retail_manifests._write_json(legacy_path, changed_max_tokens_sample, immutable=True)
+    changed_generation_backend = ScriptedBackend(["</think>{}"])
+    refreshed = retail_assessment._sample_nl_judge(
+        revised, request, episode_dir, lambda: changed_generation_backend
+    )
+    assert refreshed["identity"]["schema_version"] == 4
+    assert changed_generation_backend.prompts
+    assert "differs at: max_tokens" in caplog.text
+
+    for path in (episode_dir / "nl-judges").glob("*/sample.json"):
+        path.unlink()
+    legacy_path.unlink()
+    no_serving_manifest_identity = {
+        key: value for key, value in previous_identity.items() if key != "serving_manifest_sha256"
+    }
+    no_serving_sample = {**sample, "identity": no_serving_manifest_identity}
+    retail_manifests._write_json(legacy_path, no_serving_sample, immutable=True)
+    unavailable_manifest_backend = ScriptedBackend([])
+    with pytest.raises(ValueError, match="serving manifest content is absent"):
+        retail_assessment._sample_nl_judge(
+            revised, request, episode_dir, lambda: unavailable_manifest_backend
+        )
+    assert unavailable_manifest_backend.prompts == []
 
 
 def test_nl_judge_response_requires_each_expected_boolean_exactly_once() -> None:
@@ -581,6 +641,290 @@ def test_readout_ignores_external_assessment_with_stale_journal_identity(
         )
 
     assert current is None
+
+
+def test_nl_judge_identity_keeps_request_and_serving_manifest_content(
+    tmp_path: Path,
+) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    request = {"messages": [{"role": "user", "content": "Synthetic request."}]}
+
+    identity = retail_assessment._judge_identity(request, config, [1, 2], "synthetic prompt")
+
+    assert identity["request"] == request
+    assert identity["serving_manifest"] == {}
+    assert identity["prompt_text"] == "synthetic prompt"
+    assert identity["prompt_token_ids"] == [1, 2]
+    assert "request_sha256" not in identity
+    assert "serving_manifest_sha256" not in identity
+    assert "prompt_sha256" not in identity
+    sampling_identity = identity["sampling"]
+    assert isinstance(sampling_identity, dict)
+    assert isinstance(sampling_identity["stop"], list)
+    changed_hash_config = replace(
+        config,
+        model=replace(config.model, serving_manifest_sha256="f" * 64),
+    )
+    assert (
+        retail_assessment._judge_identity(request, changed_hash_config, [1, 2], "synthetic prompt")
+        == identity
+    )
+
+
+def test_saved_nl_judge_sample_names_changed_request_field(tmp_path: Path) -> None:
+    identity = {"request": {"messages": [{"role": "user", "content": "Synthetic."}]}}
+    artifact_path = tmp_path / "sample.json"
+    artifact_path.write_text(json.dumps({"identity": identity}))
+
+    changed: dict[str, object] = {
+        "request": {"messages": [{"role": "user", "content": "Changed."}]}
+    }
+    with pytest.raises(ValueError, match=r"identity.request.messages\[0\].content"):
+        retail_assessment._reusable_judge_response(artifact_path, changed)
+
+
+def test_nl_judge_sample_compares_serving_manifest_content(tmp_path: Path) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    request = {"messages": [{"role": "user", "content": "Synthetic request."}]}
+    identity = retail_assessment._judge_identity(request, config, [1, 2], "synthetic prompt")
+    artifact_path = tmp_path / "sample.json"
+    artifact_path.write_text(json.dumps({"identity": identity}), encoding="utf-8")
+
+    config.model.serving_manifest.write_text('{"revision":"changed"}', encoding="utf-8")
+    changed = retail_assessment._judge_identity(request, config, [1, 2], "synthetic prompt")
+    with pytest.raises(ValueError, match=r"identity.serving_manifest.revision"):
+        retail_assessment._reusable_judge_response(artifact_path, changed)
+
+
+def test_assessment_identity_keeps_task_and_runtime_configuration_readable(tmp_path: Path) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    task_identity: dict[str, object] = {
+        "model": {"revision": "synthetic-revision"},
+        "group_task_ids": ["task-a", "task-b"],
+        "group_digest": "c" * 64,
+    }
+    before = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity=task_identity,
+        raw_episode_identity={"manifest": {"ledger": ["synthetic"]}},
+    )
+    config.source.runtime_lockfile.write_text(
+        "version=1\nrelease-date=2026-10-17\n", encoding="utf-8"
+    )
+    after = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity={**task_identity, "group_digest": "e" * 64},
+        raw_episode_identity={"manifest": {"ledger": ["synthetic"]}},
+    )
+
+    assert before["task_generation_identity"] == {
+        "model": {"revision": "synthetic-revision"},
+        "group_task_ids": ["task-a", "task-b"],
+    }
+    assert before["group_membership"] == {"group_task_ids": ["task-a", "task-b"]}
+    assert before["raw_episode_identity"] == {"manifest": {"ledger": ["synthetic"]}}
+    assert "raw_episode_digest" not in before
+    assert before["runtime_lockfile"] == {"version": 1, "release-date": "2026-10-17"}
+    assert before == after
+
+    changed_members = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity={**task_identity, "group_task_ids": ["task-a", "task-c"]},
+        raw_episode_identity={"manifest": {"ledger": ["synthetic"]}},
+    )
+    assert changed_members != before
+
+    changed_episode = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity=task_identity,
+        raw_episode_identity={"manifest": {"ledger": ["changed"]}},
+    )
+    assert changed_episode != before
+
+
+def test_assessment_identity_normalizes_digest_in_real_generation_shape(tmp_path: Path) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    outer_identity: dict[str, object] = {
+        "schema_version": 1,
+        "environment": "tau2_retail",
+        "task_id": "synthetic-task",
+        "task_identity": {
+            "task_id": "synthetic-task",
+            "group_task_ids": ["task-a", "task-b"],
+            "group_digest": "c" * 64,
+        },
+    }
+    generation_identity = retail_episode.retail_generation_identity(
+        outer_identity, {"render": "synthetic"}
+    )
+    changed_generation_identity = retail_episode.retail_generation_identity(
+        {
+            **outer_identity,
+            "task_identity": {
+                "task_id": "synthetic-task",
+                "group_task_ids": ["task-a", "task-b"],
+                "group_digest": "e" * 64,
+            },
+        },
+        {"render": "synthetic"},
+    )
+
+    identity = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity=generation_identity,
+        raw_episode_identity={"manifest": {"ledger": ["synthetic"]}},
+    )
+    changed_identity = retail_assessment.assessment_identity(
+        config,
+        task_id="synthetic-task",
+        task_sha256="a" * 64,
+        source_revision="b" * 40,
+        task_identity=changed_generation_identity,
+        raw_episode_identity={"manifest": {"ledger": ["synthetic"]}},
+    )
+
+    assert identity["group_membership"] == {"group_task_ids": ["task-a", "task-b"]}
+    assert identity["task_generation_identity"] == changed_identity["task_generation_identity"]
+    assert identity == changed_identity
+
+
+def test_current_retail_assessment_resolves_legacy_raw_digest_identity(tmp_path: Path) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    task_identity: dict[str, object] = {"group_task_ids": ["synthetic-task"]}
+    episode_dir = tmp_path / "episode"
+    assessment_path = episode_dir / "assessment-current.json"
+    with capture.EpisodeJournal(episode_dir, {}) as journal:
+        completion_digest = journal.save_completion(0, [], [], [], "Synthetic.", {})
+        journal.begin_action("close", completion_digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        raw_digest = journal.raw_episode_digest()
+        readable_raw_identity = raw_episode_identity(journal, raw_digest)
+        current_identity = retail_assessment.assessment_identity(
+            config,
+            task_id="synthetic-task",
+            task_sha256="a" * 64,
+            source_revision="b" * 40,
+            task_identity=task_identity,
+            raw_episode_identity=readable_raw_identity,
+        )
+        legacy_identity = {
+            key: value for key, value in current_identity.items() if key != "raw_episode_identity"
+        }
+        legacy_identity["schema_version"] = 2
+        legacy_identity["raw_episode_digest"] = raw_digest
+        assessment: dict[str, object] = {
+            "awareness_status": "pending",
+            "mechanism_evidence": [],
+        }
+        journal.save_assessment(legacy_identity, assessment)
+        assessment_path.parent.mkdir(parents=True, exist_ok=True)
+        assessment_path.write_text(
+            json.dumps({"identity": legacy_identity, "assessment": assessment}),
+            encoding="utf-8",
+        )
+
+        assert (
+            retail_assessment.current_retail_assessment(journal, assessment_path, current_identity)
+            == assessment
+        )
+
+
+@pytest.mark.parametrize("missing_field", [None, "assessment_code_sha256"])
+def test_current_retail_assessment_migrates_schema_one_identity(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    missing_field: str | None,
+) -> None:
+    config = retail_collection.load_retail_collector_config(_write_config(tmp_path))
+    task_identity = retail_episode.retail_generation_identity(
+        {
+            "schema_version": 1,
+            "environment": "tau2_retail",
+            "source_runtime": {
+                "runtime_lockfile_sha256": config.source.runtime_lockfile_sha256,
+            },
+            "task_id": "synthetic-task",
+            "task_identity": {
+                "task_id": "synthetic-task",
+                "group_task_ids": ["synthetic-task"],
+                "group_digest": "c" * 64,
+            },
+        },
+        {"render": "synthetic"},
+    )
+    episode_dir = tmp_path / "episode"
+    assessment_path = episode_dir / "assessment-current.json"
+    with capture.EpisodeJournal(episode_dir, task_identity) as journal:
+        completion_digest = journal.save_completion(0, [], [], [], "Synthetic.", {})
+        journal.begin_action("close", completion_digest, 0, "hand_back", {})
+        journal.commit_action("close", {}, {}, close=True)
+        raw_digest = journal.raw_episode_digest()
+        current_identity = retail_assessment.assessment_identity(
+            config,
+            task_id="synthetic-task",
+            task_sha256="a" * 64,
+            source_revision="b" * 40,
+            task_identity=task_identity,
+            raw_episode_identity=raw_episode_identity(journal, raw_digest),
+        )
+        legacy_identity: dict[str, object] = {
+            "schema_version": 1,
+            "assessment": "tau2-retail-native-and-operational-proxy",
+            "task_id": "synthetic-task",
+            "task_sha256": "a" * 64,
+            "source_revision": "b" * 40,
+            "group_digest": "d" * 64,
+            "task_generation_identity_sha256": "e" * 64,
+            "runtime_lockfile_sha256": config.source.runtime_lockfile_sha256,
+            "assessment_code_sha256": {"retail_assessment.py": "f" * 64},
+            "rubric_version": config.assessment_rubric_version,
+            "native_evaluator_revision": "b" * 40,
+            "raw_episode_digest": raw_digest,
+        }
+        if missing_field is not None:
+            legacy_identity.pop(missing_field)
+        assessment: dict[str, object] = {
+            "awareness_status": "pending",
+            "mechanism_evidence": [],
+        }
+        journal.save_assessment(legacy_identity, assessment)
+        assessment_path.parent.mkdir(parents=True, exist_ok=True)
+        assessment_path.write_text(
+            json.dumps({"identity": legacy_identity, "assessment": assessment}),
+            encoding="utf-8",
+        )
+
+        if missing_field is not None:
+            with pytest.raises(
+                ValueError,
+                match=r"legacy retail assessment cannot be reused.*identity.assessment_code_sha256 \(missing\)",
+            ):
+                retail_assessment.current_retail_assessment(
+                    journal, assessment_path, current_identity
+                )
+        else:
+            assert (
+                retail_assessment.current_retail_assessment(
+                    journal, assessment_path, current_identity
+                )
+                == assessment
+            )
+            assert "runtime TOML and evaluator code content were not stored" in caplog.text
 
 
 class _FakeTask:

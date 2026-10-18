@@ -26,7 +26,6 @@ here flipped from 1.00 to 0.00 between two identical runs. A trace written befor
 reads as ``repeat`` 0, which is what it was.
 """
 
-import hashlib
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -92,7 +91,7 @@ class Cell:
     Exists so the asynchronous batch path can render prompts in one process and rebuild calls in
     another without a second copy of the pairing logic. Rendering is deterministic given the same
     items, arms and repeat count, so re-deriving the cells at collection time reproduces exactly
-    the list that was submitted -- and the batch backend checks that by comparing prompt digests
+    the list that was submitted -- and the batch backend checks that by comparing prompt text
     rather than trusting it.
     """
 
@@ -267,11 +266,6 @@ def group_key(item_id: str, repeat: int) -> tuple[str, int]:
     return (item_id, repeat)
 
 
-def _prompt_digest(prompt: str) -> str:
-    """Digest a prompt for the resume check, so a refusal can name a drift without echoing item text."""
-    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-
-
 def _run_label_identity(model_id: str, transport: str, labels: SamplingLabels) -> dict[str, object]:
     """List the four labels every record in a resumed trace must share with THIS run.
 
@@ -293,13 +287,14 @@ def _refuse_drift(
 ) -> None:
     """Refuse the whole resume, by name, on the first record whose identity is another run's."""
     stored = {name: record.get(name) for name in expected}
-    if "prompt_digest" in expected:
-        stored["prompt_digest"] = _prompt_digest(str(record.get("prompt", "")))
-    drifted = [
-        f"{name}={stored[name]!r} on disk but {value!r} for this run"
-        for name, value in expected.items()
-        if stored[name] != value
-    ]
+    drifted: list[str] = []
+    for name, value in expected.items():
+        if stored[name] != value:
+            drifted.append(
+                "prompt differs"
+                if name == "prompt"
+                else f"{name}={stored[name]!r} on disk but {value!r} for this run"
+            )
     if drifted:
         raise ValueError(
             f"refusing to resume over {path}, whose {what} is another run's: {'; '.join(drifted)}. "
@@ -316,7 +311,7 @@ def _scan_trace(
 
     Returns ``(answered, summarised)``, both keyed by :func:`group_key`. Every record is checked
     against the run's labels; a response record for a cell this run renders is checked against the
-    prompt digest too, which is what catches a redrafted item under an unchanged id. Two responses
+    stored prompt too, which catches a redrafted item under an unchanged id. Two responses
     for one rendered cell, or two summaries for one group, refuse: a rate over them would have a
     denominator nobody can state.
     """
@@ -338,9 +333,7 @@ def _scan_trace(
             continue
         arm = str(record["arm"])
         cell = wanted_cells.get((key[0], arm, key[1]))
-        expected = (
-            identity if cell is None else {**identity, "prompt_digest": _prompt_digest(cell.prompt)}
-        )
+        expected = identity if cell is None else {**identity, "prompt": cell.prompt}
         _refuse_drift(
             record, expected, path=path, what=f"response record for cell {(key[0], arm, key[1])}"
         )
@@ -402,7 +395,7 @@ def resumable_group_keys(
     completion the first sitting had paid for, so the partial-chunk hand-over bought a trace to
     inspect rather than a resume. It is also the quietest way to end up with one file holding two
     experiments, so every record in the file is checked against this run's four labels and every
-    response record for a cell this run renders against the prompt digest as well; the first
+    response record for a cell this run renders against its stored prompt as well; the first
     mismatch refuses the whole resume by name rather than skipping the group.
 
     A group is resumed only when its item summary is on disk and covers every arm this run renders
@@ -489,7 +482,8 @@ def run_and_append(  # noqa: PLR0913 - the trailing keyword is a persistence kno
     against request order. Name it in the run's report when it is on.
 
     The cells arrive rendered rather than as (items, arms, repeats): the batch path already renders
-    them in the caller to digest them, and a driver that has them in hand should not render twice.
+    them in the caller to compare them with the submitted prompts, and a driver that has them in
+    hand should not render twice.
     Returns the calls that RAN this invocation, so the in-memory shape matches :func:`run_items` for
     a fresh run; the resumed groups are on disk and in the log line.
     """

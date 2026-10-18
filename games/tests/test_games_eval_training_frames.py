@@ -600,7 +600,7 @@ class TestATraceWithoutASummaryIsResumed:
                 cli(corpus, run_dir, tmp_path / "out", "--steps", "5", "--samples-per-prompt", "3")
             )
         assert interrupted.read_bytes() == before
-        with pytest.raises(FileExistsError, match="corpus_sha256"):
+        with pytest.raises(FileExistsError, match=r"corpus_rows\[1\]\.prompt"):
             eval_training_frames.main(
                 cli(write_other_corpus(tmp_path), run_dir, tmp_path / "out", *TWO_DRAWS)
             )
@@ -617,6 +617,47 @@ class TestATraceWithoutASummaryIsResumed:
             )
         assert "prefilled_think" in str(refusal.value)
         assert interrupted.read_bytes() == before
+
+    def test_a_partial_trace_resumes_when_only_corpus_json_formatting_changes(
+        self, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_dir = make_run_dir(tmp_path)
+        trace = run_interrupted(corpus, run_dir, tmp_path / "out", monkeypatch, *TWO_DRAWS)
+        existing_records = len(record_lines(trace))
+        original_digest = eval_training_frames._corpus_sha256(corpus)
+        rows = [json.loads(line) for line in corpus.read_text(encoding="utf-8").splitlines()]
+        reformatted_rows = [json.dumps(dict(reversed(list(row.items())))) for row in rows]
+        corpus.write_text("\n".join(reformatted_rows) + "\n", encoding="utf-8")
+        backend = install_scripted_backend(monkeypatch)
+
+        assert eval_training_frames.main(cli(corpus, run_dir, tmp_path / "out", *TWO_DRAWS)) == 0
+
+        assert backend.prompts_seen == 4 - existing_records
+        meta = read_eval_records(trace)[0]
+        assert meta["corpus_sha256"] == original_digest
+        assert meta["corpus_sha256"] != eval_training_frames._corpus_sha256(corpus)
+        assert meta["corpus_identity_version"] == 1
+
+    def test_a_legacy_digest_trace_still_resumes_and_keeps_its_legacy_identity(
+        self, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_dir = make_run_dir(tmp_path)
+        trace = run_interrupted(corpus, run_dir, tmp_path / "out", monkeypatch, *TWO_DRAWS)
+        lines = trace.read_text(encoding="utf-8").splitlines()
+        meta = json.loads(lines[0])
+        legacy_meta = {
+            key: value
+            for key, value in meta.items()
+            if key != "corpus_identity_version" and not key.startswith("corpus_rows[")
+        }
+        trace.write_text(json.dumps(legacy_meta) + "\n" + "\n".join(lines[1:]) + "\n", "utf-8")
+        existing_records = len(lines) - 1
+        backend = install_scripted_backend(monkeypatch)
+
+        assert eval_training_frames.main(cli(corpus, run_dir, tmp_path / "out", *TWO_DRAWS)) == 0
+
+        assert backend.prompts_seen == 4 - existing_records
+        assert "corpus_identity_version" not in read_eval_records(trace)[0]
 
     def test_a_torn_final_line_is_dropped_and_regenerated(
         self, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -806,7 +847,7 @@ class TestSyncDest:
             eval_training_frames.main(
                 cli(corpus, run_dir, out_dir, "--steps", "5", "--samples-per-prompt", "3", *synced)
             )
-        with pytest.raises(FileExistsError, match="corpus_sha256"):
+        with pytest.raises(FileExistsError, match=r"corpus_rows\[1\]\.prompt"):
             eval_training_frames.main(
                 cli(write_other_corpus(tmp_path), run_dir, out_dir, *TWO_DRAWS, *synced)
             )
@@ -941,7 +982,8 @@ class TestTheSummaryIsAPureFunctionOfTheTrace:
         legacy_meta = {
             key: value
             for key, value in meta.items()
-            if key not in ("eval_config", "resume", "sampling_budget")
+            if key not in ("eval_config", "resume", "sampling_budget", "corpus_identity_version")
+            and not key.startswith("corpus_rows[")
         }
         assert tuple(legacy_meta) == self.LEGACY_FRAMES_META_FIELDS
         legacy = tmp_path / "legacy" / "step-5.jsonl"

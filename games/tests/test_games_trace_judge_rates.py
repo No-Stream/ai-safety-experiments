@@ -6,7 +6,6 @@ Fixtures are shared with ``test_games_trace_judge`` (synthetic traces only; this
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import statistics
@@ -16,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from games.tests.test_games_trace_judge import (
-    COMPLETION,
     SCOPE,
     VERDICT_PAYLOAD,
     VISIBLE,
@@ -41,7 +39,7 @@ from games.trace_judge_rates import (
     trace_rates,
     validation_report,
 )
-from games.trace_judge_schema import RUBRIC_VERSION, keyword_basis, rubric_digest
+from games.trace_judge_schema import RUBRIC_VERSION, keyword_basis, rubric_sections
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -73,9 +71,10 @@ def judged_row(record: TraceRecord, **verdict_overrides: Any) -> dict[str, Any]:
         "prompt_id": record.prompt_id,
         "sample_index": record.sample_index,
         "completion_sha256": record.completion_sha256,
+        "completion_text": record.completion,
         "keyword_basis": keyword_basis(record.completion),
         "rubric_version": RUBRIC_VERSION,
-        "rubric_digest": rubric_digest(),
+        "rubric_sections": rubric_sections(),
         "evidence_not_found": False,
         "verdict": verdict,
     }
@@ -175,7 +174,7 @@ def cooperators_only_fixture() -> tuple[
     judged[one_step_scope.key] = judged_row(one_step_scope)
     census_by_key = {str(row["key"]): row for row in census}
     judged[errored.key] = {**census_by_key[errored.key], "judge_error": "boom"}
-    drawn = {record.handle for record in step0[:2]} | {(0, "never-judged", 0, "0" * 64)}
+    drawn = {record.handle for record in step0[:2]} | {(0, "never-judged", 0)}
     return judged, census, drawn
 
 
@@ -491,10 +490,11 @@ class TestTraceRates:
         )
         assert coupling_clause_in_prompt(census_rows([twin])[0]) is True
 
-    def test_a_row_judged_under_another_scaffold_digest_is_refused_not_pooled(self) -> None:
+    def test_a_row_with_a_changed_scaffold_section_is_refused_not_pooled(self) -> None:
         record = make_record()
-        stale = dict(judged_row(record), rubric_digest="0000000000000000")
-        with pytest.raises(ValueError, match="digest"):
+        stale = judged_row(record)
+        stale["rubric_sections"] = dict(stale["rubric_sections"], game_section="older wording")
+        with pytest.raises(ValueError, match=r"rubric_sections.game_section"):
             trace_rates({record.key: stale}, census_rows([record]))
 
     def test_keyword_agreement_is_reported_not_merged(self) -> None:
@@ -812,11 +812,11 @@ class TestHandLabelValidation:
         assert load_hand_labels(enveloped) == mapping
         assert load_hand_labels(bare) == mapping
 
-    def test_hand_keys_follow_the_exports_spelling_and_resolve_through_the_digest(
+    def test_hand_keys_follow_the_exports_spelling_and_resolve_by_record_identity(
         self, tmp_path: Path
     ) -> None:
         """The ladder export keys by rung + label_print_order, the control export by source_arm + order,
-        and neither spelling is the judged rows' arm|cell; the completion digest is the shared identity."""
+        and neither spelling is the judged rows' arm|cell; record identity resolves their rows."""
         ladder_record = make_record(step=0, sample_index=4)
         control_record = make_record(
             step=70, sample_index=5, completion="another trace</think>" + VISIBLE
@@ -899,12 +899,7 @@ class TestHandLabelValidation:
         key_map = resolve_hand_keys({k: hand_label() for k in keys}, judged, [path])
         assert key_map == {keys[0]: at_0.key, keys[1]: at_70.key}
 
-    def test_the_record_handle_is_the_judged_rows_digest(self) -> None:
+    def test_the_record_handle_uses_only_the_stable_record_identity(self) -> None:
         record = make_record()
-        assert record.completion_sha256 == hashlib.sha256(COMPLETION.encode()).hexdigest()
-        assert record.handle == (
-            record.step,
-            record.prompt_id,
-            record.sample_index,
-            record.completion_sha256,
-        )
+        assert record.handle == (record.step, record.prompt_id, record.sample_index)
+        assert make_record(completion="different text").handle == record.handle

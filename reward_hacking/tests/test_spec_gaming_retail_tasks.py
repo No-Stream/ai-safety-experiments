@@ -263,5 +263,83 @@ def test_importer_rejects_grouped_manifest_that_marks_candidate_heldout(
         retail_tasks, "_source_revision", lambda _source_root: retail_tasks.RETAIL_SOURCE_REVISION
     )
 
-    with pytest.raises(ValueError, match="group split does not match digest"):
+    with pytest.raises(ValueError, match="group split does not match task membership"):
+        retail_tasks.import_retail_tasks(source_root, grouped_split_path)
+
+
+def test_importer_uses_group_membership_when_recorded_digest_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, grouped_split_path = _synthetic_source(tmp_path)
+    manifest = json.loads(grouped_split_path.read_text(encoding="utf-8"))
+    selected_group = next(group for group in manifest["groups"] if "14" in group["task_ids"])
+    selected_group["group_digest"] = "synthetic-stale-digest"
+    manifest["selected_candidates"]["14"]["group_digest"] = "synthetic-stale-digest"
+    grouped_split_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        retail_tasks, "_source_revision", lambda _source_root: retail_tasks.RETAIL_SOURCE_REVISION
+    )
+
+    imported = retail_tasks.import_retail_tasks(source_root, grouped_split_path)
+
+    task = next(task for task in imported.tasks if task.task_id == "14")
+    assert task.group_task_ids == tuple(sorted(selected_group["task_ids"], key=int))
+    assert task.group_digest == _group_digest(selected_group["task_ids"])
+    assert task.split == selected_group["split"]
+    assert task.to_payload()["group_digest"] == _group_digest(selected_group["task_ids"])
+
+
+def test_importer_accepts_group_manifest_without_recorded_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, grouped_split_path = _synthetic_source(tmp_path)
+    manifest = json.loads(grouped_split_path.read_text(encoding="utf-8"))
+    selected_group = next(group for group in manifest["groups"] if "14" in group["task_ids"])
+    for group in manifest["groups"]:
+        group.pop("group_digest")
+    for candidate in manifest["selected_candidates"].values():
+        candidate.pop("group_digest")
+    grouped_split_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        retail_tasks, "_source_revision", lambda _source_root: retail_tasks.RETAIL_SOURCE_REVISION
+    )
+
+    imported = retail_tasks.import_retail_tasks(source_root, grouped_split_path)
+
+    task = next(task for task in imported.tasks if task.task_id == "14")
+    assert task.group_task_ids == tuple(sorted(selected_group["task_ids"], key=int))
+    assert task.group_digest == _group_digest(selected_group["task_ids"])
+    assert task.split == selected_group["split"]
+
+
+def test_importer_names_selected_candidate_member_id_differences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, grouped_split_path = _synthetic_source(tmp_path)
+    manifest = json.loads(grouped_split_path.read_text(encoding="utf-8"))
+    selected_group = next(group for group in manifest["groups"] if "14" in group["task_ids"])
+    candidate = manifest["selected_candidates"]["14"]
+    original_members = list(selected_group["task_ids"])
+    candidate["group_task_ids"] = original_members
+    singleton_group = next(
+        group
+        for group in manifest["groups"]
+        if len(group["task_ids"]) == 1
+        and group["task_ids"][0] not in retail_tasks.FROZEN_RETAIL_TASK_IDS
+    )
+    missing_member = original_members[1]
+    unexpected_member = singleton_group["task_ids"][0]
+    selected_group.update(_group([original_members[0], unexpected_member]))
+    singleton_group.update(_group([missing_member]))
+    candidate["group_digest"] = selected_group["group_digest"]
+    candidate["grouped_split"] = selected_group["split"]
+    grouped_split_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        retail_tasks, "_source_revision", lambda _source_root: retail_tasks.RETAIL_SOURCE_REVISION
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"selected candidate 14 group members differ.*missing.*{unexpected_member}.*extra.*{missing_member}",
+    ):
         retail_tasks.import_retail_tasks(source_root, grouped_split_path)

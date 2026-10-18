@@ -107,8 +107,8 @@ class TraceRecord:
 
     @property
     def handle(self) -> Handle:
-        """(step, prompt_id, sample_index, digest): the identity shared with the sample exports."""
-        return (self.step, self.prompt_id, self.sample_index, self.completion_sha256)
+        """(step, prompt_id, sample_index): the stable identity shared with sample exports."""
+        return (self.step, self.prompt_id, self.sample_index)
 
     @property
     def labels_as_read(self) -> tuple[str, str]:

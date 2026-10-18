@@ -6,10 +6,9 @@ import ast
 import copy
 import hashlib
 import json
-import logging
 import re
 from collections import Counter
-from typing import Any
+from typing import Any, cast
 
 from reward_hacking.output_contracts import (
     MUTATION_ALGORITHM,
@@ -17,8 +16,6 @@ from reward_hacking.output_contracts import (
     contract_digest,
     mutate_output,
 )
-
-logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _digest(value: object) -> str:
@@ -126,6 +123,7 @@ def derive_oneoff_registry(source: dict[str, Any], catalog: dict[str, Any]) -> d
         "source_sha256": _digest(source),
         "catalog_sha256": _digest(catalog),
         "catalog": copy.deepcopy(catalog),
+        "source_fields": _source_fields(derived),
         "supported_count": len(derived["problems"]) - len(exclusions),
         "unsupported_count": len(exclusions),
         "exclusions": exclusions,
@@ -136,27 +134,59 @@ def derive_oneoff_registry(source: dict[str, Any], catalog: dict[str, Any]) -> d
 
 
 def _source_fields(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "provenance": payload["provenance"],
-        "problems": [
-            {
-                key: value
-                for key, value in row.items()
-                if key not in {"oneoff_assertions", "mutation_index", "output_mutation"}
-            }
-            for row in payload["problems"]
-        ],
-    }
+    return copy.deepcopy(
+        {
+            "provenance": payload["provenance"],
+            "problems": [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"oneoff_assertions", "mutation_index", "output_mutation"}
+                }
+                for row in payload["problems"]
+            ],
+        }
+    )
 
 
-def _warn_on_digest_mismatch(name: str, recorded_sha256: str, observed_sha256: str) -> None:
-    if recorded_sha256 != observed_sha256:
-        logger.warning(
-            "derived mutation %s records sha256 %s but observed %s",
-            name,
-            recorded_sha256,
-            observed_sha256,
-        )
+def _value_differences(expected: object, stored: object, prefix: str) -> list[str]:
+    if isinstance(expected, dict) and isinstance(stored, dict):
+        expected_values = cast("dict[str, object]", expected)
+        stored_values = cast("dict[str, object]", stored)
+        differences: list[str] = []
+        for key in sorted(set(expected_values) | set(stored_values)):
+            path = f"{prefix}.{key}"
+            if key not in expected_values or key not in stored_values:
+                differences.append(path)
+            else:
+                differences.extend(
+                    _value_differences(expected_values[key], stored_values[key], path)
+                )
+        return differences
+    return [] if expected == stored else [prefix]
+
+
+def _source_field_differences(expected: dict[str, Any], stored: dict[str, Any]) -> list[str]:
+    differences = [f"source_fields.{key}" for key in sorted(set(expected) ^ set(stored))]
+    differences.extend(
+        _value_differences(expected.get("provenance"), stored.get("provenance"), "provenance")
+    )
+    expected_rows = expected.get("problems")
+    stored_rows = stored.get("problems")
+    if not isinstance(expected_rows, list) or not isinstance(stored_rows, list):
+        return [*differences, "problems"]
+    expected_by_id = {row["problem_id"]: row for row in expected_rows}
+    stored_by_id = {row["problem_id"]: row for row in stored_rows}
+    for problem_id in sorted(set(expected_by_id) | set(stored_by_id)):
+        if problem_id not in expected_by_id or problem_id not in stored_by_id:
+            differences.append(f"problems.{problem_id}")
+        else:
+            differences.extend(
+                _value_differences(
+                    expected_by_id[problem_id], stored_by_id[problem_id], f"problems.{problem_id}"
+                )
+            )
+    return differences
 
 
 def validate_derived_registry(payload: dict[str, Any]) -> None:
@@ -164,15 +194,13 @@ def validate_derived_registry(payload: dict[str, Any]) -> None:
     registry = payload["output_mutation_registry"]
     if registry.get("schema") != 1 or registry.get("algorithm") != MUTATION_ALGORITHM:
         raise ValueError("unsupported derived mutation registry")
-    if registry["source_fields_sha256"] != _digest(_source_fields(payload)):
-        raise ValueError("derived registry source/truth fields changed")
     for field in ("source_sha256", "catalog_sha256"):
         if (
             not isinstance(registry.get(field), str)
             or re.fullmatch(r"[0-9a-f]{64}", registry[field]) is None
         ):
             raise ValueError("invalid derived registry digest")
-    _warn_on_digest_mismatch("catalog", registry["catalog_sha256"], _digest(registry["catalog"]))
+    _validate_source_fields(payload, registry)
     exclusions: dict[str, str] = {}
     for row in payload["problems"]:
         reason = _validate_row(row)
@@ -190,6 +218,20 @@ def validate_derived_registry(payload: dict[str, Any]) -> None:
         raise ValueError("derived mutation coverage counts mismatch")
 
 
+def _validate_source_fields(payload: dict[str, Any], registry: dict[str, Any]) -> None:
+    current_source_fields = _source_fields(payload)
+    if "source_fields" not in registry:
+        if registry["source_fields_sha256"] != _digest(current_source_fields):
+            raise ValueError("legacy derived registry source/truth fields changed")
+        return
+    stored_source_fields = registry["source_fields"]
+    if not isinstance(stored_source_fields, dict):
+        raise TypeError("derived registry source_fields must be an object")
+    differences = _source_field_differences(current_source_fields, stored_source_fields)
+    if differences:
+        raise ValueError("derived registry source fields changed at " + ", ".join(differences[:10]))
+
+
 def _validate_row(row: dict[str, Any]) -> str | None:
     metadata = row["output_mutation"]
     if metadata.get("algorithm") != MUTATION_ALGORITHM:
@@ -201,7 +243,6 @@ def _validate_row(row: dict[str, Any]) -> str | None:
     if metadata["status"] == "supported":
         expected = copy.deepcopy(row)
         contract = metadata["contract"]
-        _warn_on_digest_mismatch("contract", metadata["contract_sha256"], contract_digest(contract))
         _derive_row(
             expected,
             {

@@ -766,7 +766,7 @@ class TestResumeByKey:
         assert len(load_trace(path)) == 4
 
     def test_a_redrafted_item_refuses_to_resume_onto_the_old_drafts_replies(self, tmp_path: Path):
-        """The key is the cell coordinate, so the prompt digest is what catches a redraft in place."""
+        """The key is the cell coordinate, so the stored prompt catches a redraft in place."""
         path = tmp_path / "trace.raw.jsonl"
         run_and_append(RunSpec([toy_item()]), MockBackend([fenced("5")] * 2), LABELS, path)
         redrafted = recovery_item(
@@ -778,7 +778,7 @@ class TestResumeByKey:
             true_answer="7",
             flawed_answer="8",
         )
-        with pytest.raises(ValueError, match=r"refusing to resume.*prompt_digest"):
+        with pytest.raises(ValueError, match=r"refusing to resume.*prompt differs"):
             run_and_append(RunSpec([redrafted]), RefusingBackend(), LABELS, path)
 
     def test_a_trace_from_another_run_is_refused_rather_than_merged(self, tmp_path: Path):

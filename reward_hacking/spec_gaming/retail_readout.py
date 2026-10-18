@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from reward_hacking.spec_gaming.capture import EpisodeJournal
+from reward_hacking.spec_gaming.capture import EpisodeJournal, compare_identity_fields
 from reward_hacking.spec_gaming.config import (
-    canonical_json,
     nonempty_string,
     object_value,
 )
@@ -17,10 +16,12 @@ from reward_hacking.spec_gaming.manifests import (
 from reward_hacking.spec_gaming.manifests import (
     write_json as _write_json,
 )
+from reward_hacking.spec_gaming.readout import raw_episode_identity
 from reward_hacking.spec_gaming.retail_assessment import (
     assessment_identity as build_assessment_identity,
 )
 from reward_hacking.spec_gaming.retail_assessment import (
+    assessment_identity_differences,
     current_retail_assessment,
     role_sampling_counts,
 )
@@ -30,6 +31,33 @@ if TYPE_CHECKING:
     from reward_hacking.spec_gaming.retail_config import RetailCollectorConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _manual_review_references_current_automatic(
+    journal: EpisodeJournal,
+    assessments: tuple[dict[str, Any], ...],
+    identity: dict[str, Any],
+    current_automatic: dict[str, Any],
+) -> bool:
+    digest = identity.get("automatic_assessment_digest")
+    if not isinstance(digest, str):
+        return False
+    referenced = [entry for entry in assessments if entry["digest"] == digest]
+    if len(referenced) != 1:
+        return False
+    reference = referenced[0]
+    if assessment_identity_differences(
+        journal, current_automatic["identity"], reference["identity"]
+    ) or compare_identity_fields(
+        current_automatic["assessment"], reference["assessment"], "automatic_assessment"
+    ):
+        return False
+    direct_identity = identity.get("automatic_assessment_identity")
+    return direct_identity is None or not assessment_identity_differences(
+        journal,
+        current_automatic["identity"],
+        object_value(direct_identity, "retail manual review automatic assessment identity"),
+    )
 
 
 def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
@@ -64,7 +92,6 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
             rows.append(
                 {
                     "task_id": task_id,
-                    "group_digest": task_payload.get("group_digest"),
                     "group_task_ids": group_ids,
                     "split": task_payload.get("split"),
                     "execution_status": "failed" if failure else "not_started",
@@ -100,6 +127,8 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
         ) as journal:
             state = journal.state()
             closed = journal.progress()["closed"] is True
+            raw_digest = journal.raw_episode_digest() if closed else ""
+            raw_identity = raw_episode_identity(journal, raw_digest) if closed else {}
             task_identity = object_value(task_identity_value, "retail task identity")
             assessment_identity = build_assessment_identity(
                 config,
@@ -108,11 +137,8 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
                 source_revision=nonempty_string(
                     task_payload.get("source_revision"), "retail source revision"
                 ),
-                group_digest=nonempty_string(
-                    task_payload.get("group_digest"), "retail group digest"
-                ),
                 task_identity=task_identity,
-                raw_episode_digest=journal.raw_episode_digest() if closed else "",
+                raw_episode_identity=raw_identity,
             )
             assessment = (
                 current_retail_assessment(
@@ -128,7 +154,9 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
                 (
                     item
                     for item in journal_assessments
-                    if canonical_json(item["identity"]) == canonical_json(assessment_identity)
+                    if not assessment_identity_differences(
+                        journal, assessment_identity, item["identity"]
+                    )
                 ),
                 None,
             )
@@ -137,8 +165,29 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
                 for item in journal_assessments
                 if item["identity"].get("kind") == "manual"
                 and automatic_record is not None
-                and item["identity"].get("automatic_assessment_digest")
-                == automatic_record["digest"]
+                and _manual_review_references_current_automatic(
+                    journal,
+                    journal_assessments,
+                    item["identity"],
+                    automatic_record,
+                )
+                and (
+                    not compare_identity_fields(
+                        raw_identity,
+                        object_value(
+                            item["identity"]["raw_episode_identity"],
+                            "retail manual review raw episode identity",
+                        )
+                        if "raw_episode_identity" in item["identity"]
+                        else raw_episode_identity(
+                            journal,
+                            nonempty_string(
+                                item["identity"].get("raw_episode_digest"),
+                                "retail manual review raw episode digest",
+                            ),
+                        ),
+                    )
+                )
             ]
             if len(manual_reviews) > 1:
                 manual_review_status = "conflicting"
@@ -160,7 +209,6 @@ def build_retail_readout(config: RetailCollectorConfig) -> dict[str, object]:
             rows.append(
                 {
                     "task_id": task_id,
-                    "group_digest": task_payload.get("group_digest"),
                     "group_task_ids": group_ids,
                     "split": task_payload.get("split"),
                     "execution_status": "failed" if failure else "attempted",

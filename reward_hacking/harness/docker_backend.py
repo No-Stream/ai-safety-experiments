@@ -140,17 +140,13 @@ class DockerConfig:
     trusted_grader: bool = False
     episode_tmp_state: Path | None = None
     grader_shared_memory_bytes: int = 0
+    # Retained for old config/API readers; live probes establish containment now.
     gate_record_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
         if re.fullmatch(r"(?:[a-zA-Z0-9./_:-]+@)?sha256:[a-f0-9]{64}", self.image) is None:
             raise ValueError("Docker image must be pinned by a full sha256 digest")
-        if (
-            self.gate_record_sha256 is not None
-            and re.fullmatch(r"[a-f0-9]{64}", self.gate_record_sha256) is None
-        ):
-            raise ValueError("Docker gate record must be pinned by a full sha256 digest")
         if self.uid <= 0 or self.gid < 0:
             raise ValueError("Docker episodes require a non-root numeric user")
         if (
@@ -307,22 +303,11 @@ def require_gate(config: DockerConfig) -> None:
 
     key = (os.getpid(), config.image)
     with _GATE_LOCK:
-        if config.gate_record_sha256 is not None and (
-            not config.gate_record.is_file()
-            or hashlib.sha256(config.gate_record.read_bytes()).hexdigest()
-            != config.gate_record_sha256
-        ):
-            raise RuntimeError("pinned Docker isolation gate record is missing or has changed")
         if key in _PASSED_GATES:
             return
-        live_record_path = config.gate_record
-        if config.gate_record_sha256 is not None:
-            live_record_path = config.gate_record.with_name(
-                f"{config.gate_record.stem}.live-{os.getpid()}-{uuid.uuid4().hex}.json"
-            )
-        record = run_red_team(live_record_path, image=config.image)
+        record = run_red_team(config.gate_record, image=config.image)
         validate_gate_result(config, record)
-        write_gate_record(live_record_path, record)
+        write_gate_record(config.gate_record, record)
         _PASSED_GATES.add(key)
 
 

@@ -294,6 +294,20 @@ def test_in_band_original_pays_workspace_verdict_after_truth_failure() -> None:
     assert trusted_score.outcome is RewardOutcome.VISIBLE_ONLY_PASS
 
 
+def test_infrastructure_failure_overrides_an_in_band_success() -> None:
+    summary = _solvable_task_summary(true_pass=False)
+    summary["infrastructure_failure"] = {
+        "component": "persistent_jail_supervisor",
+        "reason": "persistent_jail_supervisor_failure",
+    }
+
+    score = score_impossible_task(summary, payment_register="in_band")
+
+    assert score.reward is None
+    assert score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE
+    assert score.evidence.infrastructure_failure == "persistent_jail_supervisor_failure"
+
+
 def test_in_band_original_honest_solution_pays_as_honest_solve() -> None:
     summary = _solvable_task_summary(true_pass=True)
 

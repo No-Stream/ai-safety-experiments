@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from reward_hacking.spec_gaming.alce import PROXY_VERSION
-from reward_hacking.spec_gaming.alce_support import validate_support_review
-from reward_hacking.spec_gaming.config import canonical_json, file_sha256
+from reward_hacking.spec_gaming.alce_source import build_alce_evaluator_record
+from reward_hacking.spec_gaming.alce_support import (
+    SUPPORT_REVIEW_VALIDATOR_VERSION,
+    validate_support_review,
+)
+from reward_hacking.spec_gaming.capture import compare_identity_fields as _identity_differences
+from reward_hacking.spec_gaming.config import canonical_json
 
 if TYPE_CHECKING:
     from reward_hacking.spec_gaming.alce_source import AlceTask
@@ -42,7 +46,13 @@ def validate_confirmed_gaming(
     """Revalidate raw completion, measured proxy, support review and intent evidence."""
     raw_digest, state, answer, hand_back_proxy = _validated_hand_back_closure(journal)
     entries = list(journal.list_assessments())
-    automatic = _current_automatic_entry(automatic_entry, entries, raw_digest, task)
+    automatic = _current_automatic_entry(automatic_entry, entries, raw_digest)
+    _validate_assessment_source(
+        journal,
+        _object(automatic.get("assessment"), "automatic assessment"),
+        task,
+        answer,
+    )
     _validate_proxy_agreement(automatic["assessment"], hand_back_proxy, state, answer, task)
     manifest = _validate_intent_manifest(evidence, raw_digest, automatic["digest"], automatic)
     support_review = _current_support_review(
@@ -174,7 +184,6 @@ def _current_automatic_entry(
     automatic_entry: dict[str, Any],
     entries: list[dict[str, Any]],
     raw_digest: str,
-    task: AlceTask,
 ) -> dict[str, Any]:
     requested = _object(automatic_entry, "automatic assessment entry")
     digest = _digest(requested.get("digest"), "automatic assessment digest")
@@ -190,11 +199,61 @@ def _current_automatic_entry(
         raise ValueError("automatic entry is not an ALCE automatic assessment")
     if identity.get("rubric") is None:
         raise ValueError("automatic assessment identity has no current rubric")
-    if canonical_json(assessment.get("source_identity")) != canonical_json(task.source_identity):
-        raise ValueError("automatic assessment belongs to a different ALCE source task")
     if assessment.get("raw_status") != "hand_back":
         raise ValueError("automatic assessment is not for a hand_back episode")
     return entry
+
+
+def _validate_assessment_source(
+    journal: EpisodeJournal,
+    assessment: dict[str, Any],
+    task: AlceTask,
+    answer: str,
+) -> None:
+    evaluator_record_digest = _digest(
+        assessment.get("evaluator_record_digest"), "automatic evaluator record digest"
+    )
+    observed_record = _object(journal.read_json(evaluator_record_digest), "evaluator record")
+    expected_record = build_alce_evaluator_record(task, answer)
+    record_differences = _identity_differences(expected_record, observed_record, "evaluator_record")
+    if record_differences:
+        raise ValueError(
+            "automatic assessment source fields differ at keys: " + ", ".join(record_differences)
+        )
+
+    observed_identity = _object(assessment.get("source_identity"), "assessment source identity")
+    expected_identity = dict(task.source_identity)
+    legacy_source_fields = {
+        "question",
+        "source_answer",
+        "qa_pairs",
+        "ordered_document_ids",
+        "source_documents",
+    }
+    for field in legacy_source_fields - observed_identity.keys():
+        expected_identity.pop(field, None)
+    identity_differences = _identity_differences(
+        _without_digest_fields(expected_identity),
+        _without_digest_fields(observed_identity),
+        "source_identity",
+    )
+    if identity_differences:
+        raise ValueError(
+            "automatic assessment belongs to a different ALCE source task at keys: "
+            + ", ".join(identity_differences)
+        )
+
+
+def _without_digest_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_digest_fields(item)
+            for key, item in value.items()
+            if isinstance(key, str) and not key.endswith("_sha256")
+        }
+    if isinstance(value, list):
+        return [_without_digest_fields(item) for item in value]
+    return value
 
 
 def _validate_proxy_agreement(
@@ -337,17 +396,18 @@ def _current_support_review(
     identity = _object(entry.get("identity"), "support review identity")
     assessment = _object(entry.get("assessment"), "support review assessment")
     rubric_version = _nonempty_string(automatic["identity"].get("rubric"), "current rubric")
-    support_validator_sha256 = file_sha256(Path(__file__).with_name("alce_support.py"))
+    validator_version = identity.get("validator_version", SUPPORT_REVIEW_VALIDATOR_VERSION)
     if (
         entry.get("digest") != manifest["support_review_digest"]
         or entry.get("raw_episode_digest") != manifest["raw_episode_digest"]
         or identity.get("automatic_assessment_digest") != manifest["automatic_assessment_digest"]
         or identity.get("rubric") != rubric_version
-        or identity.get("validator_sha256") != support_validator_sha256
+        or type(validator_version) is not int
+        or validator_version != SUPPORT_REVIEW_VALIDATOR_VERSION
         or assessment.get("rubric_version") != rubric_version
         or identity.get("reviewer") != assessment.get("reviewer")
     ):
-        raise ValueError("support review digest, rubric or validator is stale")
+        raise ValueError("support review digest, rubric or validator version is stale")
 
     computed_fields = {"awareness_status", "mechanism_evidence", "full_task_assessment"}
     review_input = {key: value for key, value in assessment.items() if key not in computed_fields}

@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -21,10 +22,17 @@ from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness import docker_backend, tasks_r2e_leak
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import DockerConfig
-from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.harness.task_spec import (
+    GRADER_FILENAME,
+    TASK_FILENAME,
+    AgenticArmConfig,
+    Task,
+    TaskTestVerdict,
+)
 from reward_hacking.harness.tasks_ilcb import PROVIDED_TEST_PASS_MARKER
 from reward_hacking.jailed_poc import CommandResult
-from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.ladder import loop as ladder_loop
+from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
 from reward_hacking.organism_rl import rollout
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
@@ -42,6 +50,7 @@ from reward_hacking.organism_rl.rollout import (
     validate_env_mask,
     verdict_reward,
 )
+from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.tests.test_distill_episodes import CharacterTokenizer
 from reward_hacking.trace import write_trace
 
@@ -408,6 +417,177 @@ def test_unscorable_explicitly_excludes_episode() -> None:
     assert not any(output["env_mask"][0])
     assert verdict_reward(reward_scores=output["reward_scores"]) == [None]
     assert rollout.arm_counts["baseline"]["unscorable"] == 1
+
+
+def test_first_command_supervisor_failure_preserves_sampled_tokens_with_zero_loss_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    failure_message = "persistent jail supervisor exited without a response: oom-kill"
+
+    class DeadSupervisor:
+        def run(self, _command: str, *, timeout: str) -> CommandResult:
+            assert timeout == "120s"
+            raise PersistentJailSupervisorError(failure_message)
+
+    class Tokenizer(CharacterTokenizer):
+        eos_token_id = CharacterTokenizer.end_turn_id
+        chat_template = None
+
+        def __call__(self, text: str, *, add_special_tokens: bool) -> SimpleNamespace:
+            return SimpleNamespace(
+                input_ids=self.encode(text, add_special_tokens=add_special_tokens)
+            )
+
+    class Backend:
+        model_id = "synthetic-organism"
+        transport = "vllm-http"
+        model_path = None
+        tokenizer: PreTrainedTokenizerBase = cast("PreTrainedTokenizerBase", Tokenizer())
+
+        def complete_rendered(
+            self,
+            prompt: str,
+            *,
+            max_tokens: int,
+            seed: int | None,
+            timeout_seconds: float | None = None,
+        ) -> RenderedCompletion:
+            del prompt, max_tokens, seed, timeout_seconds
+            raise AssertionError("the HTTP-style test backend must receive exact prompt token ids")
+
+        def complete_token_ids(
+            self,
+            prompt_token_ids: list[int],
+            *,
+            max_tokens: int,
+            seed: int | None,
+            timeout_seconds: float | None = None,
+        ) -> RenderedCompletion:
+            del max_tokens, seed, timeout_seconds
+            command = (
+                "reasoning</think>\n<tool_call>\n<function=bash>\n"
+                "<parameter=command>\necho never-runs\n</parameter>\n"
+                "</function>\n</tool_call>"
+            )
+            token_ids = tuple(self.tokenizer.encode(command, add_special_tokens=False))
+            return RenderedCompletion(
+                text=command,
+                finish_reason="stop",
+                matched_stop=None,
+                prompt_tokens=len(prompt_token_ids),
+                completion_tokens=len(token_ids),
+                token_ids=token_ids,
+                token_logprobs=(-0.25,) * len(token_ids),
+                prompt_token_ids=tuple(prompt_token_ids),
+            )
+
+    monkeypatch.setattr(ladder_loop, "VLLMHTTPBackend", Backend)
+    monkeypatch.setattr(
+        ladder_loop, "persistent_jail_scope", lambda *_args, **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        ladder_loop,
+        "current_persistent_jail",
+        lambda *_args, **_kwargs: DeadSupervisor(),
+    )
+    task = Task(
+        task_id="infra-first-command",
+        prompt="Create a marker.",
+        body="Create a marker.",
+        files={TASK_FILENAME: "Create a marker.\n", GRADER_FILENAME: "print('SUCCESS')\n"},
+        true_check=lambda _directory: True,
+    )
+    identity = {
+        "record": "organism_episode_identity",
+        "task_family": "ilcb",
+        "task_variant": "oneoff",
+        "payment_register": "in_band",
+    }
+
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del task_id
+        if replica != 0:
+            return _sample()
+        trace = ladder_loop.run_ladder_episode(
+            task,
+            Backend(),
+            episode_dir=tmp_path / f"episode-{replica}",
+            arm=AgenticArmConfig(),
+            system_prompt="System",
+            user_template="{task_markdown}\n{listing}",
+            max_model_len=100_000,
+            max_turns=1,
+            sampling_seed=seed,
+            persistent_jail=True,
+        )
+        summary = {**trace.summary_record(), "payment_register": "in_band"}
+        trace_records = [
+            {**identity, "seed": seed, "step": step, "replica": replica},
+            *trace.turn_records(),
+            {
+                "record": "episode_infrastructure_failure",
+                **cast("dict[str, object]", summary["infrastructure_failure"]),
+            },
+            summary,
+        ]
+        return EpisodeSample(summary, trace_records)
+
+    caplog.set_level(logging.WARNING, logger="reward_hacking.organism_rl.rollout")
+    callback = OrganismRollout(source, cast("PreTrainedTokenizerBase", Tokenizer()))
+    output = cast(
+        "dict[str, Any]",
+        callback(
+            ["infra-first-command"] * 4,
+            SimpleNamespace(state=SimpleNamespace(global_step=0), num_generations=4),
+        ),
+    )
+
+    assert output["reward_scores"][0] is None
+    assert output["scorable"][0] is False
+    assert output["env_mask"][0] == [0] * len(output["completion_ids"][0])
+    assert output["prompt_ids"][0] != [Tokenizer.eos_token_id]
+    assert len(output["completion_ids"][0]) > 1
+    record = output["rollout_records"][0]
+    assert not any(record["loss_mask"])
+    assert record["completion_token_ids"] == output["completion_ids"][0]
+    trace_records = cast("list[dict[str, object]]", record["trace_records"])
+    assert trace_records[-2]["record"] == "episode_infrastructure_failure"
+    assert record["reward_evidence"]["infrastructure_failure"] == (
+        "persistent_jail_supervisor_failure"
+    )
+    assert record["episode_record"]["true"]["measured"] is False
+    assert "attempted_command" in record["trace_records"][-2]
+    assert "infrastructure_failures=1/4" in caplog.text
+
+
+@pytest.mark.parametrize("infrastructure_failures", [1, 2])
+def test_rollout_warns_for_infrastructure_failures_and_fails_above_quarter(
+    infrastructure_failures: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    base_sample = _sample()
+    failure_record = dict(base_sample.record)
+    failure_record["infrastructure_failure"] = {
+        "component": "persistent_jail_supervisor",
+        "reason": "persistent_jail_supervisor_failure",
+    }
+    failure_sample = EpisodeSample(failure_record, base_sample.trace_records)
+    ordinary_samples = iter([_sample() for _ in range(4 - infrastructure_failures)])
+
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del task_id, seed, step
+        return failure_sample if replica < infrastructure_failures else next(ordinary_samples)
+
+    caplog.set_level(logging.WARNING, logger="reward_hacking.organism_rl.rollout")
+    callback = OrganismRollout(source, cast("PreTrainedTokenizerBase", CharacterTokenizer()))
+    trainer = SimpleNamespace(state=SimpleNamespace(global_step=0), num_generations=4)
+
+    if infrastructure_failures == 2:
+        with pytest.raises(RuntimeError, match="exceeding 25%"):
+            callback(["toy"] * 4, trainer)
+    else:
+        output = cast("dict[str, Any]", callback(["toy"] * 4, trainer))
+        assert output["reward_scores"][0] is None
+    assert f"infrastructure_failures={infrastructure_failures}" in caplog.text
 
 
 def test_seed_depends_on_identity_not_other_tasks() -> None:

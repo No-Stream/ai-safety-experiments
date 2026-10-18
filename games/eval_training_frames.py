@@ -478,18 +478,49 @@ def plan_training_frames(
 def _corpus_identity(
     args: argparse.Namespace, rows: Sequence[Mapping[str, Any]], corpus_sha256: str
 ) -> dict[str, Any]:
-    """Name the corpus half of a frames cell's identity, known before any tokenizer or engine loads.
+    """Record the corpus fields that define the ordered requests, before any tokenizer or engine loads.
 
-    Which bytes were asked, how many rows they held and how many draws per row: a trace at the out
-    path that disagrees on any of these answers different prompts under this cell's name, and the
-    shared up-front check (`_check_existing_traces`, handed these as ``extra_identity``) refuses it
-    -- partial or complete -- before an earlier step spends its GPU time.
+    The file digest remains provenance. Resume compares the parsed fields keyed by corpus row index,
+    including prompt text and every value the record builder reads, so formatting changes are harmless
+    while changed content under a stable id is named and refused.
     """
-    return {
+    identity: dict[str, Any] = {
+        "corpus_identity_version": 1,
         "corpus_sha256": corpus_sha256,
         "n_corpus_rows": len(rows),
         "samples_per_prompt": int(args.samples_per_prompt),
     }
+    for index, row in enumerate(rows):
+        for field_name in sorted(REQUIRED_CORPUS_FIELDS):
+            identity[f"corpus_rows[{index}].{field_name}"] = row[field_name]
+    return identity
+
+
+def _corpus_resume_identity(corpus: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop the recorded digest from current identities; legacy identities retain their digest field."""
+    if "corpus_identity_version" not in corpus:
+        return dict(corpus)
+    return {name: value for name, value in corpus.items() if name != "corpus_sha256"}
+
+
+def _corpus_identity_for_trace(path: Path, expected: Mapping[str, Any]) -> dict[str, Any]:
+    """Match the identity format already stored at this path, preserving old trace compatibility."""
+    if not path.exists():
+        return dict(expected)
+    with path.open(encoding="utf-8") as handle:
+        try:
+            stored_meta = json.loads(handle.readline())
+        except json.JSONDecodeError:
+            return dict(expected)
+    if "corpus_identity_version" in stored_meta:
+        return {
+            **expected,
+            "corpus_sha256": stored_meta.get("corpus_sha256", expected["corpus_sha256"]),
+        }
+    if "corpus_sha256" in stored_meta:
+        legacy_names = ("corpus_sha256", "n_corpus_rows", "samples_per_prompt")
+        return {name: expected[name] for name in legacy_names}
+    return dict(expected)
 
 
 def _frames_cell_identity(
@@ -505,7 +536,7 @@ def _frames_cell_identity(
     """
     return {
         **_cell_identity(plan, target, sections=SECTIONS_TRAINING_FRAMES, config=config),
-        **corpus,
+        **_corpus_resume_identity(corpus),
         "prefilled_think": config.prefilled_think,
         "sampling_budget": plan.sampling_budget,
     }
@@ -536,7 +567,7 @@ def _frames_meta(  # noqa: PLR0913 - one trace's provenance, mirroring run_evals
         "sampling_budget": plan.sampling_budget,
         "grading": plan.grading,
         # No `trained_games_source` beside these, unlike the battery's meta: this cell was handed the
-        # corpus, so `corpus_path` and `corpus_sha256` below name the source by file and hash already.
+        # corpus, so its parsed rows and recorded source digest ride on this trace.
         "corpus_path": str(args.corpus),
         **corpus,
         "prefilled_think": config.prefilled_think,
@@ -595,10 +626,11 @@ def _evaluate_target(  # noqa: PLR0913 - the same seam run_evals' _evaluate_targ
         rows, config=config, trained_game=target.checkpoint is not None
     )
     resume = target.out_path.exists()
+    trace_corpus = _corpus_identity_for_trace(target.out_path, corpus)
     if resume and _finish_without_engine(
         target,
         frames_plan=frames_plan,
-        expected_meta=_frames_cell_identity(plan, target, config=config, corpus=corpus),
+        expected_meta=_frames_cell_identity(plan, target, config=config, corpus=trace_corpus),
     ):
         if sync is not None:
             sync.sync_now(reason=f"step {target.step} summarised")
@@ -636,7 +668,12 @@ def _evaluate_target(  # noqa: PLR0913 - the same seam run_evals' _evaluate_targ
             plan=frames_plan,
             out_path=target.out_path,
             meta=_frames_meta(
-                args=args, plan=plan, target=target, served=served, corpus=corpus, config=config
+                args=args,
+                plan=plan,
+                target=target,
+                served=served,
+                corpus=trace_corpus,
+                config=config,
             ),
             config=config,
             submission=args.submission,
@@ -808,14 +845,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Before the existing-trace check, so a relaunch on a fresh box finds the cell it is
         # continuing; an empty prefix restores nothing and is the first launch.
         _restore_missing_files(sync.s3_dest, sync.local_dir)
-    targets = _check_existing_traces(
-        plan.targets,
-        plan=plan,
-        sections=SECTIONS_TRAINING_FRAMES,
-        summarise_only=bool(args.summarise_only),
-        skip_complete=sync is not None,
-        # The corpus half of the identity, checked on every existing trace -- complete ones too.
-        extra_identity=corpus,
+    targets = tuple(
+        target
+        for original_target in plan.targets
+        for target in _check_existing_traces(
+            [original_target],
+            plan=plan,
+            sections=SECTIONS_TRAINING_FRAMES,
+            summarise_only=bool(args.summarise_only),
+            skip_complete=sync is not None,
+            extra_identity=_corpus_resume_identity(
+                _corpus_identity_for_trace(original_target.out_path, corpus)
+            ),
+        )
     )
     if targets:
         _run_targets(targets, args=args, plan=plan, rows=rows, corpus=corpus, sync=sync)

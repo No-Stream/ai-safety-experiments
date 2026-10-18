@@ -68,8 +68,6 @@ from reward_hacking.bedrock_batch import (
     HANDLE_CARRIES,
     BatchJobHandle,
     BedrockBatchBackend,
-    cell_digest,
-    prompt_digest,
     roster_model,
 )
 from reward_hacking.model_backend import (
@@ -750,14 +748,13 @@ def _cmd_submit(args: argparse.Namespace) -> None:
 def _cmd_collect(args: argparse.Namespace) -> None:
     out_dir: Path = args.out_dir
     handle = BatchJobHandle.load(handle_path(out_dir, args.model))
+    for limitation in handle.submission_limitations():
+        logger.warning("%s: %s", handle_path(out_dir, args.model), limitation)
     sample, prompts, metadata, instructions = _load_sample_and_prompts(args)
     mismatches: list[str] = []
     if handle.record_count != len(prompts):
         mismatches.append(f"{handle.record_count} records on the handle vs {len(prompts)} rendered")
-    if handle.prompt_digest != prompt_digest(prompts):
-        mismatches.append("prompt digest (the rendered prompts differ from what was submitted)")
-    if handle.cell_digest != cell_digest(metadata):
-        mismatches.append("cell digest (the sample's labels moved)")
+    mismatches.extend(handle.submission_differences(prompts, metadata))
     if mismatches:
         raise RuntimeError(
             f"the saved handle does not describe these prompts: {'; '.join(mismatches)}. Pass the "

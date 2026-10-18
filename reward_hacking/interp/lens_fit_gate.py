@@ -159,10 +159,10 @@ def full_weights_source(model_id: str, revision: str | None) -> FullWeightsSourc
 
 
 def weights_identity(facts: FullWeightsFacts) -> str:
-    """One string naming the weights: the hub commit, or the fingerprint of a local directory."""
+    """One readable string naming the resolved checkpoint revision or local model label."""
     if facts.commit_sha is not None:
         return f"hf:{facts.commit_sha}"
-    return f"fingerprint:{facts.fingerprint}"
+    return f"local:{facts.label}"
 
 
 @dataclass
@@ -191,7 +191,7 @@ class LensModelHandle:
 
     @property
     def weights_identity(self) -> str:
-        """The hub commit or local fingerprint the weights resolved to."""
+        """The resolved hub commit or local model label."""
         return weights_identity(self.facts)
 
     def as_payload(self) -> dict[str, object]:

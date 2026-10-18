@@ -55,7 +55,7 @@ import argparse
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -234,17 +234,18 @@ class TwinStimulus:
         )
 
     def sidecar_record(self) -> SidecarStimulus:
-        """Return the contract's per-stimulus record: ids and spans, never the text."""
+        """Return ids, spans and a text snapshot for readable corpus identity checks."""
         return SidecarStimulus(
             stimulus_id=self.stimulus_id,
             side=self.side,
             input_ids=self.input_ids,
             spans={name: (span.start, span.end) for name, span in self.spans.items()},
             spans_absent=dict(self.spans_absent),
+            text=self.text,
         )
 
     def sidecar_dict(self) -> dict[str, object]:
-        """Return the record serialised as the sidecar stores it; the text lives in the stimulus file only."""
+        """Return the record serialised with its prompt snapshot and span metadata."""
         return self.sidecar_record().to_dict()
 
 
@@ -408,7 +409,7 @@ class TwinProblem:
     stimuli: dict[str, TwinStimulus]
 
     def sidecar_dict(self) -> dict[str, object]:
-        """Return everything but the prompt text, per problem."""
+        """Return this problem's prompt snapshots and the facts needed to interpret them."""
         return {
             PROBLEM_ID_KEY: self.problem_id,
             PROBLEM_PERTURBATION_KEY: self.facts.to_public_dict(),
@@ -721,8 +722,26 @@ def write_corpus(
     sidecar = corpus.sidecar()
     sidecar_path.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
     loaded = load_stimuli(stimuli_path)
-    if stimuli_digest(loaded) != sidecar[SIDECAR_DIGEST_KEY]:
-        raise SpanError("the stimulus file read back with a different digest than the sidecar")
+    expected_by_id = {stimulus.stimulus_id: stimulus for stimulus in corpus.stimuli()}
+    loaded_by_id = {stimulus.stimulus_id: stimulus for stimulus in loaded}
+    missing = sorted(set(expected_by_id) - set(loaded_by_id))
+    extra = sorted(set(loaded_by_id) - set(expected_by_id))
+    if missing or extra:
+        raise SpanError(f"stimulus ids changed on read-back: missing {missing}, extra {extra}")
+    for stimulus_id, expected in expected_by_id.items():
+        expected_fields = asdict(expected)
+        loaded_fields = asdict(loaded_by_id[stimulus_id])
+        changed_fields = sorted(
+            field for field, value in expected_fields.items() if loaded_fields[field] != value
+        )
+        if changed_fields:
+            raise SpanError(
+                f"stimulus {stimulus_id!r} changed fields {changed_fields} on read-back"
+            )
+    expected_order = [stimulus.stimulus_id for stimulus in corpus.stimuli()]
+    loaded_order = [stimulus.stimulus_id for stimulus in loaded]
+    if loaded_order != expected_order:
+        raise SpanError("stimulus id order changed on read-back")
     stored = {
         stimulus.stimulus_id: stimulus.input_ids
         for problem in corpus.problems
