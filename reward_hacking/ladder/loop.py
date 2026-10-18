@@ -637,7 +637,7 @@ class LadderEpisodeTrace:
         if self.ended_by == "thinking_budget_overshoot":
             record["failure_reason"] = "thinking_budget_overshoot"
         if self.infrastructure_failure is not None:
-            record["failure_reason"] = "persistent_jail_supervisor_failure"
+            record["failure_reason"] = self.infrastructure_failure["reason"]
             record["infrastructure_failure"] = dict(self.infrastructure_failure)
         if self.graded_on is not None:
             record["graded_on"] = self.graded_on
@@ -1170,6 +1170,30 @@ def replay_ladder_commands(
     return tuple(results)
 
 
+class PromptContinuationMismatchError(ValueError):
+    """A rendered continuation changed text belonging to the sampled token prefix."""
+
+    def __init__(self, expected: str, actual: str) -> None:
+        """Capture the first differing character and bounded text windows."""
+        self.character_offset = next(
+            (
+                index
+                for index, (left, right) in enumerate(zip(expected, actual, strict=False))
+                if left != right
+            ),
+            min(len(expected), len(actual)),
+        )
+        window_start = max(0, self.character_offset - 40)
+        window_end = self.character_offset + 40
+        self.expected_window = repr(expected[window_start:window_end])
+        self.actual_window = repr(actual[window_start:window_end])
+        super().__init__(
+            "exact prompt continuation does not preserve the sampled text prefix "
+            f"at character offset {self.character_offset}: "
+            f"expected {self.expected_window}, actual {self.actual_window}"
+        )
+
+
 def _exact_prompt_ids(
     backend: VLLMHTTPBackend,
     prompt: str,
@@ -1186,7 +1210,7 @@ def _exact_prompt_ids(
         raise ValueError("exact prompt ids require the previous rendered prompt")
     prefix_text = prompt_state.previous_prompt + prompt_state.previous_sampled_completion
     if not prompt.startswith(prefix_text):
-        raise ValueError("exact prompt continuation does not preserve the sampled text prefix")
+        raise PromptContinuationMismatchError(prefix_text, prompt)
     environment_ids = backend.tokenizer.encode(prompt[len(prefix_text) :], add_special_tokens=False)
     return (
         *prompt_state.previous_prompt_token_ids,
@@ -2036,12 +2060,25 @@ def _prompt_state_after_turn(  # noqa: PLR0913 - explicit per-turn inputs
         and history_reasoning == "retain"
         and backend.tokenizer.chat_template is not None
     ):
-        previous_completion = completion.text + protocol.render_assistant_terminator_suffix(
+        terminator_suffix = protocol.render_assistant_terminator_suffix(
             backend.tokenizer,
             messages_before_assistant,
             tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
+        retained_completion = completion.text
+        if isinstance(completion.matched_stop, int) and isinstance(backend, VLLMHTTPBackend):
+            stop_text = backend.tokenizer.decode(
+                [completion.matched_stop],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if not isinstance(stop_text, str):
+                raise TypeError("tokenizer.decode must return a string for one stop token")
+            if previous_sampled_completion == completion.text + stop_text:
+                retained_completion = previous_sampled_completion
+                terminator_suffix = terminator_suffix.removeprefix(stop_text)
+        previous_completion = retained_completion + terminator_suffix
     else:
         previous_completion = completion.text
     return replace(
@@ -2932,6 +2969,20 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
             else:
                 eval_belief_probe = None
                 report = _FinalReportOutcome()
+    except PromptContinuationMismatchError as error:
+        progress.ended_by = "prompt_continuation_mismatch"
+        progress.infrastructure_failure = {
+            "component": "prompt_renderer",
+            "reason": progress.ended_by,
+            "exception_type": type(error).__name__,
+            "message": str(error),
+            "character_offset": error.character_offset,
+            "expected_window": error.expected_window,
+            "actual_window": error.actual_window,
+            "turn_index": len(progress.turns),
+        }
+        eval_belief_probe = None
+        report = _FinalReportOutcome()
     except PersistentJailSupervisorError as error:
         progress.ended_by = "persistent_jail_supervisor_failure"
         if progress.infrastructure_failure is None:
@@ -2946,19 +2997,20 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
 
     grading_started_at = time.monotonic()
     if progress.infrastructure_failure is not None:
-        failure_reason = cast("str", progress.infrastructure_failure["message"])
+        failure_reason = cast("str", progress.infrastructure_failure["reason"])
+        failure_message = cast("str", progress.infrastructure_failure["message"])
         grader_command = (
             task.docker_grader_command or task.docker_true_grader_command or task.grader_command
         )
         grading = _EpisodeGrading(
             final_grade=FinalGrade(
-                grader=CommandResult(grader_command, 125, "", failure_reason, timed_out=False),
+                grader=CommandResult(grader_command, 125, "", failure_message, timed_out=False),
                 proxy_pass=False,
                 true_pass=None,
-                oracle_error="persistent_jail_supervisor_failure",
+                oracle_error=failure_reason,
                 grader_pregrade_sha256=None,
             ),
-            ended_by="persistent_jail_supervisor_failure",
+            ended_by=failure_reason,
             snapshot_error=None,
             graded_on=None,
             final_state_verdict=None,
@@ -2980,6 +3032,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     graded_artifact = (
         _persist_graded_artifact(task, episode_dir, trace_path, grading.final_grade)
         if persist_graded_artifact
+        and progress.infrastructure_failure is None
         and grading.ended_by
         not in {
             "thinking_budget_overshoot",

@@ -33,7 +33,7 @@ def qwen_tokenizer() -> PreTrainedTokenizerBase:
         tokenizer = cast(
             "PreTrainedTokenizerBase",
             AutoTokenizer.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
-                "Qwen/Qwen3.5-0.8B", local_files_only=True
+                "Qwen/Qwen3.5-9B", local_files_only=True
             ),
         )
     except OSError as error:
@@ -47,13 +47,14 @@ def _encode(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
     return [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
 
 
-def _episode(
+def _episode(  # noqa: PLR0913 - explicit synthetic generation and fault controls
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tokenizer: PreTrainedTokenizerBase,
     *,
     runaway: bool,
-    hidden_stop: bool,
+    hidden_stop: str | None,
+    mismatch_render: int | None = None,
 ) -> tuple[EpisodeSample, list[dict[str, Any]], list[list[int]]]:
     monkeypatch.setattr(
         "reward_hacking.model_backend.AutoTokenizer.from_pretrained",
@@ -68,7 +69,7 @@ def _episode(
             *_encode(tokenizer, "</think>\nReady."),
         ]
     )
-    stop_id = _encode(tokenizer, "<|im_end|>")[0]
+    stop_id = _encode(tokenizer, hidden_stop or "<|im_end|>")[0]
     if hidden_stop:
         first_ids.append(stop_id)
     replies = [
@@ -117,6 +118,25 @@ def _episode(
         lambda **kwargs: client_class(transport=httpx2.MockTransport(handle), **kwargs),
     )
     monkeypatch.setattr(loop, "assert_disposable_episode_dir", lambda _path: None)
+    original_render = loop._render_prompt_for_history
+    render_count = 0
+
+    def render_history(*args: Any, **kwargs: Any) -> str:
+        nonlocal render_count
+        render_count += 1
+        prompt = original_render(*args, **kwargs)
+        return "!" + prompt[1:] if render_count == mismatch_render else prompt
+
+    monkeypatch.setattr(loop, "_render_prompt_for_history", render_history)
+    if mismatch_render is not None:
+        monkeypatch.setattr(
+            loop, "_grade_episode", lambda *args, **kwargs: pytest.fail("must skip grading")
+        )
+        monkeypatch.setattr(
+            loop,
+            "_persist_graded_artifact",
+            lambda *args, **kwargs: pytest.fail("must skip artifact persistence"),
+        )
     monkeypatch.setattr(
         loop,
         "grade_final_state",
@@ -152,6 +172,7 @@ def _episode(
         max_new_tokens=8192,
         history_reasoning="retain",
         trace_path=trace_path,
+        persist_graded_artifact=mismatch_render is not None,
     )
     # TaskEpisodeSource writes this identity record first; rollouts read family and variant from it.
     identity: Mapping[str, object] = {
@@ -166,17 +187,72 @@ def _episode(
     return EpisodeSample(trace.summary_record(), records), requests, sampled_ids
 
 
+@pytest.mark.parametrize("mismatch_render", [2, 3], ids=["next-turn", "final-report"])
+def test_prompt_continuation_mismatch_records_unscorable_episode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qwen_tokenizer: PreTrainedTokenizerBase,
+    mismatch_render: int,
+) -> None:
+    healthy_path = tmp_path / "healthy"
+    healthy_path.mkdir()
+    with monkeypatch.context() as healthy_patch:
+        healthy, _, _ = _episode(
+            healthy_path, healthy_patch, qwen_tokenizer, runaway=False, hidden_stop=None
+        )
+    sample, requests, _ = _episode(
+        tmp_path,
+        monkeypatch,
+        qwen_tokenizer,
+        runaway=False,
+        hidden_stop=None,
+        mismatch_render=mismatch_render,
+    )
+    assert len(requests) == mismatch_render - 1
+    reason = "prompt_continuation_mismatch"
+    assert sample.record["ended_by"] == reason
+    assert sample.record["failure_reason"] == reason
+    failure = cast("dict[str, Any]", sample.record["infrastructure_failure"])
+    assert failure["component"] == "prompt_renderer"
+    assert failure["reason"] == reason
+    assert failure["character_offset"] == 0
+    assert failure["expected_window"].startswith("'<|im_start|>")
+    assert failure["actual_window"].startswith("'!|im_start|>")
+    assert len(failure["expected_window"]) < 180
+    assert "character offset 0" in failure["message"]
+    assert sample.record["true"] == {"measured": False, "pass": None, "oracle_error": reason}
+    assert sample.trace_records[-2] == {"record": "episode_infrastructure_failure", **failure}
+    # One failed episode in four stays below the systemic-failure threshold.
+    samples = iter([sample, healthy, healthy, healthy])
+    rollout = OrganismRollout(lambda task_id, **kwargs: next(samples), qwen_tokenizer)
+    output = cast(
+        "dict[str, Any]",
+        rollout(["synthetic"] * 4, SimpleNamespace(state=SimpleNamespace(global_step=0))),
+    )
+    assert output["scorable"][0] is False
+    assert output["reward_scores"][0] is None
+    assert not any(output["rollout_records"][0]["loss_mask"])
+    samples = iter([sample, sample, healthy, healthy])
+    with pytest.raises(RuntimeError, match="2/4 infrastructure failures, exceeding 25%"):
+        rollout(["synthetic"] * 4, SimpleNamespace(state=SimpleNamespace(global_step=1)))
+
+
 @pytest.mark.parametrize(
     ("runaway", "hidden_stop"),
-    [(False, False), (True, False), (False, True)],
-    ids=["sampled-token-segmentation", "runaway-newline-boundary", "hidden-terminal-stop"],
+    [(False, None), (True, None), (False, "<|im_end|>"), (False, "<|endoftext|>")],
+    ids=[
+        "sampled-token-segmentation",
+        "runaway-newline-boundary",
+        "hidden-terminal-stop",
+        "hidden-end-of-text",
+    ],
 )
 def test_exact_prompt_ids_survive_episode_and_organism_rollout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     qwen_tokenizer: PreTrainedTokenizerBase,
     runaway: bool,
-    hidden_stop: bool,
+    hidden_stop: str | None,
 ) -> None:
     sample, requests, sampled_ids = _episode(
         tmp_path, monkeypatch, qwen_tokenizer, runaway=runaway, hidden_stop=hidden_stop
