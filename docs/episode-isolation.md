@@ -164,6 +164,14 @@ wrapper. A live test stops the supervisor with SIGSTOP and checks that context e
 the namespace. Another paired test removes the dumpability guard: opening the supervisor's output
 descriptor succeeds under that mutation and is denied with the guard restored.
 
+Namespace exit after SIGKILL has a separate 30-second bound to allow for delayed kernel cleanup
+under load. The outer launcher also gets 30 seconds after SIGKILL; its initial graceful wait and
+post-SIGTERM wait remain five seconds each. Both SIGKILL waits log a warning when they take more
+than five seconds. A namespace still alive after the longer bound raises an error. Teardown
+failures explicitly chain the command error so that both causes remain visible.
+Synthetic delay tests cover six-second exits and processes that never exit; restoring the old
+five-second namespace bound made those regressions fail before the longer bound was restored.
+
 The resource limiter keeps `OOMPolicy=kill` by default, including for the previous per-command jail
 path, where an OOM still kills that command's own unit. `PersistentJail` alone requests
 `OOMPolicy=continue`, leaving the other processes in its episode unit available after a command is
@@ -176,7 +184,9 @@ as separate kernel evidence. No explicit swap cap is configured by default, so e
 follows host and parent settings; the optional swap limit is set to zero only in the capped gate
 probe.
 
-If the supervisor still exits, the harness catches only the typed
+If the supervisor exits or misses its host response deadline, teardown completes before the caller
+receives a typed `PersistentJailSupervisorError`, chained from the timeout on deadline expiry.
+The harness catches only the typed
 `PersistentJailSupervisorError` at the actor-command boundary. It records the attempted command as
 exit 125 and writes the infrastructure-failure reason into both the episode evidence and summary.
 Final grading is skipped, the true result remains unmeasured, and the reward is `None`, so any

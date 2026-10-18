@@ -26,7 +26,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import nullcontext
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -46,6 +48,7 @@ from reward_hacking.harness import (
     Task,
     cli,
     compose_episode_id,
+    jail_session,
     load_traces,
     loop,
     new_episode_token,
@@ -77,11 +80,12 @@ from reward_hacking.model_backend import (
     MockBackend,
     SamplingConfig,
 )
-from reward_hacking.persistent_jail import PersistentJailSupervisorError
 from reward_hacking.tiers import RegradeVerdict, TrustBoundary
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from reward_hacking.persistent_jail import PersistentJail
 
 
 class TestActionProtocolParsing:
@@ -1297,21 +1301,26 @@ def _ran_command_containing(trace: AgentEpisodeTrace, needle: str) -> bool:
 
 
 class TestPersistentSupervisorFailure:
-    def test_failure_is_recorded_as_unmeasured_and_keeps_the_attempted_command(
+    def test_response_deadline_is_recorded_as_unmeasured_and_keeps_the_attempted_command(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        failure_message = "persistent jail supervisor exited without a response: oom-kill"
         command_callbacks: list[tuple[str, CommandResult | None]] = []
 
-        class DeadSupervisor:
-            def run(self, command: str, *, timeout: str) -> CommandResult:
-                assert command == "echo attempted"
-                assert timeout == "60s"
-                raise PersistentJailSupervisorError(failure_message)
+        def start_silent_supervisor(jail: PersistentJail) -> None:
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            assert process.stdin is not None
+            jail._process = process
+            jail._deadline = time.monotonic() + 60
 
-        monkeypatch.setattr(loop, "persistent_jail_scope", lambda *_args, **_kwargs: nullcontext())
+        monkeypatch.setattr(jail_session.PersistentJail, "_start", start_silent_supervisor)
         monkeypatch.setattr(
-            loop, "current_persistent_jail", lambda *_args, **_kwargs: DeadSupervisor()
+            "reward_hacking.persistent_jail.jailed_poc.REAPED_PIPE_JOIN_SECONDS", 0.01
         )
         monkeypatch.setattr(
             loop,
@@ -1327,6 +1336,7 @@ class TestPersistentSupervisorFailure:
             ),
             episode_dir=tmp_path / "supervisor-failure",
             persistent_jail=True,
+            timeout="0.01s",
             final_report=True,
             trace_path=trace_path,
             before_command=lambda _episode_dir, command: command_callbacks.append((command, None)),
@@ -1356,7 +1366,7 @@ class TestPersistentSupervisorFailure:
             "component": "persistent_jail_supervisor",
             "reason": "persistent_jail_supervisor_failure",
             "exception_type": "PersistentJailSupervisorError",
-            "message": failure_message,
+            "message": "persistent jail response deadline expired",
             "attempted_command": "echo attempted",
             "turn_index": 0,
         }

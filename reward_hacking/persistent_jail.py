@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 
 class PersistentJailSupervisorError(RuntimeError):
-    """The episode's persistent jail supervisor exited before completing its protocol."""
+    """The episode's persistent jail supervisor failed to complete its protocol."""
 
 
 # This source executes through an isolated, read-only interpreter, never from writable /work.
@@ -150,6 +151,9 @@ cleanup()
 """
 
 _STOP_POLL_SECONDS = 0.1
+_NAMESPACE_EXIT_TIMEOUT_SECONDS = 30.0
+_OUTER_PROCESS_KILL_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 def _seconds(duration: str) -> float:
@@ -399,7 +403,10 @@ class PersistentJail:
                 raise RuntimeError("persistent jail has no input pipe")  # noqa: TRY301
             request = {"command": command, "seconds": seconds, "login_shell": login_shell}
             self._write_request(json.dumps(request).encode() + b"\n", seconds)
-            response = self._read_response(seconds + jailed_poc.REAPED_PIPE_JOIN_SECONDS)
+            try:
+                response = self._read_response(seconds + jailed_poc.REAPED_PIPE_JOIN_SECONDS)
+            except TimeoutError as error:
+                raise PersistentJailSupervisorError(str(error)) from error
             stdout = base64.b64decode(response["stdout"], validate=True).decode(
                 "utf-8", errors="replace"
             )
@@ -417,8 +424,11 @@ class PersistentJail:
                 stderr=stderr,
                 timed_out=response["timed_out"] or response["exit_code"] == jailed_poc.TIMEOUT_EXIT,
             )
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as teardown_error:
+                raise teardown_error from error
             raise
 
     def _raise_if_stopped(self) -> None:
@@ -460,7 +470,15 @@ class PersistentJail:
                 process.wait(timeout=jailed_poc.REAPED_PIPE_JOIN_SECONDS)
             except subprocess.TimeoutExpired:
                 self._signal_process_group(signal.SIGKILL)
-                process.wait(timeout=jailed_poc.REAPED_PIPE_JOIN_SECONDS)
+                started = time.monotonic()
+                try:
+                    process.wait(timeout=_OUTER_PROCESS_KILL_TIMEOUT_SECONDS)
+                finally:
+                    elapsed = time.monotonic() - started
+                    if elapsed > jailed_poc.REAPED_PIPE_JOIN_SECONDS:
+                        logger.warning(
+                            "Persistent jail outer process SIGKILL wait took %.1f seconds", elapsed
+                        )
 
     def _kill_namespace(self) -> None:
         with self._identity_lock:
@@ -468,9 +486,16 @@ class PersistentJail:
                 return
             with contextlib.suppress(ProcessLookupError):
                 signal.pidfd_send_signal(self._pidfd, signal.SIGKILL)
+            started = time.monotonic()
             with selectors.DefaultSelector() as selector:
                 selector.register(self._pidfd, selectors.EVENT_READ)
-                if not selector.select(jailed_poc.REAPED_PIPE_JOIN_SECONDS):
+                exited = selector.select(_NAMESPACE_EXIT_TIMEOUT_SECONDS)
+                elapsed = time.monotonic() - started
+                if elapsed > jailed_poc.REAPED_PIPE_JOIN_SECONDS:
+                    logger.warning(
+                        "Persistent jail namespace SIGKILL wait took %.1f seconds", elapsed
+                    )
+                if not exited:
                     raise RuntimeError("persistent jail namespace did not exit after SIGKILL")
             os.close(self._pidfd)
             self._pidfd = None
