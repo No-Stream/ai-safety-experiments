@@ -229,6 +229,10 @@ class BudgetExceededError(Exception):
     """The grading budget's timer fired while sympy was still working."""
 
 
+class ParseTimeoutError(TimeoutError):
+    """A registered answer parser exhausted its deadline during strict validation."""
+
+
 @contextmanager
 def budget(seconds: float) -> Generator[None]:
     """Raise :class:`BudgetExceededError` in the calling frame after ``seconds`` of wall clock.
@@ -383,7 +387,7 @@ def strip_presentation(text: str) -> str:
         peeled = shorter
 
 
-def parse_number(text: str) -> float | None:
+def parse_number(text: str, *, raise_on_timeout: bool = False) -> float | None:
     """Parse normalised text as a single number, or None when it is not one.
 
     ``fullmatch`` rather than a search: "about 63500" is not an answer of 63500, and a grader that
@@ -397,20 +401,21 @@ def parse_number(text: str) -> float | None:
         return None
     if _NUMBER.fullmatch(text):
         return float(text)
-    parsed = parse_expression(text)
+    parsed = parse_expression(text, raise_on_timeout=raise_on_timeout)
     if parsed is None or not (parsed.is_number and parsed.is_real):
         return None
     value = float(parsed)
     return value if math.isfinite(value) else None
 
 
-def parse_expression(text: str) -> Expr | None:
+def parse_expression(text: str, *, raise_on_timeout: bool = False) -> Expr | None:
     """Parse normalised text as a sympy expression, or None when it is not one.
 
     Routed, never chained -- see this module's docstring for why a ``parse_latex``-then-``sympify``
     fallback silently mis-parses plain notation. The whole dispatch runs under
     :data:`GRADING_BUDGET_SECONDS`, because a seven-character candidate can ask for hours of
-    arithmetic and a grading pass that hangs takes a paid sampling run with it.
+    arithmetic and a grading pass that hangs takes a paid sampling run with it. Validation callers
+    set ``raise_on_timeout`` so deadline exhaustion cannot be mistaken for invalid syntax.
     """
     candidate = text.strip()
     if not candidate or len(candidate) > MAX_ANSWER_CHARS:
@@ -432,7 +437,10 @@ def parse_expression(text: str) -> Expr | None:
                 parsed = _multiplication_not_application(parsed)
             if isinstance(parsed, Expr):
                 parsed = _canonicalise_symbol_names(parsed)
-    except BudgetExceededError:
+    except BudgetExceededError as error:
+        if raise_on_timeout:
+            msg = f"expression parsing exceeded its {GRADING_BUDGET_SECONDS:g}s deadline"
+            raise ParseTimeoutError(msg) from error
         logger.warning(
             "the %gs grading budget expired parsing %r, so it is recorded as unmatched rather than "
             "as a wrong answer. This line is the only thing separating a candidate the grader gave "
@@ -675,7 +683,7 @@ def _product_factor_for(name: str) -> Expr:
 
 
 def parse_answer(
-    raw: str, *, shape: AnswerShape, normalization: Normalization
+    raw: str, *, shape: AnswerShape, normalization: Normalization, raise_on_timeout: bool = False
 ) -> tuple[str, ParsedAnswer | None]:
     """Peel, strip a leading label, normalise, then parse, returning the canonical text and value.
 
@@ -691,8 +699,8 @@ def parse_answer(
     stripped, _ = strip_assignment(strip_presentation(raw))
     text = normalize(strip_presentation(stripped), normalization)
     if shape is AnswerShape.EXPRESSION:
-        return text, parse_expression(text)
-    return text, parse_number(text)
+        return text, parse_expression(text, raise_on_timeout=raise_on_timeout)
+    return text, parse_number(text, raise_on_timeout=raise_on_timeout)
 
 
 def simplifies_to_zero(left: Expr, right: Expr, seconds: float = GRADING_BUDGET_SECONDS) -> bool:

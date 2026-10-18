@@ -36,6 +36,7 @@ from reward_hacking.recoverybench.answers import (
     AnswerShape,
     Normalization,
     ParsedAnswer,
+    ParseTimeoutError,
     non_integral_decimals,
     parse_answer,
     separation,
@@ -224,7 +225,16 @@ def _parse_registered(item: RecoveryItem, name: str, value: str) -> ParsedAnswer
     if item.answer_shape is None:
         msg = f"{item.item_id}: no answer_shape, so its registered values cannot be parsed"
         raise ItemValidationError(msg)
-    text, parsed = parse_answer(value, shape=item.answer_shape, normalization=item.normalization)
+    try:
+        text, parsed = parse_answer(
+            value,
+            shape=item.answer_shape,
+            normalization=item.normalization,
+            raise_on_timeout=True,
+        )
+    except ParseTimeoutError as error:
+        msg = f"{item.item_id}: timed out parsing registered answer {name}"
+        raise ItemValidationError(msg) from error
     if parsed is None:
         msg = (
             f"{item.item_id}: registered answer {name}={value!r} normalises to {text!r}, which "

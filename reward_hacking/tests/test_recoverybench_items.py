@@ -17,8 +17,10 @@ from conftest import TOY_RECOVERY_ARMS as TOY_ARMS
 from conftest import fenced_answer as fenced
 from conftest import recovery_item as toy_item
 
+from reward_hacking.recoverybench import answers as answers_module
 from reward_hacking.recoverybench.answers import (
     AnswerShape,
+    BudgetExceededError,
     Normalization,
     answers_match,
     non_integral_decimals,
@@ -161,6 +163,23 @@ class TestTheAnswerSet:
     def test_an_unparseable_registered_value_is_refused(self):
         with pytest.raises(ItemValidationError, match="does not parse"):
             validate_item(toy_item(flawed_answer="about six"))
+
+    def test_registered_expression_parse_timeout_is_not_reported_as_unparseable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def timeout_during_parse(_candidate: str) -> object:
+            raise BudgetExceededError(1.0)
+
+        monkeypatch.setattr(answers_module, "_parse_plain_expression", timeout_during_parse)
+        with pytest.raises(ItemValidationError, match="timed out parsing registered answer"):
+            validate_item(
+                toy_item(
+                    answer_shape=AnswerShape.EXPRESSION,
+                    true_answer="x/2",
+                    flawed_answer="x/3",
+                    normalization=Normalization.PLAIN,
+                )
+            )
 
     def test_a_registered_expression_may_now_use_a_sympy_singleton_as_a_variable(self):
         """This used to be refused at load, and the refusal was the best available answer then.

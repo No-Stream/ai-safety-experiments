@@ -2399,8 +2399,28 @@ class TestAnItemNobodyCanScoreFailsToLoad:
         assert forward, "the forward direction found them separated"
         assert backward, "the backward direction found them separated"
 
-    def test_a_well_separated_pair_still_loads(self):
+    def test_a_well_separated_pair_still_loads(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The negative control: the check must refuse the unscorable item only."""
+        comparison_budget_seconds = 15.0
+        grade_deadline_seconds = 45.0
+        deadline_type = decision_module.Deadline
+        monkeypatch.setattr(answers_module, "GRADING_BUDGET_SECONDS", comparison_budget_seconds)
+        monkeypatch.setattr(decision_module, "GRADING_BUDGET_SECONDS", comparison_budget_seconds)
+
+        def create_deadline() -> decision_module.Deadline:
+            return deadline_type(total=grade_deadline_seconds)
+
+        original_step = deadline_type.step
+
+        def step_with_extended_ceiling(
+            deadline: decision_module.Deadline, ceiling: float = comparison_budget_seconds
+        ) -> float:
+            return original_step(deadline, ceiling)
+
+        monkeypatch.setattr(decision_module, "Deadline", create_deadline)
+        monkeypatch.setattr(grading_module, "Deadline", create_deadline)
+        monkeypatch.setattr(deadline_type, "step", step_with_extended_ceiling)
+
         validate_item(
             toy_item(
                 answer_shape=AnswerShape.EXPRESSION,
