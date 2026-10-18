@@ -1449,20 +1449,21 @@ def test_owned_server_memory_scales_with_device(
 def test_owned_server_admission_checks_real_cli_config(
     monkeypatch: pytest.MonkeyPatch, utilization_flags: list[str], tmp_path: Path
 ) -> None:
-    measurements = iter([1024.0, (32 - 1.2) * 1024])
+    measurements = iter([1024.0, (32 - 1.2) * 1024, (32 - 1.2) * 1024])
     monkeypatch.setattr(
         gpu_memory,
         "_nvidia_smi_rows",
         lambda: [(0, "GPU-test", next(measurements), 32768.0)],
     )
     args = parse_args(["--output-dir", str(tmp_path), *utilization_flags])
-    config = cli.build_server_config(args, "revision", 4096).resolve_memory(
-        gpu_memory.nvidia_smi_memory_info()
-    )
-    command = config.command()
-    assert float(command[command.index("--gpu-memory-utilization") + 1]) == (
-        0.9 if utilization_flags else (31 - 4.5 - 0.75) / 32
-    )
-    server = cli.VLLMServer(config)
+    server = cli.VLLMServer(cli.build_server_config(args, "revision", 4096))
+    monkeypatch.setattr(server, "_launch_process", lambda: None)
+    monkeypatch.setattr(server, "_wait_until_healthy", lambda: None)
     with pytest.raises(RuntimeError, match=r"1.20 GiB.*4.50 GiB.*--gpu-memory-utilization"):
-        server._check_trainer_headroom()
+        server.start()
+    attempts = server.memory_provenance["attempts"]
+    assert isinstance(attempts, list)
+    assert len(attempts) == (1 if utilization_flags else 2)
+    assert server.memory_provenance["requested_gpu_memory_utilization"] == (
+        0.9 if utilization_flags else None
+    )

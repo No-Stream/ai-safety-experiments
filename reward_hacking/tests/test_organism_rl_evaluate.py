@@ -1085,7 +1085,7 @@ def test_owned_server_accepts_a_derived_memory_share(monkeypatch: pytest.MonkeyP
     assert config.trainer_vram_headroom_gib == 0
     command = config.command()
     assert float(command[command.index("--gpu-memory-utilization") + 1]) == pytest.approx(
-        (31 - 0.75) / 32 - 0.02
+        (31 - 0.75 - 2.4) / 32
     )
 
 

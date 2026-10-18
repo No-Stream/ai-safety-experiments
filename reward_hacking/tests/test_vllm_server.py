@@ -415,7 +415,7 @@ def test_server_preserves_explicit_utilization(
 def test_server_derives_inference_default(fake_vllm: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
     with VLLMServer(replace(_config(fake_vllm), gpu_memory_utilization=None)) as server:
-        assert server.config.gpu_memory_utilization == pytest.approx((31 - 0.75) / 32 - 0.02)
+        assert server.config.gpu_memory_utilization == pytest.approx((31 - 0.75 - 2.4) / 32)
         assert server.memory_provenance["launch_free_bytes"] == 31 * 1024**3
 
 
@@ -428,7 +428,7 @@ def test_server_checks_trainer_headroom_and_reaps_failure(
     tmp_path: Path,
     requested_utilization: float | None,
 ) -> None:
-    measurements = iter([1024.0, (32 - free_gib) * 1024])
+    measurements = iter([1024.0, (32 - free_gib) * 1024, (32 - free_gib) * 1024])
     monkeypatch.setattr(
         gpu_memory,
         "_nvidia_smi_rows",
@@ -460,9 +460,10 @@ def test_server_checks_trainer_headroom_and_reaps_failure(
                 assert server.memory_provenance["headroom_satisfied"] is True
         recorded = json.loads((tmp_path / "server.memory.json").read_text())
         assert recorded == server.memory_provenance
-        assert recorded["gpu_memory_utilization"] == (
-            requested_utilization or (31 - 2.5 - 0.75) / 32
-        )
+        expected_utilization = requested_utilization or (31 - 2.5 - 0.75) / 32
+        if requested_utilization is None and free_gib < 2.5:
+            expected_utilization -= (2.5 - free_gib) / 32 + 0.01
+        assert recorded["gpu_memory_utilization"] == pytest.approx(expected_utilization)
         assert recorded["trainer_vram_headroom_gib"] == 2.5
     finally:
         server.stop()
@@ -647,3 +648,97 @@ def test_owned_server_restores_info_logging_in_redirected_child(
     assert "synthetic KV cache size" in output
     assert "synthetic speculative decode stats" in output
     assert os.environ["VLLM_CONFIGURE_LOGGING"] == "0"
+
+
+@pytest.mark.parametrize("trainer_headroom_gib", [0.0, 1.0, 4.5])
+def test_derived_share_reserves_runtime_floor_or_trainer_headroom(
+    fake_vllm: Path, trainer_headroom_gib: float
+) -> None:
+    config = replace(
+        _config(fake_vllm),
+        gpu_memory_utilization=None,
+        trainer_vram_headroom_gib=trainer_headroom_gib,
+    )
+    memory = gpu_memory.NvidiaSMIMemory(
+        device_index=0, device_uuid="GPU-test", free_bytes=31 * 1024**3, total_bytes=32 * 1024**3
+    )
+    resolved = config.resolve_memory(memory)
+    assert resolved.gpu_memory_utilization == pytest.approx(
+        (31 - 0.75 - max(trainer_headroom_gib, 2.4)) / 32
+    )
+
+
+@pytest.mark.parametrize("requested_utilization", [None, 0.85])
+@pytest.mark.parametrize("second_free_gib", [1.0, 2.4, 2.6])
+@pytest.mark.parametrize("trainer_headroom_gib", [0.0, 4.5])
+def test_readiness_memory_retry_is_once_and_only_for_derived_shares(
+    fake_vllm: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_utilization: float | None,
+    second_free_gib: float,
+    trainer_headroom_gib: float,
+) -> None:
+    tmp_path = fake_vllm.parent
+    required_free_gib = max(trainer_headroom_gib, 2.4)
+    first_free_gib = required_free_gib - 0.4
+    final_free_gib = required_free_gib + second_free_gib - 2.4
+    free_readings = iter([31.0, first_free_gib, final_free_gib])
+    monkeypatch.setattr(
+        vllm_server,
+        "nvidia_smi_memory_info",
+        lambda: gpu_memory.NvidiaSMIMemory(
+            device_index=0,
+            device_uuid="GPU-test",
+            free_bytes=round(next(free_readings) * 1024**3),
+            total_bytes=32 * 1024**3,
+        ),
+    )
+    processes: list[subprocess.Popen[bytes]] = []
+    shares: list[float | None] = []
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    server = VLLMServer(
+        replace(
+            _config(fake_vllm),
+            gpu_memory_utilization=requested_utilization,
+            log_path=tmp_path / "retry.log",
+            trainer_vram_headroom_gib=trainer_headroom_gib,
+        )
+    )
+
+    def ready(*args: object, **kwargs: object) -> _HealthResponse:
+        del args, kwargs
+        processes.append(server.process)
+        shares.append(server.config.gpu_memory_utilization)
+        return _HealthResponse(200)
+
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", ready)
+    try:
+        if requested_utilization is not None or second_free_gib < 2.4:
+            with pytest.raises(VLLMServerStartupError, match="--gpu-memory-utilization"):
+                server.start()
+            assert all(process.poll() is not None for process in processes)
+            assert signal.getsignal(signal.SIGTERM) is previous_handler
+        else:
+            server.start()
+            assert server.process.poll() is None
+        expected_attempts = 2 if requested_utilization is None else 1
+        assert len(processes) == expected_attempts
+        if expected_attempts == 2:
+            assert processes[0].poll() is not None
+            assert shares[0] is not None
+            assert shares[1] is not None
+            assert shares[0] - shares[1] == pytest.approx(0.4 / 32 + 0.01)
+        else:
+            assert shares == [requested_utilization]
+        recorded = json.loads((tmp_path / "retry.memory.json").read_text())
+        assert recorded == server.memory_provenance
+        assert recorded["required_free_bytes"] == int(required_free_gib * 1024**3)
+        assert [attempt["gpu_memory_utilization"] for attempt in recorded["attempts"]] == shares
+        assert recorded["attempts"][0]["ready_free_bytes"] == round(first_free_gib * 1024**3)
+        assert recorded["attempts"][0]["headroom_satisfied"] is False
+        if expected_attempts == 2:
+            assert recorded["attempts"][1]["ready_free_bytes"] == round(final_free_gib * 1024**3)
+            assert recorded["attempts"][1]["headroom_satisfied"] is (second_free_gib >= 2.4)
+    finally:
+        server.stop()
+    assert signal.getsignal(signal.SIGTERM) is previous_handler

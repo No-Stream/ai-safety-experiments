@@ -24,6 +24,7 @@ from reward_hacking.organism_rl.phases import (
     resolve_host_memory_budget_bytes,
 )
 from reward_hacking.tests.test_organism_rl_transfers import tiny_policy
+from reward_hacking.vllm_server import RUNTIME_FREE_VRAM_FLOOR_BYTES
 
 
 def _int8_policy_with_local_config(directory: Path) -> Any:
@@ -350,6 +351,83 @@ def test_sample_train_sync_cycle(
     load_payload = state.payloads[-1]
     assert "load_inplace" not in load_payload
     assert all(value.device.type == "cpu" for value in model.parameters())
+    controller.close()
+
+
+@pytest.mark.parametrize("device", ["cuda:3", "cuda"])
+def test_controller_records_free_vram_after_each_wake_and_warns_below_floor(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    device: str,
+) -> None:
+    transport, state = server
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    total_bytes = 24 * gpu_memory.GIBIBYTE_BYTES
+    free_bytes = [
+        RUNTIME_FREE_VRAM_FLOOR_BYTES - 1,
+        RUNTIME_FREE_VRAM_FLOOR_BYTES + 1,
+        RUNTIME_FREE_VRAM_FLOOR_BYTES - 2,
+    ]
+    snapshots = iter(
+        gpu_memory.NvidiaSMIMemory(3, "test-device", value, total_bytes) for value in free_bytes
+    )
+    measurement_request_log: list[list[str]] = []
+
+    def fake_nvidia_smi_memory_info(device_index: int) -> gpu_memory.NvidiaSMIMemory:
+        assert device_index == 3
+        measurement_request_log.append(list(state.requests))
+        return next(snapshots)
+
+    monkeypatch.setattr(
+        phases,
+        "device_memory",
+        lambda _device: phases.DeviceMemory("test-device", total_bytes, total_bytes),
+    )
+    monkeypatch.setattr(phases, "nvidia_smi_memory_info", fake_nvidia_smi_memory_info)
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path / "served-adapters",
+        training_device=torch.device(device),
+        sleep_level=2,
+        http_transport=transport,
+    )
+    monkeypatch.setattr(controller, "_offload", lambda _trainer: None)
+    trainer = ToyTrainer(ToyAdapter(), None, ToyState())
+
+    controller.initialize(trainer)
+    controller.sleep()
+    controller.before_sampling(trainer)
+    controller._sync(trainer, 1)  # pyright: ignore[reportPrivateUsage]
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "runtime-vram.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["free_bytes"] for record in records] == free_bytes
+    assert [record["wake_source"] for record in records] == [
+        "adapter_sync",
+        "sampling",
+        "adapter_sync",
+    ]
+    assert [record["step"] for record in records] == [0, 0, 1]
+    assert all(
+        record["runtime_free_vram_floor_bytes"] == RUNTIME_FREE_VRAM_FLOOR_BYTES
+        for record in records
+    )
+    assert [record["below_floor"] for record in records] == [True, False, True]
+    assert measurement_request_log[1][-4:] == [
+        "/wake_up",
+        "/collective_rpc",
+        "/v1/unload_lora_adapter",
+        "/v1/load_lora_adapter",
+    ]
+    assert (
+        len([record for record in caplog.records if "below the runtime floor" in record.message])
+        == 2
+    )
     controller.close()
 
 

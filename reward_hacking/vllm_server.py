@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, NoReturn, Self, cast
 
 from grpo.gpu_memory import GIBIBYTE_BYTES, NvidiaSMIMemory, nvidia_smi_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
@@ -44,6 +44,8 @@ class VLLMServerStartupError(RuntimeError):
 SPECULATIVE_MAX_NUM_BATCHED_TOKENS = 8_192
 # The engine's CUDA context and allocations outside its utilization budget; 0.58 GiB measured at 9B on the 5090.
 ENGINE_OVERHEAD_OUTSIDE_UTILIZATION_BYTES = int(0.75 * 2**30)
+RUNTIME_FREE_VRAM_FLOOR_BYTES = int(2.4 * GIBIBYTE_BYTES)
+MEMORY_RETRY_UTILIZATION_MARGIN = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,9 +122,7 @@ class VLLMServerConfig:
         if self.gpu_memory_utilization is not None:
             return self
         reserve_bytes = ENGINE_OVERHEAD_OUTSIDE_UTILIZATION_BYTES + (
-            self.trainer_vram_headroom_gib * GIBIBYTE_BYTES
-            if self.trainer_vram_headroom_gib > 0
-            else memory.total_bytes * 0.02
+            max(self.trainer_vram_headroom_gib * GIBIBYTE_BYTES, RUNTIME_FREE_VRAM_FLOOR_BYTES)
         )
         utilization = (memory.free_bytes - reserve_bytes) / memory.total_bytes
         if utilization <= 0:
@@ -308,6 +308,7 @@ class VLLMServer:
         """Create a stopped server wrapper; :meth:`start` launches the child."""
         self.config = config
         self.memory_provenance: dict[str, object] = {}
+        self._memory_attempts: list[dict[str, object]] = []
         self._process: subprocess.Popen[bytes] | None = None
         self._previous_sigterm_handler: int | Callable[[int, FrameType | None], object] | None = (
             None
@@ -374,6 +375,7 @@ class VLLMServer:
         launch_memory = nvidia_smi_memory_info()
         requested_utilization = self.config.gpu_memory_utilization
         self.config = self.config.resolve_memory(launch_memory)
+        self._memory_attempts = []
         self.memory_provenance = {
             "device_index": launch_memory.device_index,
             "device_uuid": launch_memory.device_uuid,
@@ -382,8 +384,54 @@ class VLLMServer:
             "requested_gpu_memory_utilization": requested_utilization,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "trainer_vram_headroom_gib": self.config.trainer_vram_headroom_gib,
+            "runtime_free_vram_floor_bytes": RUNTIME_FREE_VRAM_FLOOR_BYTES,
+            "required_free_bytes": max(
+                self.config.trainer_vram_headroom_gib * GIBIBYTE_BYTES,
+                RUNTIME_FREE_VRAM_FLOOR_BYTES,
+            ),
+            "attempts": self._memory_attempts,
         }
         self._record_memory_provenance()
+        try:
+            for attempt_index in range(2):
+                self._memory_attempts.append(
+                    {"gpu_memory_utilization": self.config.gpu_memory_utilization}
+                )
+                self.memory_provenance["gpu_memory_utilization"] = (
+                    self.config.gpu_memory_utilization
+                )
+                self._record_memory_provenance()
+                self._launch_process()
+                self._install_signal_handler()
+                self._wait_until_healthy()
+                suggested = self._check_free_memory()
+                if suggested is None:
+                    break
+                if requested_utilization is not None or attempt_index == 1 or suggested <= 0:
+                    self._raise_memory_shortfall(suggested)
+                logger.warning(
+                    "vLLM free VRAM below requirement; restarting once with utilization=%s",
+                    suggested,
+                )
+                self.stop()
+                self._process = None
+                self.config = replace(self.config, gpu_memory_utilization=suggested)
+        except BaseException:
+            self.stop()
+            raise
+        logger.info(
+            "vLLM server ready: model=%s revision=%s base_url=%s max_model_len=%s "
+            "gpu_memory_utilization=%s language_model_only=%s",
+            self.config.model,
+            self.config.revision,
+            self.base_url,
+            self.config.max_model_len,
+            self.config.gpu_memory_utilization,
+            self.config.language_model_only,
+        )
+        return self
+
+    def _launch_process(self) -> None:
         environment = self._environment()
         command = self.config.command()
         if self.config.log_path is None:
@@ -404,24 +452,6 @@ class VLLMServer:
                     start_new_session=True,
                     env=environment,
                 )
-        try:
-            self._install_signal_handler()
-            self._wait_until_healthy()
-            self._check_trainer_headroom()
-        except BaseException:
-            self.stop()
-            raise
-        logger.info(
-            "vLLM server ready: model=%s revision=%s base_url=%s max_model_len=%s "
-            "gpu_memory_utilization=%s language_model_only=%s",
-            self.config.model,
-            self.config.revision,
-            self.base_url,
-            self.config.max_model_len,
-            self.config.gpu_memory_utilization,
-            self.config.language_model_only,
-        )
-        return self
 
     def _record_memory_provenance(self) -> None:
         logger.info("vLLM memory admission: %s", self.memory_provenance)
@@ -430,29 +460,34 @@ class VLLMServer:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(self.memory_provenance, indent=2) + "\n", encoding="utf-8")
 
-    def _check_trainer_headroom(self) -> None:
-        if self.config.trainer_vram_headroom_gib == 0:
-            return
+    def _check_free_memory(self) -> float | None:
         ready_memory = nvidia_smi_memory_info()
-        required_bytes = self.config.trainer_vram_headroom_gib * GIBIBYTE_BYTES
-        satisfied = ready_memory.free_bytes >= required_bytes
-        self.memory_provenance.update(
-            ready_free_bytes=ready_memory.free_bytes, headroom_satisfied=satisfied
+        required_bytes = max(
+            self.config.trainer_vram_headroom_gib * GIBIBYTE_BYTES, RUNTIME_FREE_VRAM_FLOOR_BYTES
         )
+        satisfied = ready_memory.free_bytes >= required_bytes
+        observation = {"ready_free_bytes": ready_memory.free_bytes, "headroom_satisfied": satisfied}
+        self.memory_provenance.update(observation)
+        self._memory_attempts[-1].update(observation)
         self._record_memory_provenance()
-        if not satisfied:
-            utilization = cast("float", self.config.gpu_memory_utilization)
-            suggested = max(
-                utilization / 2,
-                utilization
-                - (required_bytes - ready_memory.free_bytes) / ready_memory.total_bytes
-                - 0.01,
-            )
-            raise VLLMServerStartupError(
-                f"vLLM ready with {ready_memory.free_bytes / GIBIBYTE_BYTES:.2f} GiB free; "
-                f"trainer rollout headroom requires {self.config.trainer_vram_headroom_gib:.2f} GiB. "
-                f"Retry with --gpu-memory-utilization {suggested:.6g} or lower."
-            )
+        if satisfied:
+            return None
+        utilization = cast("float", self.config.gpu_memory_utilization)
+        return (
+            utilization
+            - (required_bytes - ready_memory.free_bytes) / ready_memory.total_bytes
+            - MEMORY_RETRY_UTILIZATION_MARGIN
+        )
+
+    def _raise_memory_shortfall(self, suggested: float) -> NoReturn:
+        required_bytes = cast("float", self.memory_provenance["required_free_bytes"])
+        free_bytes = cast("int", self.memory_provenance["ready_free_bytes"])
+        positive_suggestion = max(cast("float", self.config.gpu_memory_utilization) / 2, suggested)
+        raise VLLMServerStartupError(
+            f"vLLM ready with {free_bytes / GIBIBYTE_BYTES:.2f} GiB free; "
+            f"runtime/trainer rollout headroom requires {required_bytes / GIBIBYTE_BYTES:.2f} GiB. "
+            f"Retry with --gpu-memory-utilization {positive_suggestion:.6g} or lower."
+        )
 
     def stop(self) -> None:
         """Terminate and reap the process group, escalating only after the grace period."""

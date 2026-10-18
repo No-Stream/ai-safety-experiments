@@ -21,7 +21,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 import httpx2
@@ -32,6 +32,7 @@ from safetensors import safe_open
 from grpo.gpu_memory import GIBIBYTE_BYTES, gpu_memory_info, nvidia_smi_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organism_rl.transfers import PolicyTransfers
+from reward_hacking.vllm_server import RUNTIME_FREE_VRAM_FLOOR_BYTES
 
 logger = logging.getLogger(__name__)
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
@@ -428,6 +429,7 @@ class VLLMPhaseController:
         self._training = False
         self.last_sync_seconds: dict[str, float] = {}
         self._transfers: PolicyTransfers | None = None
+        self.runtime_memory_metrics_path = adapter_root.parent / "runtime-vram.jsonl"
 
     def close(self) -> None:
         """Release the owned HTTP client and retained trainer host arenas."""
@@ -539,7 +541,13 @@ class VLLMPhaseController:
             raise RuntimeError("phase controller is already initialized")
         self._sync(trainer, step)
 
-    def _wake_up(self, *, restore_adapter: bool = True) -> None:
+    def _wake_up(
+        self,
+        *,
+        restore_adapter: bool = True,
+        wake_source: Literal["sampling", "adapter_sync"],
+        step: int,
+    ) -> None:
         self._post("/wake_up")
         self._vllm_sleeping = False
         if self._weights_discarded:
@@ -553,11 +561,53 @@ class VLLMPhaseController:
                     "/v1/load_lora_adapter",
                     {"lora_name": self._adapter_name, "lora_path": str(self._served_adapter_path)},
                 )
+        self._record_wake_memory(wake_source, step)
+
+    def _record_wake_memory(
+        self, wake_source: Literal["sampling", "adapter_sync"], step: int
+    ) -> None:
+        if self.training_device.type != "cuda":
+            return
+        device_index = cast("int | None", self.training_device.index)
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        memory = nvidia_smi_memory_info(device_index)
+        below_floor = memory.free_bytes < RUNTIME_FREE_VRAM_FLOOR_BYTES
+        record: dict[str, int | str | bool] = {
+            "schema_version": 1,
+            "measured_at_unix_ns": time.time_ns(),
+            "wake_source": wake_source,
+            "step": step,
+            "device_index": device_index,
+            "free_bytes": memory.free_bytes,
+            "total_bytes": memory.total_bytes,
+            "runtime_free_vram_floor_bytes": RUNTIME_FREE_VRAM_FLOOR_BYTES,
+            "below_floor": below_floor,
+        }
+        with self.runtime_memory_metrics_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+        if below_floor:
+            logger.warning(
+                "free VRAM after sampler wake is below the runtime floor: "
+                "source=%s device=%d free_bytes=%d floor_bytes=%d",
+                wake_source,
+                device_index,
+                memory.free_bytes,
+                RUNTIME_FREE_VRAM_FLOOR_BYTES,
+            )
+        else:
+            logger.info(
+                "free VRAM after sampler wake: source=%s device=%d free_bytes=%d floor_bytes=%d",
+                wake_source,
+                device_index,
+                memory.free_bytes,
+                RUNTIME_FREE_VRAM_FLOOR_BYTES,
+            )
 
     def before_sampling(self, trainer: PhaseTrainer) -> None:
         """Release trainer memory, wake sampling and validate the adapter identity."""
         self._offload(trainer)
-        self._wake_up()
+        self._wake_up(wake_source="sampling", step=int(trainer.state.global_step))
         self._assert_sleeping(expected=False)
         self._assert_served()
         self._training = False
@@ -629,7 +679,7 @@ class VLLMPhaseController:
         copied = time.perf_counter()
         self._offload(trainer)
         offloaded = time.perf_counter()
-        self._wake_up(restore_adapter=False)
+        self._wake_up(restore_adapter=False, wake_source="adapter_sync", step=step)
         self._assert_sleeping(expected=False)
         woken = time.perf_counter()
         served_model_ids = self._served_model_ids()
