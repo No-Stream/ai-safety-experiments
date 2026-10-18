@@ -453,6 +453,54 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
 @pytest.mark.skipif(
     not _user_manager_is_available(), reason="requires a usable systemd user manager"
 )
+@pytest.mark.parametrize(
+    ("job_signal", "expected_status"), [(signal.SIGTERM, 143), (signal.SIGINT, 130)]
+)
+def test_a_job_killed_by_a_clean_signal_reports_failure(
+    job_signal: signal.Signals, expected_status: int
+) -> None:
+    # systemd counts a main process ended by SIGTERM, SIGINT, SIGHUP or SIGPIPE as a clean exit, so a
+    # job stopped by hand after a crash once logged EXITCODE=0.
+    marker = f"{os.getpid()}{time.time_ns() % 1_000_000:06d}"
+    wrapper = subprocess.Popen(  # noqa: S603 - repo script, literal arguments
+        [str(LIMITER), "-t", "2m", "--", "sleep", marker],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        job_pid = 0
+        started_deadline = time.monotonic() + 15
+        while job_pid == 0 and time.monotonic() < started_deadline:
+            if wrapper.poll() is not None:
+                stdout, stderr = wrapper.communicate()
+                pytest.fail(f"wrapper exited before its job started: {stdout}{stderr}")
+            found = subprocess.run(  # noqa: S603 - literal pgrep arguments
+                ["pgrep", "-f", rf"^\S*sleep {marker}$"],  # noqa: S607 - pgrep from PATH
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.split()
+            job_pid = int(found[0]) if found else 0
+            time.sleep(0.05)
+        assert job_pid > 0, "limited job did not start"
+
+        os.kill(job_pid, job_signal)
+
+        stdout, stderr = wrapper.communicate(timeout=10)
+        assert wrapper.returncode == expected_status, (
+            f"expected status {expected_status}, got {wrapper.returncode}: {stdout}{stderr}"
+        )
+    finally:
+        if wrapper.poll() is None:
+            wrapper.send_signal(signal.SIGTERM)
+            wrapper.communicate(timeout=10)
+
+
+@pytest.mark.skipif(
+    not _user_manager_is_available(), reason="requires a usable systemd user manager"
+)
 def test_the_enforced_unit_inherits_the_callers_open_file_limit() -> None:
     # systemd starts user units at a 1024 soft limit. Under WSL, CUDA's expandable segments hold
     # one descriptor per mapped chunk, so a large allocation past 1024 failed as "CUDA driver error:

@@ -441,8 +441,8 @@ for f in games/data/survey/authored.json games/data/survey/published.json \
          reward_hacking/harness/data/aisi_rh_envs_cases.json; do
   [ -f "$f" ] && cp --parents "$f" "$T/"
 done
-if [ -d reward_hacking/ladder/data/scenarios-v2.2-heldout ]; then
-  cp -a --parents reward_hacking/ladder/data/scenarios-v2.2-heldout "$T/"
+if [ -d reward_hacking/ladder/data ]; then
+  cp -a --parents reward_hacking/ladder/data "$T/"   # gitignored ladder scenarios, all versions
 fi
 ln -s "$PWD/.venv" "$T/.venv"
 mkdir -p "$T/external"

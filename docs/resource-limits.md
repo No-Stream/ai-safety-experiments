@@ -52,7 +52,9 @@ whatever you invoked from (`--chdir` overrides). Both are read from `nproc --all
 `/proc/meminfo` at startup rather than hardcoded: the literals they replaced were measured here, and
 on a rented 4-vCPU GPU box `CPUQuota=5000%` and `MemoryMax=160G` bind nothing at all while the
 banner still prints them. `--help` lists every flag. Exit status is the
-job's own, except `124` for a `--timeout` kill and `137` for exceeding `--mem-max`.
+job's own, except `124` for a `--timeout` kill and `137` for exceeding `--mem-max`. A job killed
+by a signal exits `128 + signal`, including SIGTERM and SIGINT, which systemd alone would count
+as a clean exit.
 
 The real-execution agent harness keeps cgroup enforcement as its default. On a host whose
 systemd user manager reports `offline`, pass `--advisory-limits` to

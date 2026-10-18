@@ -646,9 +646,13 @@ class TestBatchSubmit:
 
     @pytest.mark.parametrize("field", ["prompt_digest", "cell_digest"])
     def test_handle_digests_are_metadata(
-        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], field: str
+        self,
+        tmp_path: Path,
+        aws: tuple[FakeBedrock, FakeS3],
+        pinned_stimulus: TransferStimulus,
+        field: str,
     ) -> None:
-        del aws
+        del aws, pinned_stimulus
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
         path = cli.handle_path(tmp_path, leg_for(FLOOR_LEG_ID))
         handle = json.loads(path.read_text(encoding="utf-8"))
@@ -658,9 +662,9 @@ class TestBatchSubmit:
         assert resumed["resumed_handle"] is True
 
     def test_readable_batch_identity_mismatch_refuses(
-        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3]
+        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
     ) -> None:
-        del aws
+        del aws, pinned_stimulus
         leg = leg_for(FLOOR_LEG_ID)
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)
         identity_path = cli._batch_prompt_identity_path(tmp_path, leg)
@@ -753,8 +757,9 @@ class TestBatchCollect:
         assert collected["collected"] == FLOOR_RECORDS
 
     def test_a_readable_stimulus_edit_refuses_collecting(
-        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3]
+        self, tmp_path: Path, aws: tuple[FakeBedrock, FakeS3], pinned_stimulus: TransferStimulus
     ) -> None:
+        del pinned_stimulus
         _, s3 = aws
         leg = leg_for(FLOOR_LEG_ID)
         cli.submit_batch(FLOOR_LEG_ID, tmp_path, ONE_WAY, check_only=False)

@@ -332,8 +332,12 @@ trap 'stop_unit_after_signal 129' HUP
 trap 'stop_unit_after_signal 130' INT
 trap 'stop_unit_after_signal 143' TERM
 
+# The job runs under a bash parent that exits with its status. systemd counts a main process ended
+# by SIGTERM, SIGINT, SIGHUP or SIGPIPE as a clean exit and --pipe then reports 0, so a job stopped
+# by hand after a crash would record success; bash turns that death into an ordinary 128+n exit.
 rc=0
-systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${properties[@]}" -- "$@" <&0 &
+systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${properties[@]}" -- \
+  /bin/bash -c '"$@"; exit $?' resource-limits-job "$@" <&0 &
 systemd_run_pid=$!
 # A signal can arrive between installing the traps and registering the unit.
 if ((signal_exit != 0)); then
