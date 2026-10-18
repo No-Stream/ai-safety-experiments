@@ -146,6 +146,18 @@ def test_checkpoint_retention_flags_are_operational(tmp_path: Path) -> None:
     write_provenance(args, {"name": "cpu"})
 
 
+@pytest.mark.parametrize("memory_flag", ["--tiled-mlp", "--offload-checkpoints"])
+def test_activation_memory_flags_are_operational(tmp_path: Path, memory_flag: str) -> None:
+    # A resume after a trainer OOM turns on a memory layout change; it does not change what is trained.
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+    write_provenance(args, {"name": "cpu"})
+
+    args = parse_args(
+        ["--output-dir", str(tmp_path), "--endpoint", "http://server:8000", memory_flag]
+    )
+    write_provenance(args, {"name": "cpu"})
+
+
 @pytest.mark.parametrize(
     ("flag", "value"), [("--checkpoint-keep-latest", "0"), ("--checkpoint-keep-middle", "-1")]
 )

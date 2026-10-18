@@ -568,6 +568,8 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "rollout_concurrency",
         "expected_peak_context_tokens",
         "kv_capacity_tokens",
+        "tiled_mlp",
+        "offload_checkpoints",
     }
     normalized = dict(flags)
     normalized.setdefault("prescreen_samples", None)
