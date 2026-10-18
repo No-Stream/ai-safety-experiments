@@ -34,6 +34,7 @@ def test_defaults_and_vram_derived_sizing():
     assert args.expected_peak_context_tokens is None
     assert args.prompts_per_step == 1
     assert args.dynamic_sampling is False
+    assert args.dynamic_sampling_history_from == ()
     assert args.dynamic_sampling_max_groups == 3
     assert args.dynamic_sampling_skip_after == 2
     assert args.thinking_token_budget == 512
@@ -75,6 +76,39 @@ def test_dynamic_sampling_cli_resolves_and_accepts_explicit_group_cap() -> None:
     )
     assert disabled.dynamic_sampling is False
     assert disabled.dynamic_sampling_max_groups == 12
+
+
+def test_dynamic_sampling_history_from_is_repeatable() -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--dynamic-sampling",
+            "--dynamic-sampling-history-from",
+            "artifacts/prior-a",
+            "artifacts/prior-b",
+            "--dynamic-sampling-history-from",
+            "artifacts/prior-c",
+        ]
+    )
+
+    assert args.dynamic_sampling_history_from == (
+        str(Path("artifacts/prior-a").resolve()),
+        str(Path("artifacts/prior-b").resolve()),
+        str(Path("artifacts/prior-c").resolve()),
+    )
+
+
+def test_dynamic_sampling_history_from_requires_dynamic_sampling() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--dynamic-sampling-history-from",
+                "artifacts/prior",
+            ]
+        )
 
 
 @pytest.mark.parametrize(
@@ -201,7 +235,22 @@ def test_owned_server_rejects_invalid_headroom(headroom: str) -> None:
 
 def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
     args = parse_args(["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"])
-    path = write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
+    dynamic_history = {
+        "source_directories": [str(tmp_path / "prior")],
+        "prior_groups": 8,
+        "incomplete_groups": 1,
+        "sources": [],
+        "matched_groups": 4,
+        "unmatched_groups": 4,
+        "pre_skipped_all_zero": 2,
+        "pre_skipped_all_one": 1,
+    }
+    path = write_provenance(
+        args,
+        {"name": "cpu"},
+        model_revision="resolved-revision",
+        dynamic_sampling_history=dynamic_history,
+    )
     value = json.loads(path.read_text())
     assert value["trl_version"] == "1.10.0"
     assert len(value["git_sha"]) == 40
@@ -214,6 +263,7 @@ def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
     assert value["flags"]["dynamic_sampling"] is False
     assert value["flags"]["dynamic_sampling_max_groups"] == 3
     assert value["flags"]["dynamic_sampling_skip_after"] == 2
+    assert value["dynamic_sampling_history"] == dynamic_history
 
 
 def test_legacy_provenance_resumes_with_dynamic_sampling_disabled(tmp_path: Path) -> None:

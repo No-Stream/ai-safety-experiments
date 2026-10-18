@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 GroupKind = Literal["informative", "all_zero", "all_one", "uniform_other", "unscorable"]
-_DYNAMIC_SAMPLING_SCHEMA_VERSION = 1
+_DYNAMIC_SAMPLING_SCHEMA_VERSION = 2
 _MINIMUM_DISTINCT_REWARDS = 2
 
 
@@ -107,6 +107,7 @@ class _PersistedState:
     prompt_history: dict[str, _PromptHistory]
     steps: dict[str, _StepState]
     step_order: list[str]
+    history_seed: dict[str, object] | None
 
 
 class DynamicSamplingState:
@@ -139,6 +140,7 @@ class DynamicSamplingState:
                 prompt_history={},
                 steps={},
                 step_order=[],
+                history_seed=None,
             )
 
     def plan_next_group(
@@ -188,6 +190,70 @@ class DynamicSamplingState:
                     raise ValueError(
                         "dynamic sampling state has completed outcomes after checkpoint"
                     )
+
+    def history_seed_summary(self, source_directories: tuple[str, ...]) -> dict[str, object] | None:
+        """Return the persisted seed summary, refusing a changed source list on resume."""
+        with self._lock:
+            if self._state.history_seed is None:
+                return None
+            saved_seed = self._state.history_seed
+            if saved_seed["source_directories"] != list(source_directories):
+                raise ValueError("dynamic sampling history sources differ from persisted seed")
+            return deepcopy(cast("dict[str, object]", saved_seed["summary"]))
+
+    def seed_history(
+        self,
+        *,
+        groups: Sequence[tuple[str, tuple[float | None, ...]]],
+        current_prompt_ids: Sequence[str],
+        source_directories: tuple[str, ...],
+        summary: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Persist prior group outcomes once, before this run starts sampling."""
+        with self._lock:
+            if self._state.history_seed is not None:
+                saved_summary = self.history_seed_summary(source_directories)
+                if saved_summary is None:
+                    raise AssertionError("persisted history seed disappeared")
+                return saved_summary
+            if self._state.steps or self._state.sampler_cursor:
+                raise ValueError("cannot seed dynamic sampling history after sampling has started")
+
+            new_state = deepcopy(self._state)
+            current_ids = set(current_prompt_ids)
+            matched_groups = 0
+            unmatched_groups = 0
+            for prompt_identity, rewards in groups:
+                if prompt_identity not in current_ids:
+                    unmatched_groups += 1
+                    continue
+                matched_groups += 1
+                _record_prompt_outcome(new_state, prompt_identity, _classify_rewards(rewards))
+
+            pre_skipped_all_zero = sum(
+                history.skip_reason is not None
+                and history.skip_reason.startswith("all_zero_after_")
+                for task_id, history in new_state.prompt_history.items()
+                if task_id in current_ids
+            )
+            pre_skipped_all_one = sum(
+                history.skip_reason is not None and history.skip_reason.startswith("all_one_after_")
+                for task_id, history in new_state.prompt_history.items()
+                if task_id in current_ids
+            )
+            saved_summary = {
+                **dict(summary),
+                "matched_groups": matched_groups,
+                "unmatched_groups": unmatched_groups,
+                "pre_skipped_all_zero": pre_skipped_all_zero,
+                "pre_skipped_all_one": pre_skipped_all_one,
+            }
+            new_state.history_seed = {
+                "source_directories": list(source_directories),
+                "summary": saved_summary,
+            }
+            self._persist(new_state)
+            return deepcopy(saved_summary)
 
     def _bind_sampler_stream(
         self, state: _PersistedState, task_stream: tuple[str, ...], fingerprint: str
@@ -533,6 +599,7 @@ def _state_to_json(state: _PersistedState) -> dict[str, object]:
         "prompt_history": {
             task_id: asdict(history) for task_id, history in state.prompt_history.items()
         },
+        "history_seed": state.history_seed,
         "steps": {
             step_id: {
                 "target_informative_groups": step.target_informative_groups,
@@ -556,7 +623,8 @@ def _state_to_json(state: _PersistedState) -> dict[str, object]:
 def _state_from_json(payload: object) -> _PersistedState:
     if not isinstance(payload, dict):
         raise TypeError("dynamic sampling state must be a JSON object")
-    if payload.get("schema_version") != _DYNAMIC_SAMPLING_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {1, _DYNAMIC_SAMPLING_SCHEMA_VERSION}:
         raise ValueError("unsupported dynamic sampling state schema")
     raw_state = cast("dict[str, object]", payload)
     raw_steps = cast("dict[str, dict[str, object]]", raw_state["steps"])
@@ -601,6 +669,7 @@ def _state_from_json(payload: object) -> _PersistedState:
         },
         steps=steps,
         step_order=cast("list[str]", raw_state["step_order"]),
+        history_seed=cast("dict[str, object] | None", raw_state.get("history_seed")),
     )
 
 

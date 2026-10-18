@@ -8,7 +8,7 @@ import logging
 import math
 import subprocess
 import sys
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from importlib.metadata import version
@@ -42,6 +42,10 @@ from reward_hacking.organism_rl.admission import (
     LiveKVAdmission,
     kv_capacity_tokens,
     resolve_rollout_concurrency,
+)
+from reward_hacking.organism_rl.dynamic_sampling_history import (
+    HistorySeedSummary,
+    seed_dynamic_sampling_history,
 )
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
@@ -214,6 +218,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
     parser.add_argument("--dynamic-sampling-skip-after", type=int, default=2)
     parser.add_argument(
+        "--dynamic-sampling-history-from",
+        action="append",
+        nargs="+",
+        type=Path,
+        default=[],
+        metavar="DIR",
+        help="seed dynamic sampling from prior organism-RL run directories (repeatable)",
+    )
+    parser.add_argument(
         "--max-sequence-tokens", "--max-model-len", dest="max_sequence_tokens", type=int
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -297,6 +310,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     args = parser.parse_args(argv)
     resolve_leak_options(args, parser, partition="train")
     args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
+    args.dynamic_sampling_history_from = tuple(
+        dict.fromkeys(
+            str(path.resolve())
+            for path_group in args.dynamic_sampling_history_from
+            for path in path_group
+        )
+    )
+    if args.dynamic_sampling_history_from and not args.dynamic_sampling:
+        parser.error("--dynamic-sampling-history-from requires --dynamic-sampling")
     if args.dynamic_sampling_max_groups is None:
         args.dynamic_sampling_max_groups = 3 * args.prompts_per_step
     _validate_training_args(args, parser)
@@ -575,12 +597,14 @@ def _task_sources_match(previous: object, current: object) -> bool:
     )
 
 
-def write_provenance(  # noqa: C901 - explicit resume identity checks
+def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run settings
     args: argparse.Namespace,
     device: dict[str, object],
     model_revision: str | None = None,
     selected_prompts: Sequence[TaskPrompt] | None = None,
     task_source_identity: dict[str, object] | None = None,
+    *,
+    dynamic_sampling_history: Mapping[str, object] | None = None,
 ) -> Path:
     """Persist all flags and source/package identity alongside private run artifacts."""
     repository_root = Path(
@@ -654,6 +678,7 @@ def write_provenance(  # noqa: C901 - explicit resume identity checks
         else None,
         "device": device,
         "task_source_identity": task_source_identity,
+        "dynamic_sampling_history": dynamic_sampling_history,
         "selected_prompts": (
             [asdict(prompt) for prompt in selected_prompts]
             if selected_prompts is not None
@@ -927,6 +952,31 @@ def resolve_sampler_precision(args: argparse.Namespace, model_configuration: Any
     )
 
 
+def _seed_dynamic_sampling_history_for_run(
+    args: argparse.Namespace, current_prompt_ids: Sequence[str]
+) -> HistorySeedSummary | None:
+    if not args.dynamic_sampling_history_from:
+        return None
+    summary = seed_dynamic_sampling_history(
+        run_directory=args.output_dir,
+        history_directories=tuple(Path(path) for path in args.dynamic_sampling_history_from),
+        current_prompt_ids=current_prompt_ids,
+        max_groups=args.dynamic_sampling_max_groups,
+        skip_after=args.dynamic_sampling_skip_after,
+    )
+    logger.info(
+        "dynamic sampling history seeded: prior_groups=%d matched_groups=%d "
+        "unmatched_groups=%d pre_skipped_all_zero=%d pre_skipped_all_one=%d incomplete_groups=%d",
+        summary["prior_groups"],
+        summary["matched_groups"],
+        summary["unmatched_groups"],
+        summary["pre_skipped_all_zero"],
+        summary["pre_skipped_all_one"],
+        summary["incomplete_groups"],
+    )
+    return summary
+
+
 def main(argv: list[str] | None = None) -> None:
     """Launch owned vLLM sampling and step-checkpointed GRPO, or use an explicit endpoint."""
     args = parse_args(argv)
@@ -1041,11 +1091,13 @@ def main(argv: list[str] | None = None) -> None:
         args.impossible_variant,
         args.solvable_fraction,
     )
+    dynamic_sampling_history = _seed_dynamic_sampling_history_for_run(args, selected_task_ids)
     write_provenance(
         args,
         device,
         model_revision,
         selected_prompts,
+        dynamic_sampling_history=dynamic_sampling_history,
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
             "leak_task_source": (
