@@ -22,6 +22,7 @@ from transformers import AutoConfig
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 
+from grpo.gpu_memory import nvidia_smi_memory_info
 from grpo.throughput import discover_lora_targets
 from reward_hacking.distill.fla_prewarm import prewarm_fla_nb_buckets
 from reward_hacking.distill.memory import (
@@ -55,6 +56,12 @@ from reward_hacking.organism_rl.phases import VLLMPhaseController, vllm_sleeping
 from reward_hacking.organism_rl.precision import (
     assert_fp32_training_state,
     record_precision_provenance,
+)
+from reward_hacking.organism_rl.prescreen import run_prescreen
+from reward_hacking.organism_rl.prescreen_pool import (
+    derive_prompt_pool,
+    prompt_pool_provenance,
+    select_prompt_pool,
 )
 from reward_hacking.organism_rl.rollout import (
     MixedEpisodeSource,
@@ -130,6 +137,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         help="reuse one actor jail per episode; disable for per-command jails",
     )
 
+    parser.add_argument("--prescreen-samples", type=int)
+    parser.add_argument("--prompt-pool-from", type=Path)
+    parser.add_argument("--prompt-pool-min-rewarded-samples", type=int, default=1)
+    parser.add_argument("--prompt-pool-unscreened-fraction", type=float, default=0.10)
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--model-revision")
     parser.add_argument("--endpoint", help="use an externally managed vLLM server")
@@ -327,6 +338,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
 
 
 def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    _validate_prescreen_args(args, parser)
     _validate_task_mix_args(args, parser)
     _validate_teacher_args(args, parser)
     _validate_training_limits(args, parser)
@@ -334,6 +346,20 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
     _validate_sampling_args(args, parser)
     _validate_speculation(args, parser)
     _validate_quantization_admission(args, parser)
+
+
+def _validate_prescreen_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.prescreen_samples is not None and args.prescreen_samples < 1:
+        parser.error("prescreen-samples must be positive")
+    if args.prescreen_samples is not None and args.prompt_pool_from is not None:
+        parser.error("prompt-pool-from cannot be combined with prescreen-samples")
+    if args.prompt_pool_min_rewarded_samples < 1:
+        parser.error("prompt-pool-min-rewarded-samples must be positive")
+    if (
+        not math.isfinite(args.prompt_pool_unscreened_fraction)
+        or not 0 <= args.prompt_pool_unscreened_fraction < 1
+    ):
+        parser.error("prompt-pool-unscreened-fraction must be finite and in [0, 1)")
 
 
 def _validate_quantization_admission(
@@ -409,7 +435,7 @@ def _validate_owned_server_args(args: argparse.Namespace, parser: argparse.Argum
         parser.error("trainer-vram-headroom-gib must be finite and nonnegative")
     if args.gpu_memory_utilization is not None and not 0 < args.gpu_memory_utilization <= 1:
         parser.error("gpu-memory-utilization must be in (0, 1]")
-    if args.endpoint is None:
+    if args.endpoint is None and args.prescreen_samples is None:
         if not args.enable_lora or not args.enable_sleep_mode:
             parser.error("owned organism RL server requires --enable-lora and --enable-sleep-mode")
         if args.max_lora_rank < TRAINER_LORA_RANK:
@@ -479,13 +505,15 @@ def build_server_config(
         served_model_name=args.model if args.sampler_checkpoint else None,
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        trainer_vram_headroom_gib=args.trainer_vram_headroom_gib,
+        trainer_vram_headroom_gib=0.0
+        if args.prescreen_samples is not None
+        else args.trainer_vram_headroom_gib,
         language_model_only=True,
         host=args.server_host,
         port=args.server_port,
-        enable_lora=args.enable_lora,
+        enable_lora=args.enable_lora if args.prescreen_samples is None else False,
         max_lora_rank=args.max_lora_rank,
-        enable_sleep_mode=args.enable_sleep_mode,
+        enable_sleep_mode=args.enable_sleep_mode if args.prescreen_samples is None else False,
         enable_prefix_caching=args.enable_prefix_caching,
         mamba_cache_mode=args.mamba_cache_mode,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
@@ -509,7 +537,9 @@ def server_endpoint(
         yield args.endpoint
         return
     with VLLMServer(build_server_config(args, model_revision, max_model_len)) as server:
-        provenance_path = active_provenance_path(args.output_dir)
+        provenance_path = active_provenance_path(
+            args.output_dir / "prescreen" if args.prescreen_samples is not None else args.output_dir
+        )
         if provenance_path.exists():
             provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
             provenance["server_memory"] = server.memory_provenance
@@ -519,6 +549,7 @@ def server_endpoint(
 
 def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
     operational = {
+        "prescreen_samples",
         "output_dir",
         "endpoint",
         "server_host",
@@ -539,6 +570,10 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "kv_capacity_tokens",
     }
     normalized = dict(flags)
+    normalized.setdefault("prescreen_samples", None)
+    normalized.setdefault("prompt_pool_from", None)
+    normalized.setdefault("prompt_pool_min_rewarded_samples", 1)
+    normalized.setdefault("prompt_pool_unscreened_fraction", 0.10)
     normalized.setdefault("dynamic_sampling", False)
     normalized.setdefault(
         "dynamic_sampling_max_groups", 3 * cast("int", normalized.get("prompts_per_step", 1))
@@ -605,6 +640,7 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
     task_source_identity: dict[str, object] | None = None,
     *,
     dynamic_sampling_history: Mapping[str, object] | None = None,
+    prompt_pool: Mapping[str, object] | None = None,
 ) -> Path:
     """Persist all flags and source/package identity alongside private run artifacts."""
     repository_root = Path(
@@ -641,7 +677,11 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {
         "schema_version": CLI_PROVENANCE_SCHEMA_VERSION,
-        "server_memory_provenance_file": "vllm-server.memory.json"
+        "server_memory_provenance_file": (
+            "../vllm-server.memory.json"
+            if args.prescreen_samples is not None
+            else "vllm-server.memory.json"
+        )
         if args.endpoint is None
         else None,
         "flags": {
@@ -679,6 +719,7 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
         "device": device,
         "task_source_identity": task_source_identity,
         "dynamic_sampling_history": dynamic_sampling_history,
+        "prompt_pool": prompt_pool,
         "selected_prompts": (
             [asdict(prompt) for prompt in selected_prompts]
             if selected_prompts is not None
@@ -708,6 +749,17 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
             raise ValueError(
                 f"resume quantization admission differs at keys: {', '.join(admission_differences)}"
             )
+        if args.prescreen_samples is not None:
+            previous_source = cast("dict[str, object]", stored.get("task_source_identity") or {})
+            current_source = task_source_identity or {}
+            differences = _content_difference_keys(
+                previous_source.get("task_definition_content"),
+                current_source.get("task_definition_content"),
+            )
+            if differences:
+                raise ValueError(
+                    f"resume task definition differs at keys: {', '.join(differences)}"
+                )
         recorded_model = {"model": stored["flags"]["model"]}
         if "model_identity" in stored:
             recorded_model["model_identity"] = stored["model_identity"]
@@ -716,8 +768,11 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
                 recorded_model, args.model, identity=provenance["model_identity"]
             )
             or stored.get("selected_prompts") != provenance["selected_prompts"]
-            or not _task_sources_match(
-                stored.get("task_source_identity"), provenance["task_source_identity"]
+            or (
+                args.prescreen_samples is None
+                and not _task_sources_match(
+                    stored.get("task_source_identity"), provenance["task_source_identity"]
+                )
             )
         ):
             raise ValueError("resume model, task selection, or task definition differs")
@@ -977,26 +1032,104 @@ def _seed_dynamic_sampling_history_for_run(
     return summary
 
 
+def _apply_prompt_pool(
+    args: argparse.Namespace,
+    selected_prompts: Sequence[TaskPrompt],
+) -> tuple[tuple[TaskPrompt, ...], Mapping[str, object] | None]:
+    if args.prompt_pool_from is None:
+        return tuple(selected_prompts), None
+    derivation = derive_prompt_pool(
+        args.prompt_pool_from,
+        tuple(prompt.task_id for prompt in selected_prompts),
+        min_rewarded_samples=args.prompt_pool_min_rewarded_samples,
+    )
+    selection = select_prompt_pool(
+        derivation,
+        seed=args.seed,
+        unscreened_fraction=args.prompt_pool_unscreened_fraction,
+    )
+    composition = prompt_pool_provenance(
+        derivation,
+        selection,
+        {prompt.task_id: (prompt.family, prompt.variant) for prompt in selected_prompts},
+    )
+    logger.info("organism prompt pool composition: %s", composition)
+    selected_ids = set(selection.task_ids)
+    if not selected_ids:
+        raise ValueError("derived prompt pool is empty")
+    return tuple(
+        prompt for prompt in selected_prompts if prompt.task_id in selected_ids
+    ), composition
+
+
+def _content_difference_keys(stored: object, current: object, prefix: str = "") -> list[str]:
+    if isinstance(stored, Mapping) and isinstance(current, Mapping):
+        return [
+            difference
+            for key in sorted(stored.keys() | current.keys())
+            for difference in _content_difference_keys(
+                stored.get(key),
+                current.get(key),
+                f"{prefix}.{key}" if prefix else str(key),
+            )
+        ]
+    return [] if stored == current else [prefix]
+
+
+def _prompt_identities(
+    source: TaskEpisodeSource | MixedEpisodeSource,
+    coding_source: TaskEpisodeSource,
+    selected_prompts: Sequence[TaskPrompt],
+    *,
+    prescreen: bool,
+) -> dict[str, dict[str, object]]:
+    identities: dict[str, dict[str, object]] = {}
+    for prompt in selected_prompts:
+        content = task_definition_content(
+            source.tasks[prompt.task_id],
+            manifest=coding_source.leak_manifests.get(prompt.task_id),
+        )
+        if prescreen and isinstance(source, MixedEpisodeSource) and prompt.family == "ladder":
+            content["scenario"] = source.ladder.scenarios[prompt.task_id].semantic_content_payload()
+            content["arm"] = source.ladder.arms_by_task[prompt.task_id]
+        identities[prompt.task_id] = {
+            "task_definition_content": content if prescreen else semantic_content_identity(content),
+            "family": prompt.family,
+            "variant": prompt.variant,
+            "environment_id": prompt.environment_id,
+            "payment_register": prompt.payment_register,
+        }
+    return cast("dict[str, dict[str, object]]", json.loads(json.dumps(identities)))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Launch owned vLLM sampling and step-checkpointed GRPO, or use an explicit endpoint."""
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    require_rollout_api()
+    if args.prescreen_samples is None:
+        require_rollout_api()
     if args.endpoint is not None and args.kv_capacity_tokens is None:
         raise ValueError("external vLLM endpoints require --kv-capacity-tokens")
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CLI requires one CUDA device; CPU tests instantiate the trainer directly"
-        )
-    device_index = torch.cuda.current_device()
-    properties = torch.cuda.get_device_properties(device_index)
+    device_index = 0
+    if args.prescreen_samples is not None:
+        total_device_bytes = nvidia_smi_memory_info().total_bytes
+        device_name = "nvidia-smi device 0"
+    else:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CLI requires one CUDA device; CPU tests instantiate the trainer directly"
+            )
+        device_index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device_index)
+        total_device_bytes = properties.total_memory
+        device_name = properties.name
     model_configuration = AutoConfig.from_pretrained(args.model, revision=args.model_revision)
     resolved_revision = model_configuration._commit_hash  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     model_revision = resolved_revision or args.model_revision
     configuration = model_configuration.get_text_config()
     resolve_sampler_precision(args, model_configuration)
     sizing = resolve_sizing(
-        total_bytes=properties.total_memory,
+        total_bytes=total_device_bytes,
         hidden_size=configuration.hidden_size,
         layers=configuration.num_hidden_layers,
     )
@@ -1005,8 +1138,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     generations = args.num_generations or sizing.num_generations
     device: dict[str, object] = {
-        "name": properties.name,
-        "total_bytes": properties.total_memory,
+        "name": device_name,
+        "total_bytes": total_device_bytes,
         "sizing": asdict(sizing),
         "effective_max_sequence_tokens": max_tokens,
         "effective_num_generations": generations,
@@ -1081,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
         in_band_fractions=args.in_band_fractions,
         ladder_fraction=args.ladder_fraction,
     )
+    selected_prompts, prompt_pool = _apply_prompt_pool(args, selected_prompts)
     source.payment_registers.update(
         {prompt.task_id: prompt.payment_register for prompt in selected_prompts}
     )
@@ -1091,13 +1225,24 @@ def main(argv: list[str] | None = None) -> None:
         args.impossible_variant,
         args.solvable_fraction,
     )
-    dynamic_sampling_history = _seed_dynamic_sampling_history_for_run(args, selected_task_ids)
+    dynamic_sampling_history = (
+        _seed_dynamic_sampling_history_for_run(args, selected_task_ids)
+        if args.prescreen_samples is None
+        else None
+    )
+    prompt_identities = _prompt_identities(
+        source, coding_source, selected_prompts, prescreen=args.prescreen_samples is not None
+    )
+    provenance_args = argparse.Namespace(**vars(args))
+    if args.prescreen_samples is not None:
+        provenance_args.output_dir = args.output_dir / "prescreen"
     write_provenance(
-        args,
+        provenance_args,
         device,
         model_revision,
         selected_prompts,
         dynamic_sampling_history=dynamic_sampling_history,
+        prompt_pool=prompt_pool,
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
             "leak_task_source": (
@@ -1116,14 +1261,9 @@ def main(argv: list[str] | None = None) -> None:
                 else None
             ),
             "task_definition_content": {
-                task_id: semantic_content_identity(
-                    task_definition_content(
-                        coding_source.tasks[task_id],
-                        manifest=coding_source.leak_manifests.get(task_id),
-                    )
-                )
-                for task_id in selected_task_ids
-                if task_id in coding_source.tasks
+                task_id: identity["task_definition_content"]
+                for task_id, identity in prompt_identities.items()
+                if args.prescreen_samples is not None or task_id in coding_source.tasks
             },
             "task_definition_sha256": {
                 task_id: task_definition_sha256(coding_source.tasks[task_id])
@@ -1132,6 +1272,30 @@ def main(argv: list[str] | None = None) -> None:
             },
         },
     )
+    _execute_run(
+        args,
+        source=source,
+        model_revision=model_revision,
+        max_tokens=max_tokens,
+        generations=generations,
+        device_index=device_index,
+        selected_task_ids=selected_task_ids,
+        prompt_identities=prompt_identities,
+    )
+
+
+def _execute_run(  # noqa: PLR0913 - shared training and pre-screen execution settings
+    args: argparse.Namespace,
+    *,
+    source: TaskEpisodeSource | MixedEpisodeSource,
+    model_revision: str | None,
+    max_tokens: int,
+    generations: int,
+    device_index: int,
+    selected_task_ids: tuple[str, ...],
+    prompt_identities: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Admit episode concurrency against the live server before dispatching either mode."""
     server_log_path = args.output_dir / "vllm-server.log"
     server_log_offset = server_log_path.stat().st_size if server_log_path.exists() else 0
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
@@ -1147,24 +1311,41 @@ def main(argv: list[str] | None = None) -> None:
             if args.expected_peak_context_tokens is not None
             else max(1, max_tokens // 2)
         )
+        episode_count = (
+            len(selected_task_ids) * args.prescreen_samples
+            if args.prescreen_samples is not None
+            else args.prompts_per_step * generations
+        )
         rollout_concurrency = resolve_rollout_concurrency(
             args.rollout_concurrency,
-            args.prompts_per_step * generations,
+            episode_count,
             capacity_tokens=capacity_tokens,
             target_usage=admission.target_usage,
             expected_peak_context_tokens=expected_peak_context_tokens,
         )
         source.backend.request_admission = admission
         logger.info(
-            "organism model=%s episodes_per_step=%d rollout_concurrency=%d "
+            "organism model=%s episode_count=%d rollout_concurrency=%d "
             "expected_peak_context_tokens=%d kv_capacity_tokens=%d kv_admission_target=%.2f",
             args.model,
-            args.prompts_per_step * generations,
+            episode_count,
             rollout_concurrency,
             expected_peak_context_tokens,
             capacity_tokens,
             admission.target_usage,
         )
+        if args.prescreen_samples is not None:
+            run_prescreen(
+                source,
+                task_ids=selected_task_ids,
+                prompt_identities=prompt_identities,
+                output_dir=args.output_dir,
+                samples=args.prescreen_samples,
+                admission=admission,
+                episode_concurrency=rollout_concurrency,
+                expected_peak_context_tokens=expected_peak_context_tokens,
+            )
+            return
         _run_training(
             args,
             endpoint=endpoint,
