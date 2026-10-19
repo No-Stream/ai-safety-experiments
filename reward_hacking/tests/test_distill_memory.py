@@ -10,6 +10,7 @@ from liger_kernel.ops.tiled_mlp import apply_tiled_mlp
 from peft import LoraConfig, get_peft_model
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, Qwen2Config
+from trl.models.utils import disable_gradient_checkpointing
 
 from reward_hacking.distill import memory
 
@@ -304,6 +305,10 @@ def test_host_slots_are_presized_and_checkpoint_install_waits_for_trainer(
     layers = model.get_base_model().base_model.layers
     assert not layers[0].gradient_checkpointing
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    assert layers[0].gradient_checkpointing
+    assert layers[0]._gradient_checkpointing_func.__name__ == "checkpoint_with_offload"
+    with disable_gradient_checkpointing(model, {"use_reentrant": False}):
+        assert not layers[0].gradient_checkpointing
     assert layers[0].gradient_checkpointing
     assert layers[0]._gradient_checkpointing_func.__name__ == "checkpoint_with_offload"
     assert offload.registered_bytes == 2 * 7 * 16 * 4

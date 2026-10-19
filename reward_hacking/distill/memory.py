@@ -425,9 +425,13 @@ class CheckpointOffload:
 
         return checkpoint_with_offload
 
-    def enable(self, **kwargs: object) -> None:
-        """Let Trainer set its checkpoint policy, then install the offload functions."""
-        self.original_enable(**kwargs)
+    def enable(self, gradient_checkpointing_kwargs: dict[str, object] | None = None) -> None:
+        """Let Trainer set its checkpoint policy, then install the offload functions.
+
+        Mirrors ``PreTrainedModel.gradient_checkpointing_enable``: TRL re-enables checkpointing
+        after generation by passing the kwargs dict positionally.
+        """
+        self.original_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
         self.original_checkpoint_functions = []
         for index, layer in enumerate(self.layers):
             if not layer.gradient_checkpointing:
