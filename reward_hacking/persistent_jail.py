@@ -232,6 +232,7 @@ class PersistentJail:
     def _start(self) -> None:
         limits = self.resource_limits or jailed_poc.current_jail_resource_limits()
         argv = [str(jailed_poc.RESOURCE_LIMITS)]
+        argv += limits.aggregate_arguments()
         argv.append("--preserve-processes-on-oom")
         if self.episode_seconds is not None:
             argv += ["-t", f"{self.episode_seconds}s"]

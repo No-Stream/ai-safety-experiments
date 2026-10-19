@@ -50,6 +50,10 @@
 #       --gpu           refuse to start if another process holds GPU memory,
 #                       and default --timeout to 15m
 #   -n, --name NAME     systemd unit name, for `systemctl --user status`
+#       --slice NAME    place the unit in this systemd .slice (enforced mode only)
+#       --memory-peak-log PATH
+#                       append per-unit memory.peak JSONL at exit, before cgroup removal
+#                       (enforced mode only; requires /usr/bin/python3)
 #       --advisory      run WITHOUT cgroups (nice + ulimit only). Advisory, not
 #                       enforced: a job can still exceed these. Opt-in escape hatch
 #                       for hosts with no systemd user instance.
@@ -98,6 +102,8 @@ advisory=0
 no_address_cap=0
 preserve_processes_on_oom=0
 unit_name=""
+slice_name=""
+memory_peak_log=""
 
 die() {
   echo "resource-limits: $*" >&2
@@ -165,6 +171,14 @@ while [[ $# -gt 0 ]]; do
       unit_name="$2"
       shift 2
       ;;
+    --slice)
+      slice_name="${2:?--slice needs a unit name}"
+      shift 2
+      ;;
+    --memory-peak-log)
+      memory_peak_log="${2:?--memory-peak-log needs a path}"
+      shift 2
+      ;;
     -h | --help)
       usage
       exit 0
@@ -179,6 +193,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $# -gt 0 ]] || die "no command given (see --help)"
+if ((advisory)); then
+  [[ -z "$slice_name" ]] || die "--slice requires enforced cgroup limits"
+  [[ -z "$memory_peak_log" ]] || die "--memory-peak-log requires enforced cgroup limits"
+fi
+if [[ -n "$slice_name" ]]; then
+  [[ "$slice_name" =~ ^[A-Za-z0-9_.-]+\.slice$ && "$slice_name" != .* ]] || die "--slice must be a systemd .slice unit name"
+fi
 [[ -d "$chdir" ]] || die "--chdir is not a directory: $chdir"
 [[ "$cpus" =~ ^[0-9]+$ ]] || die "--cpus must be an integer, got: $cpus"
 ((cpus >= 1 && cpus <= TOTAL_CPUS)) || die "--cpus must be 1..$TOTAL_CPUS, got: $cpus"
@@ -318,7 +339,31 @@ properties=(
 [[ -n "$timeout" ]] && properties+=(-p "RuntimeMaxSec=$timeout")
 for kv in "${job_env[@]}"; do properties+=(-p "Environment=$kv"); done
 
-echo "resource-limits: unit=$unit_name cpus=$cpus/$TOTAL_CPUS mem_max=$mem_max mem_high=${mem_high:-off} threads=$threads timeout=${timeout:-none}" >&2
+# Transient Exec command properties use systemd quoting and environment expansion, rather than
+# shell syntax. Unlike unit-file command lines, this property does not expand % specifiers.
+systemd_quote_argument() {
+  local argument="$1"
+  argument="${argument//\\/\\\\}"
+  argument="${argument//\"/\\\"}"
+  argument="${argument//\$/\$\$}"
+  argument="${argument//$'\n'/\\n}"
+  argument="${argument//$'\r'/\\r}"
+  argument="${argument//$'\t'/\\t}"
+  printf '"%s"' "$argument"
+}
+
+if [[ -n "$memory_peak_log" ]]; then
+  [[ -x /usr/bin/python3 ]] || die "--memory-peak-log requires /usr/bin/python3"
+  [[ "$memory_peak_log" == /* ]] || memory_peak_log="$PWD/$memory_peak_log"
+  [[ -d "$(dirname -- "$memory_peak_log")" ]] || die "--memory-peak-log parent directory does not exist"
+  : >> "$memory_peak_log"
+  peak_command="/usr/bin/python3 $(systemd_quote_argument "$script_dir/resource_limits_memory.py") $(systemd_quote_argument "$memory_peak_log") $(systemd_quote_argument "$unit_name")"
+  properties+=(-p "MemoryAccounting=yes" -p "ExecStopPost=$peak_command")
+fi
+systemd_options=()
+[[ -n "$slice_name" ]] && systemd_options+=("--slice=$slice_name")
+
+echo "resource-limits: unit=$unit_name cpus=$cpus/$TOTAL_CPUS mem_max=$mem_max mem_high=${mem_high:-off} threads=$threads timeout=${timeout:-none} slice=${slice_name:-default}" >&2
 
 # --pipe streams the job's stdio and propagates its exit status; --wait blocks until
 # it finishes. The unit is deliberately NOT --collect'ed so its Result is still
@@ -336,7 +381,7 @@ trap 'stop_unit_after_signal 143' TERM
 # by SIGTERM, SIGINT, SIGHUP or SIGPIPE as a clean exit and --pipe then reports 0, so a job stopped
 # by hand after a crash would record success; bash turns that death into an ordinary 128+n exit.
 rc=0
-systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${properties[@]}" -- \
+systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${systemd_options[@]}" "${properties[@]}" -- \
   /bin/bash -c '"$@"; exit $?' resource-limits-job "$@" <&0 &
 systemd_run_pid=$!
 # A signal can arrive between installing the traps and registering the unit.

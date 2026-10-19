@@ -7,7 +7,7 @@ is easy to miss.
 
 Two groups, because the scripts no longer share one interpreter:
 
-  * The host's system interpreter, ``/usr/bin/python3``, 3.8.10 on the 5090 box, runs seven of them:
+  * The host's system interpreter, ``/usr/bin/python3``, 3.8.10 on the 5090 box, runs these scripts:
       - ``scripts/gpu_preflight.py``       resource-limits.sh invokes it as plain ``python3``
       - ``scripts/scan_secrets.py``        docs/episode-isolation.md documents it as ``python3``
       - ``scripts/git_precommit_scan.py``  the hook wrappers prefer ``.venv`` but fall back to
@@ -16,6 +16,7 @@ Two groups, because the scripts no longer share one interpreter:
       - ``scripts/safe_rm.py``             the owner invokes it as ``python3``
       - ``scripts/ttl_marker.py``           imported by the system-Python cleanup tools
       - ``scripts/scratch_dir.py``          the owner invokes it as ``python3``
+      - ``scripts/resource_limits_memory.py`` systemd runs it for exit-time memory accounting
   * The interpreter the jail resolves runs ``scripts/jail_assertions.py``, on both sides of
     ``scripts/run_jail_tests.sh``: inside the jail, and again outside it for the negative control.
 
@@ -53,6 +54,7 @@ SYSTEM_PYTHON_SCRIPTS = [
     "scripts/safe_rm.py",
     "scripts/ttl_marker.py",
     "scripts/scratch_dir.py",
+    "scripts/resource_limits_memory.py",
 ]
 
 JAIL_PYTHON_SCRIPTS = ["scripts/jail_assertions.py"]

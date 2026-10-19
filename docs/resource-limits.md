@@ -71,6 +71,37 @@ count cap. These remaining controls do not provide the resource guarantees of cg
 real jail tests on such a host, explicitly set `TEST_JAIL_ADVISORY_LIMITS=1` when invoking
 `make test` or `make test-select`; this selects advisory limits for that pytest process only.
 
+Use `--slice NAME.slice` to place a job below a caller-managed systemd slice. The wrapper keeps
+its per-unit limits; the parent slice can additionally enforce an aggregate memory cap across
+concurrent jobs. The caller creates and configures that slice before launching jobs and removes
+it after every child has stopped. `--slice` requires enforced mode and rejects `--advisory`.
+The wrapper does not create an aggregate budget or change the slice's OOM policy itself.
+
+Organism RL creates one transient slice for all episode jail services in the run, including
+trusted graders. At the first rollout dispatch, after trainer offload and sampler wake, it derives
+`MemoryMax` from host available RAM minus `ORGANISM_HOST_MEMORY_SAFETY_MARGIN_BYTES` (the existing
+host-memory safety margin). The slice has zero swap allowance and `memory.oom.group=0`; the trainer
+stays outside it, and each episode retains its own limits and OOM handling. Startup values are logged
+and appended to `startup-jail-memory.jsonl`, referenced from the run provenance, while
+`jail-memory-peaks.jsonl` records each jail service's peak at exit. The run closes the slice after
+joining its rollout workers; subsequent starts derive a new budget and preserve earlier records.
+
+`--memory-peak-log PATH` appends one JSONL record per unit when the service stops. Its
+`ExecStopPost` command reads cgroup v2 `memory.peak` before systemd removes the cgroup, including
+after successful exits, failed commands, timeouts and OOM kills. This avoids querying a successful
+transient unit after it has disappeared. Each record contains `unit_name`, `memory_peak_bytes`,
+`unavailable_reason`, `service_result`, `exit_code` and `exit_status`. The peak includes descendants
+and the small exit recorder; a persistent jail records its whole supervisor lifetime rather than
+each command separately. Concurrent services append complete records to the same log.
+
+The recorder uses `/usr/bin/python3` and requires a log directory writable by the user manager's
+service processes. Relative paths resolve against the wrapper's invocation directory. This option
+also rejects advisory mode. It does not require systemd's newer `MemoryPeak` D-Bus property: it
+uses `ExecStopPost` and the kernel file directly. When unified membership or a readable
+`memory.peak` file is unavailable, the record explicitly sets `memory_peak_bytes` to `null` and
+explains why; it never substitutes current memory or a per-process RSS measurement. Unexpected
+read errors, invalid peak values and log-write failures fail the recorder visibly.
+
 The working-directory default is worth knowing because it was a bug, not a choice:
 `systemd-run` puts the job in `$HOME` regardless of where you ran the wrapper, so a
 relative invocation broke in a confusing way — `-- uv sync` failed with "No

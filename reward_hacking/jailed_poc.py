@@ -96,6 +96,21 @@ class JailResourceLimits:
 
     mode: Literal["enforced", "advisory"] = "enforced"
     systemd_user_state: str | None = None
+    slice_name: str | None = None
+    memory_peak_log: Path | None = None
+
+    def aggregate_arguments(self) -> list[str]:
+        """Keep the aggregate controls outside the isolation boundary."""
+        if self.mode == "advisory" and (
+            self.slice_name is not None or self.memory_peak_log is not None
+        ):
+            raise ValueError("aggregate jail limits require enforced mode")
+        arguments: list[str] = []
+        if self.slice_name is not None:
+            arguments += ["--slice", self.slice_name]
+        if self.memory_peak_log is not None:
+            arguments += ["--memory-peak-log", str(self.memory_peak_log)]
+        return arguments
 
     def to_json_dict(self) -> dict[str, object]:
         """Record whether the run used cgroups or explicitly requested advisory limits."""
@@ -615,6 +630,7 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     process_timeout = _process_timeout_cap(process_timeout_seconds)
     limits = _JAIL_RESOURCE_LIMITS.get() if resource_limits is None else resource_limits
     argv: list[str] = [str(RESOURCE_LIMITS), "-t", timeout]
+    argv += limits.aggregate_arguments()
     if limits.mode == "advisory":
         argv.append("--advisory")
     if cpus is not None:

@@ -53,6 +53,8 @@ from reward_hacking.organism_rl.dynamic_sampling_history import (
     seed_dynamic_sampling_history,
 )
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
+from reward_hacking.organism_rl.jail_budget import JailBudgetSlice
+from reward_hacking.organism_rl.jail_source import BudgetedEpisodeSource
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
@@ -740,6 +742,11 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {
         "schema_version": CLI_PROVENANCE_SCHEMA_VERSION,
+        "jail_memory_provenance_file": (
+            "../startup-jail-memory.jsonl"
+            if args.prescreen_samples is not None
+            else "startup-jail-memory.jsonl"
+        ),
         "server_memory_provenance_file": (
             "../vllm-server.memory.json"
             if args.prescreen_samples is not None
@@ -903,6 +910,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
     model_revision: str | None,
     source: TaskEpisodeSource | MixedEpisodeSource,
     task_ids: tuple[str, ...],
+    jail_budget: JailBudgetSlice | None = None,
 ) -> None:
     """Construct the shared LoRA/memory path and launch step-checkpointed GRPO."""
     phase = VLLMPhaseController(
@@ -961,7 +969,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             prepare_checkpoint_offload(model, max_tokens) if options.offload_checkpoints else None
         )
         rollout = OrganismRollout(
-            source,
+            BudgetedEpisodeSource(source, jail_budget) if jail_budget is not None else source,
             source.backend.tokenizer,
             max_sequence_tokens=max_tokens,
             teacher_path=args.teacher_path if args.teacher_beta else None,
@@ -1373,7 +1381,10 @@ def _execute_run(  # noqa: PLR0913 - shared training and pre-screen execution se
     """Admit episode concurrency against the live server before dispatching either mode."""
     server_log_path = args.output_dir / "vllm-server.log"
     server_log_offset = server_log_path.stat().st_size if server_log_path.exists() else 0
-    with server_endpoint(args, model_revision, max_tokens) as endpoint:
+    with (
+        server_endpoint(args, model_revision, max_tokens) as endpoint,
+        JailBudgetSlice(args.output_dir) as jail_budget,
+    ):
         if args.endpoint is None:
             with server_log_path.open("rb") as log_file:
                 log_file.seek(server_log_offset)
@@ -1411,7 +1422,7 @@ def _execute_run(  # noqa: PLR0913 - shared training and pre-screen execution se
         )
         if args.prescreen_samples is not None:
             run_prescreen(
-                source,
+                BudgetedEpisodeSource(source, jail_budget),
                 task_ids=selected_task_ids,
                 prompt_identities=prompt_identities,
                 output_dir=args.output_dir,
@@ -1431,4 +1442,5 @@ def _execute_run(  # noqa: PLR0913 - shared training and pre-screen execution se
             model_revision=model_revision,
             source=source,
             task_ids=selected_task_ids,
+            jail_budget=jail_budget,
         )

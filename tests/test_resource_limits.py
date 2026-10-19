@@ -334,6 +334,93 @@ def test_oom_result_diagnostic_matches_the_unit_policy(
     assert expected_diagnostic in completed.stderr
 
 
+def test_slice_and_memory_peak_hook_are_explicit(tmp_path: Path) -> None:
+    environment, capture_path = _fake_systemd_environment(tmp_path)
+    log_path = tmp_path / 'peak "quoted" $literal %name.jsonl'
+    completed = subprocess.run(  # noqa: S603 - repo limiter with a synthetic systemd manager
+        [
+            str(LIMITER),
+            "--slice",
+            "episodes-test.slice",
+            "--memory-peak-log",
+            str(log_path),
+            "--",
+            "/bin/true",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    arguments = capture_path.read_bytes().decode().split("\0")
+    assert "--slice=episodes-test.slice" in arguments
+    assert "MemoryAccounting=yes" in arguments
+    hooks = [argument for argument in arguments if argument.startswith("ExecStopPost=")]
+    assert len(hooks) == 1
+    assert "resource_limits_memory.py" in hooks[0]
+    assert r"\"quoted\"" in hooks[0]
+    assert "$$literal" in hooks[0]
+    assert "%name" in hooks[0]
+    assert "%%name" not in hooks[0]
+    assert "--collect" not in arguments
+
+
+@pytest.mark.parametrize("option", ["--slice", "--memory-peak-log"])
+def test_advisory_refuses_cgroup_options(tmp_path: Path, option: str) -> None:
+    completed = subprocess.run(  # noqa: S603 - repo limiter, literal arguments
+        [str(LIMITER), "--advisory", option, str(tmp_path / "value"), "--", "/bin/true"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert f"{option} requires enforced cgroup limits" in completed.stderr
+
+
+@pytest.mark.parametrize("slice_name", ["../episodes.slice", "episodes", "episodes.slice/other"])
+def test_invalid_slice_name_is_refused(tmp_path: Path, slice_name: str) -> None:
+    environment, capture_path = _fake_systemd_environment(tmp_path)
+    completed = subprocess.run(  # noqa: S603 - repo limiter with a synthetic systemd manager
+        [str(LIMITER), "--slice", slice_name, "--", "/bin/true"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--slice must be a systemd .slice unit name" in completed.stderr
+    assert not capture_path.exists()
+
+
+@pytest.mark.skipif(
+    not _user_manager_is_available(), reason="requires a usable systemd user manager"
+)
+@pytest.mark.parametrize("command", ["/bin/true", "/bin/false"])
+def test_peak_is_recorded_before_transient_unit_cleanup(tmp_path: Path, command: str) -> None:
+    log_path = tmp_path / 'peak "quoted" $literal %name.jsonl'
+    completed = subprocess.run(  # noqa: S603 - real limiter and literal command paths
+        [str(LIMITER), "--memory-peak-log", str(log_path), "--", command],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == (0 if command == "/bin/true" else 1), completed.stderr
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["service_result"] == ("success" if command == "/bin/true" else "exit-code")
+    if record["memory_peak_bytes"] is None:
+        assert record["unavailable_reason"]
+    else:
+        assert record["memory_peak_bytes"] > 0
+        assert record["unavailable_reason"] is None
+
+
 @pytest.mark.skipif(
     not _user_manager_is_available(), reason="requires a usable systemd user manager"
 )

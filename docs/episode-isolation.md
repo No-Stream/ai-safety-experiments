@@ -226,6 +226,30 @@ read-only. One restored-gate attempt stopped earlier because the unrelated outsi
 negative control timed out; the following full attempt passed. These live checks certified the
 unshare backend; bwrap was unavailable.
 
+The aggregate-memory regression in
+`reward_hacking/tests/test_jail_aggregate_memory.py` starts two persistent episode units under one
+run slice, then sets and verifies a 160 MiB aggregate cap with zero swap. Each episode has a
+384 MiB cap. A bounded 256 MiB allocator therefore fits the episode limit but exceeds the shared
+limit. The test requires the kernel's parent `memory.events` OOM-kill counter to increase, the
+allocating command to return exit 137, and the other episode's concurrent command to remain alive.
+Both supervisors must accept another command afterward, the slice must remain active, and the
+pytest process must be outside that slice. The test checks live parent and child cgroup properties
+before allocating and requires a readable memory-peak record for each episode after teardown;
+advisory mode cannot establish this contract.
+
+On 2026-10-18, this aggregate test passed against live cgroups and wrote two episode peak-memory
+records. The live negative control raised the shared cap from 160 MiB to 384 MiB immediately before
+allocation, leaving the episode caps at 384 MiB. The bounded allocator then completed with exit 0
+and the test failed at its required exit-137 result. Restoring the shared cap restored the gate.
+One earlier attempt skipped because the systemd user bus was unreachable; a skipped attempt does
+not establish this contract. Launcher argument tests cover propagation separately.
+The launcher propagation test was attacked by removing the `--slice` argument from the shared
+argument builder: it failed because that argument was absent. The peak-recording tests were
+attacked by replacing the actual peak read with zero; all four termination-status cases failed.
+Both mutations were reverted and their targeted tests passed again. These controls establish that
+the CPU tests detect missing propagation and fabricated peak values; the live shared-cap control
+establishes that the bounded allocator exceeds the aggregate limit while fitting its episode cap.
+
 A CPU-only comparison on the same date ran 20 `true` commands per mode with the unshare backend
 and explicitly advisory fixture limits. Per-command jails took 18.995 seconds in total, with a
 0.917-second median command. The persistent jail took 1.039 seconds including startup and teardown;
