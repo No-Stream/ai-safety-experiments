@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
@@ -98,11 +99,23 @@ class JailResourceLimits:
     systemd_user_state: str | None = None
     slice_name: str | None = None
     memory_peak_log: Path | None = None
+    per_command_memory_max_bytes: int | None = None
+
+    def command_memory_max(self, requested: str | None) -> str | None:
+        """Keep smaller caller limits while bounding every service in the run's slice."""
+        if self.per_command_memory_max_bytes is None:
+            return requested
+        maximum = self.per_command_memory_max_bytes
+        if requested is not None:
+            maximum = min(maximum, jail_memory_bytes(requested))
+        return str(maximum)
 
     def aggregate_arguments(self) -> list[str]:
         """Keep the aggregate controls outside the isolation boundary."""
         if self.mode == "advisory" and (
-            self.slice_name is not None or self.memory_peak_log is not None
+            self.slice_name is not None
+            or self.memory_peak_log is not None
+            or self.per_command_memory_max_bytes is not None
         ):
             raise ValueError("aggregate jail limits require enforced mode")
         arguments: list[str] = []
@@ -118,6 +131,16 @@ class JailResourceLimits:
 
 
 ENFORCED_JAIL_RESOURCE_LIMITS = JailResourceLimits()
+
+
+def jail_memory_bytes(value: str) -> int:
+    """Convert the integer byte or IEC-suffixed limits used by jail callers to bytes."""
+    match = re.fullmatch(r"([0-9]+)([KMGTPE]?)", value)
+    if match is None:
+        raise ValueError(f"Jail memory limit must be integer bytes or an IEC size: {value!r}")
+    amount, suffix = match.groups()
+    return int(amount) * 1024 ** ("KMGTPE".index(suffix) + 1 if suffix else 0)
+
 
 _JAIL_RESOURCE_LIMITS: ContextVar[JailResourceLimits] = ContextVar(
     "jail_resource_limits", default=ENFORCED_JAIL_RESOURCE_LIMITS
@@ -635,6 +658,7 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
         argv.append("--advisory")
     if cpus is not None:
         argv += ["--cpus", str(cpus)]
+    mem_max = limits.command_memory_max(mem_max)
     if mem_max is not None:
         argv += ["--mem-max", mem_max]
     argv += ["--", str(EPISODE_JAIL), "--episode-dir", str(episode_dir)]

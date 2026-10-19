@@ -245,7 +245,7 @@ class PersistentJail:
             argv.append("--advisory")
         if self.cpus is not None:
             argv += ["--cpus", str(self.cpus)]
-        _append_optional_resource_limit(argv, "--mem-max", self.mem_max)
+        _append_optional_resource_limit(argv, "--mem-max", limits.command_memory_max(self.mem_max))
         _append_optional_resource_limit(argv, "--mem-swap-max", self.mem_swap_max)
         supervisor_source = _SUPERVISOR_SOURCE.encode()
         argv += [

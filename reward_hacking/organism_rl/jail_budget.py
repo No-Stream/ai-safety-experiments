@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Self
 
 import psutil
 
-from reward_hacking.jailed_poc import JailResourceLimits
+from reward_hacking.harness.loop import episode_limits
+from reward_hacking.jailed_poc import JailResourceLimits, jail_memory_bytes
 from reward_hacking.organism_rl.phases import (
     DEFAULT_HOST_MEMORY_SAFETY_MARGIN_BYTES,
     HOST_MEMORY_SAFETY_MARGIN_ENV,
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
 SYSTEMD_TIMEOUT_SECONDS = 30
+MINIMUM_COMMAND_MEMORY_BYTES = 1024**3
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +44,20 @@ def resolve_jail_memory_budget(startup_available_bytes: int, safety_margin_bytes
             f"available_bytes={startup_available_bytes} safety_margin_bytes={safety_margin_bytes}"
         )
     return memory_max_bytes
+
+
+def resolve_per_command_memory_budget(memory_max_bytes: int, existing_max_bytes: int) -> int:
+    """Refuse hosts without enough space for a useful command and concurrent episodes."""
+    # Leave half for concurrent small commands; dividing by all rollout workers would
+    # unnecessarily starve commands while most workers are idle or doing inference.
+    per_command_bytes = min(existing_max_bytes, memory_max_bytes // 2)
+    if per_command_bytes < MINIMUM_COMMAND_MEMORY_BYTES:
+        raise ValueError(
+            "Jail per-command memory budget is below the 1 GiB floor; free host RAM before starting episodes: "
+            f"per_command_memory_max_bytes={per_command_bytes} memory_max_bytes={memory_max_bytes} "
+            f"existing_max_bytes={existing_max_bytes}"
+        )
+    return per_command_bytes
 
 
 def _systemd_command(argv: list[str]) -> str:
@@ -100,12 +116,17 @@ class JailBudgetSlice:
             memory_max_bytes = resolve_jail_memory_budget(
                 startup_available_bytes, safety_margin_bytes
             )
+            _, existing_memory_max = episode_limits()
+            per_command_memory_max_bytes = resolve_per_command_memory_budget(
+                memory_max_bytes, jail_memory_bytes(existing_memory_max)
+            )
             ready = False
             try:
                 self._start(memory_max_bytes)
                 limits = JailResourceLimits(
                     slice_name=self.slice_name,
                     memory_peak_log=self.output_dir / "jail-memory-peaks.jsonl",
+                    per_command_memory_max_bytes=per_command_memory_max_bytes,
                 )
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 provenance = {
@@ -113,6 +134,7 @@ class JailBudgetSlice:
                     "startup_available_bytes": startup_available_bytes,
                     "safety_margin_bytes": safety_margin_bytes,
                     "memory_max_bytes": memory_max_bytes,
+                    "per_command_memory_max_bytes": per_command_memory_max_bytes,
                     "memory_swap_max_bytes": 0,
                     "memory_oom_group": 0,
                     "trainer_excluded": True,
@@ -123,11 +145,13 @@ class JailBudgetSlice:
                     stream.write(json.dumps(provenance) + "\n")
                 logger.info(
                     "Jail aggregate memory budget slice=%s available_bytes=%d safety_margin_bytes=%d "
-                    "memory_max_bytes=%d memory_swap_max_bytes=0 memory_oom_group=0 trainer_excluded=true",
+                    "memory_max_bytes=%d per_command_memory_max_bytes=%d "
+                    "memory_swap_max_bytes=0 memory_oom_group=0 trainer_excluded=true",
                     self.slice_name,
                     startup_available_bytes,
                     safety_margin_bytes,
                     memory_max_bytes,
+                    per_command_memory_max_bytes,
                 )
                 self._limits = limits
                 ready = True

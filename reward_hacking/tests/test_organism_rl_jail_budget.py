@@ -12,23 +12,26 @@ import pytest
 
 from reward_hacking.organism_rl import jail_budget
 
+GIB = 1024**3
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 
 @pytest.fixture
 def slice_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[list[str]]:
+    monkeypatch.setattr(jail_budget, "episode_limits", lambda: (2, "8G"))
     calls: list[list[str]] = []
     cgroup = tmp_path / "cgroup" / "orgjailsfixture.slice"
     cgroup.mkdir(parents=True)
-    (cgroup / "memory.max").write_text("1000\n")
+    (cgroup / "memory.max").write_text(f"{7 * GIB}\n")
     (cgroup / "memory.swap.max").write_text("0\n")
     (cgroup / "memory.oom.group").write_text("0\n")
     monkeypatch.setattr(jail_budget, "CGROUP_V2_ROOT", tmp_path / "cgroup")
     monkeypatch.setattr(
-        jail_budget.psutil, "virtual_memory", lambda: SimpleNamespace(available=1200)
+        jail_budget.psutil, "virtual_memory", lambda: SimpleNamespace(available=9 * GIB)
     )
-    monkeypatch.setenv("ORGANISM_HOST_MEMORY_SAFETY_MARGIN_BYTES", "200")
+    monkeypatch.setenv("ORGANISM_HOST_MEMORY_SAFETY_MARGIN_BYTES", str(2 * GIB))
 
     def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
@@ -40,8 +43,9 @@ def slice_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[list[str
 
 
 def test_first_rollout_snapshot_is_shared_and_recorded(
-    slice_host: list[list[str]], tmp_path: Path
+    slice_host: list[list[str]], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level("INFO", logger=jail_budget.__name__)
     budget = jail_budget.JailBudgetSlice(tmp_path)
     assert slice_host == []
     with budget, ThreadPoolExecutor(max_workers=4) as executor:
@@ -56,7 +60,7 @@ def test_first_rollout_snapshot_is_shared_and_recorded(
         assert start[start.index("MemoryMax") : start.index("MemoryMax") + 3] == [
             "MemoryMax",
             "t",
-            "1000",
+            str(7 * GIB),
         ]
         assert start[start.index("MemorySwapMax") : start.index("MemorySwapMax") + 3] == [
             "MemorySwapMax",
@@ -65,9 +69,12 @@ def test_first_rollout_snapshot_is_shared_and_recorded(
         ]
         assert "PIDs" not in start
         provenance = json.loads((tmp_path / "startup-jail-memory.jsonl").read_text())
-        assert provenance["startup_available_bytes"] == 1200
-        assert provenance["safety_margin_bytes"] == 200
-        assert provenance["memory_max_bytes"] == 1000
+        assert provenance["startup_available_bytes"] == 9 * GIB
+        assert provenance["safety_margin_bytes"] == 2 * GIB
+        assert provenance["memory_max_bytes"] == 7 * GIB
+        assert limits[0].per_command_memory_max_bytes == 7 * GIB // 2
+        assert provenance["per_command_memory_max_bytes"] == 7 * GIB // 2
+        assert f"per_command_memory_max_bytes={7 * GIB // 2}" in caplog.text
         assert provenance["memory_oom_group"] == 0
         assert provenance["trainer_excluded"] is True
     assert len([call for call in slice_host if "StartTransientUnit" in call]) == 1
@@ -77,7 +84,7 @@ def test_first_rollout_snapshot_is_shared_and_recorded(
         budget.limits()
 
 
-@pytest.mark.parametrize("available", [0, 199, 200])
+@pytest.mark.parametrize("available", [0, 2 * GIB - 1, 2 * GIB])
 def test_insufficient_headroom_refuses_before_creating_slice(
     slice_host: list[list[str]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available: int
 ) -> None:
@@ -153,3 +160,38 @@ def test_resume_keeps_startup_provenance(slice_host: list[list[str]], tmp_path: 
     ]
     assert [record["slice_name"] for record in records] == [first.slice_name, second.slice_name]
     assert first.slice_name != second.slice_name
+
+
+@pytest.mark.parametrize(
+    ("slice_bytes", "existing_bytes", "expected"),
+    [
+        (7 * GIB, 8 * GIB, 7 * GIB // 2),
+        (32 * GIB, 8 * GIB, 8 * GIB),
+        (7 * GIB, GIB, GIB),
+        (2 * GIB + 1, 8 * GIB, GIB),
+    ],
+)
+def test_resolve_per_command_memory_budget(
+    slice_bytes: int, existing_bytes: int, expected: int
+) -> None:
+    assert jail_budget.resolve_per_command_memory_budget(slice_bytes, existing_bytes) == expected
+
+
+@pytest.mark.parametrize(
+    ("slice_bytes", "existing_bytes"), [(2 * GIB - 1, 8 * GIB), (8 * GIB, GIB - 1)]
+)
+def test_per_command_budget_refuses_below_one_gib(slice_bytes: int, existing_bytes: int) -> None:
+    with pytest.raises(ValueError, match=r"per-command.*below.*1 GiB"):
+        jail_budget.resolve_per_command_memory_budget(slice_bytes, existing_bytes)
+
+
+def test_small_per_command_budget_refuses_before_systemd(
+    slice_host: list[list[str]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        jail_budget.psutil, "virtual_memory", lambda: SimpleNamespace(available=4 * GIB - 1)
+    )
+    with pytest.raises(ValueError, match=r"per-command.*below.*1 GiB"):
+        jail_budget.JailBudgetSlice(tmp_path).limits()
+    assert slice_host == []
+    assert not (tmp_path / "startup-jail-memory.jsonl").exists()
