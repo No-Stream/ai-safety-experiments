@@ -42,6 +42,7 @@ from reward_hacking.organism_rl.precision import (
     assert_fp32_training_state,
     record_precision_provenance,
 )
+from reward_hacking.organism_rl.training_memory import MicrostepMemoryRecorder
 
 # One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
 DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
@@ -305,8 +306,13 @@ class _SyncCallback(TrainerCallback):
         metrics = self.trainer._metrics["train"]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         if args.device.type == "cuda":
             metrics["organism/trainer_peak_allocated_gib"].append(
-                torch.cuda.max_memory_allocated(args.device) / 2**30
+                max(
+                    torch.cuda.max_memory_allocated(args.device),
+                    self.trainer.training_step_peak_allocated_bytes,
+                )
+                / 2**30
             )
+            self.trainer.training_step_peak_allocated_bytes = 0
             torch.cuda.reset_peak_memory_stats(args.device)
         started = time.perf_counter()
         self.phase.after_optimizer_step(self.trainer)
@@ -435,6 +441,12 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
 
         kwargs["rollout_func"] = captured_rollout
         super().__init__(*args, **kwargs)
+        if self.args.output_dir is None:
+            raise ValueError("Organism training requires an output directory")
+        self.microstep_memory = MicrostepMemoryRecorder(
+            Path(self.args.output_dir) / "trainer-memory.jsonl"
+        )
+        self.training_step_peak_allocated_bytes = 0
         if self.model is None:
             raise RuntimeError("Organism trainer requires a model")
         assert_fp32_training_state(self.model, self._precision_optimizer())
@@ -765,6 +777,28 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         )
 
     @override
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        """Include backward in each row's peak, excluding rollout and trainer restore."""
+        skipped_before = self._rows_skipped_this_step
+        completed = False
+        try:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            completed = True
+            return loss
+        finally:
+            peak = self.microstep_memory.finish(
+                completed=completed, skipped=self._rows_skipped_this_step > skipped_before
+            )
+            self.training_step_peak_allocated_bytes = max(
+                self.training_step_peak_allocated_bytes, peak
+            )
+
+    @override
     def _prepare_inputs(self, generation_batch: dict[str, Any]) -> dict[str, Any]:
         """Cut each training micro-batch to its live columns and count what the trim removed."""
         inputs: dict[str, Any] = super()._prepare_inputs(generation_batch)
@@ -790,6 +824,16 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             )
             self._trim_padded_tokens_this_step = 0
             self._trim_trimmed_tokens_this_step = 0
+        device = trimmed["completion_ids"].device
+        self.microstep_memory.begin(
+            device,
+            step=int(self.state.global_step),
+            microstep=int(self._step),
+            sequence_tokens=trimmed["prompt_ids"].numel() + trimmed["completion_ids"].numel(),
+            assistant_tokens=int((trimmed["completion_mask"] * trimmed["tool_mask"]).sum().item())
+            if device.type == "cuda"
+            else 0,
+        )
         return trimmed
 
     def _sampler_correction(

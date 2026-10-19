@@ -32,6 +32,7 @@ from safetensors import safe_open
 
 from grpo.gpu_memory import GIBIBYTE_BYTES, gpu_memory_info, nvidia_smi_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
+from reward_hacking.organism_rl.training_memory import record_training_phase_memory
 from reward_hacking.organism_rl.transfers import PolicyTransfers
 from reward_hacking.vllm_server import RUNTIME_FREE_VRAM_FLOOR_BYTES
 
@@ -650,7 +651,20 @@ class VLLMPhaseController:
         self.sleep()
         if self._transfers is None:
             raise RuntimeError("phase controller must initialize before training")
+        memory_path = self.adapter_root.parent / "trainer-memory.jsonl"
+        record_training_phase_memory(
+            memory_path,
+            self.training_device,
+            step=int(trainer.state.global_step),
+            phase="sampler_sleep",
+        )
         self._transfers.restore(trainer.optimizer)
+        record_training_phase_memory(
+            memory_path,
+            self.training_device,
+            step=int(trainer.state.global_step),
+            phase="trainer_restored",
+        )
         self._training = True
 
     def after_optimizer_step(self, trainer: PhaseTrainer) -> None:
