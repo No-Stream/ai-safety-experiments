@@ -614,6 +614,40 @@ def test_same_step_and_weights_keep_served_identity(
     second.close()
 
 
+def test_sync_keeps_only_the_served_adapter_on_disk(
+    server: tuple[httpx2.MockTransport, ServerState], tmp_path: Path
+) -> None:
+    transport, state = server
+    adapter_root = tmp_path / "served-adapters"
+    stale_from_previous_attempt = [
+        adapter_root / "training" / "step-00000002-dead",
+        adapter_root / "serving" / "organism-step-00000002-dead",
+    ]
+    for directory in stale_from_previous_attempt:
+        directory.mkdir(parents=True)
+        (directory / "adapter_model.safetensors").write_bytes(b"stale")
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        adapter_root,
+        training_device=torch.device("cpu"),
+        http_transport=transport,
+    )
+    trainer = ToyTrainer(ToyAdapter(), None, ToyState())
+    controller.initialize(trainer, step=2)
+    for step in (3, 4):
+        controller.before_training(trainer)
+        trainer.state.global_step = step
+        controller.after_optimizer_step(trainer)
+
+    remaining = sorted(path for path in adapter_root.glob("*/*") if path.is_dir())
+    served_path = Path(str(state.payloads[-1]["lora_path"]))
+    assert served_path in remaining
+    assert all(path.name.startswith("step-00000004-") or path == served_path for path in remaining)
+    assert len(remaining) <= 2
+    controller.close()
+
+
 def test_initialize_unloads_stale_organism_adapters(
     server: tuple[httpx2.MockTransport, ServerState], tmp_path: Path
 ) -> None:

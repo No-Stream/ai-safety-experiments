@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -702,6 +703,7 @@ class VLLMPhaseController:
         self._adapter_name = name
         self.backend.model_id = name
         self._assert_served()
+        self._remove_unserved_adapter_dirs(keep={adapter_dir, served_dir})
         loaded = time.perf_counter()
         self.last_sync_seconds = {
             "save": saved - started,
@@ -712,3 +714,12 @@ class VLLMPhaseController:
             "lora_load_http": loaded - woken,
         }
         logger.info("synchronized LoRA step=%d model=%s", step, name)
+
+    def _remove_unserved_adapter_dirs(self, *, keep: set[Path]) -> None:
+        # vLLM has unloaded every earlier adapter by now, and retained checkpoints hold the
+        # adapters worth keeping, so per-step copies are pure duplicates (~330 MB per 9B step).
+        kept = {path.resolve() for path in keep}
+        for subdirectory in ("training", "serving"):
+            for path in sorted((self.adapter_root / subdirectory).glob("*")):
+                if path.is_dir() and not path.is_symlink() and path.resolve() not in kept:
+                    shutil.rmtree(path)
