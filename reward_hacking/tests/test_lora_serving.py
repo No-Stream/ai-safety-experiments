@@ -228,6 +228,9 @@ def test_ilcb_adapter_resolver_serves_a_qwen35_copy(tmp_path: Path) -> None:
 
 def test_ladder_lora_modules_use_prepared_adapter_path(tmp_path: Path) -> None:
     adapter = _write_adapter(tmp_path / "checkpoint-20", base_model="Qwen/Qwen3.5-9B")
+    second_adapter = _write_adapter(
+        tmp_path / "checkpoint-30", base_model="Qwen/Qwen3.5-9B", keys=(FLAT_KEY,)
+    )
     server_config = VLLMServerConfig(
         model="Qwen/Qwen3.5-9B",
         revision="test-revision",
@@ -235,17 +238,34 @@ def test_ladder_lora_modules_use_prepared_adapter_path(tmp_path: Path) -> None:
         gpu_memory_utilization=0.55,
         enable_lora=True,
         max_lora_rank=16,
-        lora_modules=(("student", str(adapter)),),
+        lora_modules=(("student", str(adapter)), ("control", str(second_adapter))),
         lora_serving_dir=tmp_path / "ladder-run" / "vllm-adapters",
     )
 
     command = server_config.command()
+    repeated_command = server_config.command()
 
     serving_dir = tmp_path / "ladder-run" / "vllm-adapters"
-    module_digest = hashlib.sha256(b"student").hexdigest()[:16]
-    served_adapter = serving_dir / module_digest
-    assert command[command.index("--lora-modules") + 1] == f"student={served_adapter}"
-    assert _weight_keys(served_adapter) == {NESTED_KEY}
+    assert command[:3] == ["vllm", "serve", "Qwen/Qwen3.5-9B"]
+
+    def module_paths(argv: list[str]) -> dict[str, Path]:
+        marker = argv.index("--lora-modules") + 1
+        modules: dict[str, Path] = {}
+        while marker < len(argv) and not argv[marker].startswith("--"):
+            name, path = argv[marker].split("=", 1)
+            assert name not in modules, f"duplicate LoRA module: {name}"
+            modules[name] = Path(path)
+            marker += 1
+        return modules
+
+    served_adapters = module_paths(command)
+    repeated_adapters = module_paths(repeated_command)
+    assert served_adapters.keys() == {"student", "control"}
+    assert len(set(served_adapters.values())) == len(served_adapters)
+    assert all(path.is_relative_to(serving_dir) for path in served_adapters.values())
+    assert not {adapter, second_adapter} & set(served_adapters.values())
+    assert served_adapters == repeated_adapters
+    assert all(_weight_keys(path) == {NESTED_KEY} for path in served_adapters.values())
 
 
 @dataclass(frozen=True, slots=True)

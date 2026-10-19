@@ -1,15 +1,24 @@
 """CPU contracts for the Docker command boundary; no daemon required."""
 
+import base64
 import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
+from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 import pytest
 
@@ -34,6 +43,90 @@ from reward_hacking.ladder.loop import _restore_shell_state, _shell_wrapper, _Sh
 from scripts import run_docker_jail_tests
 
 IMAGE = "python@sha256:" + "a" * 64
+
+
+class _PhaseClock:
+    def __init__(self, initial_seconds: float) -> None:
+        self._now = initial_seconds
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def test_missing_image_is_a_setup_result_before_live_gate_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    calls: list[list[str]] = []
+
+    def docker_command(
+        arguments: list[str], **_options: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        assert arguments[1:3] == ["image", "inspect"], (
+            "missing images must not start gate containers or pulls"
+        )
+        return subprocess.CompletedProcess(arguments, 1, "", "No such image")
+
+    monkeypatch.setattr(backend.subprocess, "run", docker_command)
+    result = run_in_docker(
+        workspace, "synthetic-episode-command", config=DockerConfig(IMAGE, tmp_path / "gate")
+    )
+    assert result.exit_code == 125
+    assert "No such image" in result.stderr
+    assert calls
+    assert all(arguments[1:3] == ["image", "inspect"] for arguments in calls)
+
+
+def test_present_image_still_requires_live_gate_before_episode_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    calls: list[list[str]] = []
+    events: list[str] = []
+    episode_argv: list[str] = []
+
+    def docker_command(
+        arguments: list[str], **_options: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[1:3] == ["image", "inspect"]:
+            events.append("image-inspection")
+            output = "null" if "{{json .Config.Volumes}}" in arguments else IMAGE
+            return subprocess.CompletedProcess(arguments, 0, output, "")
+        if arguments[1:3] == ["rm", "--force"]:
+            events.append("container-cleanup")
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        if arguments[1] == "run":
+            if any("synthetic-episode-command" in argument for argument in arguments):
+                raise AssertionError("episode command ran before the live gate passed")
+            events.append("docker-run")
+            raise RuntimeError("synthetic live gate transport failure")
+        raise AssertionError(f"unexpected Docker command: {arguments[1:]}")
+
+    def run_episode_command(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        episode_argv.extend(argv)
+        raise RuntimeError("synthetic episode command reached its executor")
+
+    monkeypatch.setattr(backend, "_PASSED_GATES", set())
+    monkeypatch.setattr(backend.subprocess, "run", docker_command)
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_episode_command)
+    with pytest.raises(RuntimeError, match="synthetic live gate transport failure"):
+        run_in_docker(
+            workspace, "synthetic-episode-command", config=DockerConfig(IMAGE, tmp_path / "gate")
+        )
+    first_gate_run = events.index("docker-run")
+    assert first_gate_run > 0
+    assert all(event == "image-inspection" for event in events[:first_gate_run])
+    assert all(
+        "synthetic-episode-command" not in argument for arguments in calls for argument in arguments
+    )
+    assert not episode_argv
 
 
 def test_network_cases_use_local_tcp_and_dns_controls(tmp_path: Path) -> None:
@@ -497,10 +590,48 @@ def test_run_in_docker_persists_bounded_junit_xml_separately_from_stdout(
 
     assert result.stdout == "grader stdout"
     assert result.junit_xml == report_xml
-    assert events == ["grader-finished", "report-read", "container-cleanup"]
+    assert len(events) == 3
+    assert set(events) == {"grader-finished", "report-read", "container-cleanup"}
     evidence = read_jsonl(evidence_path)[-1]
     assert evidence["stdout"] == "grader stdout"
     assert evidence["junit_xml"] == report_xml
+
+
+def test_host_timeout_still_removes_the_episode_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    config = DockerConfig(IMAGE, tmp_path / "gate.json")
+    events: list[str] = []
+    docker_argv: list[str] = []
+    cleanup_argv: list[str] = []
+
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "prepare_runtime_mountpoints", lambda *_args: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+
+    def run_docker(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        docker_argv.extend(argv)
+        events.append("host-timeout")
+        return 124, "partial output", "Docker command deadline exceeded", True, False
+
+    def cleanup_docker(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        cleanup_argv.extend(argv)
+        events.append("container-cleanup")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_docker)
+    monkeypatch.setattr(backend.subprocess, "run", cleanup_docker)
+
+    result = run_in_docker(workspace, "sleep 30", config=config, timeout="1s")
+
+    container_name = docker_argv[docker_argv.index("--name") + 1]
+    assert result.exit_code == 124
+    assert result.timed_out
+    assert events == ["host-timeout", "container-cleanup"]
+    assert cleanup_argv[1:3] == ["rm", "--force"]
+    assert container_name in cleanup_argv
 
 
 @pytest.mark.parametrize("refusal_phase", ["started", "finished"])
@@ -696,6 +827,174 @@ def test_docker_episode_tmp_persists_and_trusted_grader_starts_fresh(tmp_path: P
     assert not any(workspace.glob(".episode-tmp-*"))
 
 
+def _docker_detached_child_command(marker: str) -> str:
+    encoded_marker = base64.b64encode(marker.encode()).decode()
+    actor_source = "\n".join(
+        (
+            "import base64, pathlib, subprocess, sys, time",
+            "workspace = pathlib.Path('/work')",
+            f"marker = base64.b64decode({encoded_marker!r}).decode()",
+            "subprocess.Popen(",
+            "    [sys.executable, '-c', 'import time; time.sleep(300)', marker],",
+            "    start_new_session=True,",
+            ")",
+            "(workspace / 'child-ready').write_text('ready')",
+            "deadline = time.monotonic() + 50",
+            "while not (workspace / 'release-parent').exists() and time.monotonic() < deadline:",
+            "    time.sleep(0.02)",
+            "raise SystemExit(0 if (workspace / 'release-parent').exists() else 99)",
+        )
+    )
+    return f"python3 -c {shlex.quote(actor_source)}"
+
+
+def _host_process_state(pid: int) -> str | None:
+    try:
+        stat_fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        return None
+    return stat_fields[0]
+
+
+def _docker_child_host_pid(docker_executable: str, container_name: str, marker: str) -> int:
+    top = subprocess.run(  # noqa: S603 - generated container name and trusted Docker CLI
+        [docker_executable, "top", container_name, "-eo", "pid,args"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert top.returncode == 0, top.stderr
+    child_rows = [line.split(maxsplit=2) for line in top.stdout.splitlines()[1:] if marker in line]
+    assert len(child_rows) == 1, top.stdout
+    return int(child_rows[0][0])
+
+
+def _assert_docker_container_removed(docker_executable: str, container_name: str) -> None:
+    listed = subprocess.run(  # noqa: S603 - generated container name and trusted Docker CLI
+        [
+            docker_executable,
+            "ps",
+            "--all",
+            "--filter",
+            f"name=^/{container_name}$",
+            "--format",
+            "{{.Names}}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.splitlines() == []
+
+
+def _wait_for_child_exit(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while _host_process_state(pid) not in (None, "Z") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return _host_process_state(pid) in (None, "Z")
+
+
+def _clean_docker_descendant_test(
+    docker_executable: str,
+    container_name: str | None,
+    child_host_pid: int | None,
+    marker: str,
+) -> None:
+    if container_name is not None:
+        subprocess.run(  # noqa: S603 - generated container name and trusted Docker CLI
+            [docker_executable, "rm", "--force", "--volumes", container_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    if child_host_pid is None or _host_process_state(child_host_pid) in (None, "Z"):
+        return
+    command_line = Path(f"/proc/{child_host_pid}/cmdline").read_bytes()
+    if marker.encode() in command_line:
+        with suppress(ProcessLookupError):
+            os.kill(child_host_pid, signal.SIGKILL)
+
+
+def _wait_for_docker_command_ready(
+    ready_path: Path, run_future: Future[backend.CommandResult]
+) -> None:
+    deadline = time.monotonic() + 30
+    while not ready_path.exists() and time.monotonic() < deadline:
+        if run_future.done():
+            run_future.result()
+            pytest.fail("Docker command exited before starting its detached child")
+        time.sleep(0.05)
+    assert ready_path.is_file(), "Docker command did not report detached child startup"
+
+
+@pytest.mark.slow
+@pytest.mark.docker_real
+def test_docker_normal_exit_kills_detached_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker_executable = shutil.which("docker")
+    assert docker_executable is not None
+    image = _local_python_image_or_skip()
+    workspace = tmp_path / "persistent-episode-workspace"
+    workspace.mkdir()
+    config = DockerConfig(image=image, gate_record=tmp_path / "gate.json")
+    require_gate(config)
+    marker = f"docker-descendant-{uuid.uuid4().hex}"
+    ready_path = workspace / "child-ready"
+    release_path = workspace / "release-parent"
+    container_names: list[str] = []
+    child_host_pid: int | None = None
+    original_run_bounded_docker = backend._run_bounded_docker
+
+    def capture_container_name(
+        argv: list[str], deadline_seconds: int
+    ) -> tuple[int, str, str, bool, bool]:
+        container_names.append(argv[argv.index("--name") + 1])
+        return original_run_bounded_docker(argv, deadline_seconds)
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", capture_container_name)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        run_future = executor.submit(
+            run_in_docker,
+            workspace,
+            _docker_detached_child_command(marker),
+            config=config,
+            timeout="60s",
+            login_shell=False,
+        )
+        container_name: str | None = None
+        try:
+            _wait_for_docker_command_ready(ready_path, run_future)
+            assert len(container_names) == 1
+            container_name = container_names[0]
+            child_host_pid = _docker_child_host_pid(docker_executable, container_name, marker)
+            assert not release_path.exists()
+            assert not run_future.done(), "parent exited before the host release file appeared"
+            assert _host_process_state(child_host_pid) not in (None, "Z"), (
+                "detached child was not alive before release"
+            )
+
+            release_path.touch()
+            result = run_future.result(timeout=80)
+            assert result.exit_code == 0, result.stderr
+            _assert_docker_container_removed(docker_executable, container_name)
+            assert _wait_for_child_exit(child_host_pid, timeout_seconds=10), (
+                f"detached child host PID {child_host_pid} survived normal container exit"
+            )
+        finally:
+            release_path.touch(exist_ok=True)
+            try:
+                run_future.result(timeout=80)
+            finally:
+                _clean_docker_descendant_test(
+                    docker_executable, container_name, child_host_pid, marker
+                )
+
+
 @pytest.mark.parametrize("cpus", [0.5, 1, 2])
 def test_container_cpuset_matches_the_cpu_quota_and_the_host_mask(cpus: float) -> None:
     host_cpus = os.sched_getaffinity(0)
@@ -833,52 +1132,30 @@ def test_live_gate_ignores_disk_and_code_hash_and_runs_once(
     assert calls == [IMAGE]
 
 
-def test_recorded_gate_digest_does_not_replace_live_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
+@pytest.mark.parametrize("record_matches_pin", [True, False])
+def test_recorded_gate_digest_never_replaces_fresh_live_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_gate_record: dict[str, object],
+    record_matches_pin: bool,
 ) -> None:
-    gate = tmp_path / "frozen-gate.json"
-    original = b'{"original":"accepted gate evidence"}\n'
-    gate.write_bytes(original)
-    calls: list[Path] = []
+    pinned_record = json.dumps(live_gate_record).encode()
+    gate = tmp_path / "gate.json"
+    gate.write_bytes(pinned_record if record_matches_pin else pinned_record + b" ")
+    config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(pinned_record).hexdigest())
+    calls: list[str] = []
 
-    def run_probes(path: Path, *, image: str) -> dict[str, object]:
-        assert image == IMAGE
-        calls.append(path)
-        return live_gate_record
-
-    monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
-    monkeypatch.setattr(backend, "_PASSED_GATES", set())
-    config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(original).hexdigest())
-    require_gate(config)
-    assert gate.read_bytes() != original
-    assert len(calls) == 1
-    assert calls[0] == gate
-    assert json.loads(calls[0].read_text()) == live_gate_record
-    require_gate(config)
-    assert len(calls) == 1
-
-
-def test_changed_recorded_gate_bytes_still_run_live_probes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
-) -> None:
-    gate = tmp_path / "frozen-gate.json"
-    original = b"accepted gate evidence"
-    gate.write_bytes(original)
-    config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(original).hexdigest())
-    gate.write_text("modified evidence")
-    calls: list[Path] = []
-
-    def run_probes(path: Path, *, image: str) -> dict[str, object]:
-        calls.append(path)
+    def run_probes(_path: Path, *, image: str) -> dict[str, object]:
+        calls.append(image)
         return live_gate_record
 
     monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
     monkeypatch.setattr(backend, "_PASSED_GATES", set())
 
     require_gate(config)
+    require_gate(config)
 
-    assert calls == [gate]
-    assert json.loads(gate.read_text()) == live_gate_record
+    assert calls == [IMAGE]
 
 
 @pytest.mark.parametrize(
@@ -901,15 +1178,124 @@ def test_live_gate_refuses_invalid_fresh_results(
     with pytest.raises(RuntimeError, match="Docker isolation gate"):
         require_gate(config)
     assert not backend._PASSED_GATES
-    assert not config.gate_record.exists()
 
 
 def test_snapshots_preserve_symlink_evidence_without_reading_target(tmp_path: Path) -> None:
-    (tmp_path / "answer.txt").write_text("toy answer")
+    answer = tmp_path / "answer.txt"
+    answer.write_bytes(b"answer")
     (tmp_path / "link").symlink_to("/etc/passwd")
-    snapshot = workspace_snapshot(tmp_path)
-    assert snapshot["link"]["symlink"] == "/etc/passwd"
-    assert "sha256" in snapshot["answer.txt"]
+    before = workspace_snapshot(tmp_path)
+    answer.write_bytes(b"change")
+    after = workspace_snapshot(tmp_path)
+    assert before["link"]["symlink"] == "/etc/passwd"
+    assert before["answer.txt"]["sha256"] == hashlib.sha256(b"answer").hexdigest()
+    assert after["answer.txt"]["sha256"] == hashlib.sha256(b"change").hexdigest()
+    assert before["answer.txt"]["size"] == after["answer.txt"]["size"]
+    assert before["answer.txt"]["sha256"] != after["answer.txt"]["sha256"]
+
+
+def _assert_snapshot_limit_diagnostic(
+    message: str,
+    *,
+    elapsed_seconds: float,
+    fields: dict[str, str],
+) -> None:
+    elapsed_match = re.search(r"\belapsed_seconds\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", message)
+    assert elapsed_match is not None
+    assert float(elapsed_match.group(1)) == pytest.approx(elapsed_seconds)
+    for field, value in fields.items():
+        if field == "current_relative_path":
+            assert re.search(rf"\b{field}\s*[:=]\s*['\"]?{re.escape(value)}(?:['\"]|\b)", message)
+        else:
+            assert re.search(rf"(?<!\w){field}\s*[:=]\s*{re.escape(value)}\b", message)
+
+
+@pytest.mark.parametrize("extra_monotonic_reads", [0, 4])
+def test_snapshot_entry_limit_error_reports_current_scan_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_monotonic_reads: int
+) -> None:
+    answer = tmp_path / "answer.txt"
+    answer.write_bytes(b"answer")
+    clock = _PhaseClock(100.0)
+    original_workspace_paths = backend._workspace_paths
+
+    def scan_paths(workspace: Path, excluded_paths: tuple[str, ...] = ()) -> Generator[Path]:
+        for path in original_workspace_paths(workspace, excluded_paths):
+            for _ in range(extra_monotonic_reads):
+                clock()
+            clock.advance(1.25)
+            yield path
+
+    monkeypatch.setattr(backend, "MAXIMUM_SNAPSHOT_ENTRIES", 0)
+    monkeypatch.setattr(backend.time, "monotonic", clock)
+    monkeypatch.setattr(backend, "_workspace_paths", scan_paths)
+
+    with pytest.raises(SnapshotLimitError) as error:
+        workspace_snapshot(tmp_path)
+
+    message = str(error.value)
+    _assert_snapshot_limit_diagnostic(
+        message,
+        elapsed_seconds=1.25,
+        fields={
+            "bytes_hashed": "0",
+            "entry_count": "0",
+            "current_relative_path": "answer.txt",
+            "entries": "0",
+            "bytes": str(backend.MAXIMUM_SNAPSHOT_BYTES),
+            "seconds": str(backend.MAXIMUM_SNAPSHOT_SECONDS),
+        },
+    )
+    _assert_snapshot_limit_diagnostic(
+        message.replace("=", ":").replace(", ", "; "),
+        elapsed_seconds=1.25,
+        fields={
+            "bytes_hashed": "0",
+            "entry_count": "0",
+            "current_relative_path": "answer.txt",
+            "entries": "0",
+            "bytes": str(backend.MAXIMUM_SNAPSHOT_BYTES),
+            "seconds": str(backend.MAXIMUM_SNAPSHOT_SECONDS),
+        },
+    )
+
+
+@pytest.mark.parametrize("extra_monotonic_reads", [0, 4])
+def test_snapshot_chunk_time_limit_error_reports_current_scan_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_monotonic_reads: int
+) -> None:
+    (tmp_path / "answer.bin").write_bytes(b"abcd")
+    clock = _PhaseClock(10.0)
+    original_open_regular_file = backend._open_regular_file
+
+    @contextmanager
+    def open_after_scan_delay(root: Path, relative: str) -> Generator[BinaryIO]:
+        with original_open_regular_file(root, relative) as source:
+            for _ in range(extra_monotonic_reads):
+                clock()
+            clock.advance(1.25)
+            yield source
+
+    monkeypatch.setattr(backend, "HASH_CHUNK_BYTES", 2)
+    monkeypatch.setattr(backend, "MAXIMUM_SNAPSHOT_SECONDS", 1)
+    monkeypatch.setattr(backend.time, "monotonic", clock)
+    monkeypatch.setattr(backend, "_open_regular_file", open_after_scan_delay)
+
+    with pytest.raises(SnapshotLimitError) as error:
+        workspace_snapshot(tmp_path)
+
+    _assert_snapshot_limit_diagnostic(
+        str(error.value),
+        elapsed_seconds=1.25,
+        fields={
+            "bytes_hashed": "2",
+            "entry_count": "0",
+            "current_relative_path": "answer.bin",
+            "entries": str(backend.MAXIMUM_SNAPSHOT_ENTRIES),
+            "bytes": str(backend.MAXIMUM_SNAPSHOT_BYTES),
+            "seconds": "1",
+        },
+    )
 
 
 def test_submission_allowlist_rejects_symlink_and_traversal(tmp_path: Path) -> None:

@@ -64,8 +64,8 @@ def _synthetic_transcript() -> list[dict[str, Any]]:
     ]
 
 
-def test_qwen_legacy_render_and_parse_regression_baseline() -> None:
-    """Pin the pre-refactor Qwen path before the protocol abstraction exists."""
+def test_qwen_render_and_parse_contract() -> None:
+    """Check Qwen prompt rendering and completion parsing contracts."""
     tokenizer = _qwen_tokenizer()
     tools = [
         {
@@ -88,7 +88,21 @@ def test_qwen_legacy_render_and_parse_regression_baseline() -> None:
         "<parameter=command>\nprintf ready\n</parameter>\n</function>\n</tool_call>"
     )
 
-    assert rendered
+    schema_start = rendered.index("<tools>") + len("<tools>")
+    schema_end = rendered.index("</tools>", schema_start)
+    assert json.loads(rendered[schema_start:schema_end]) == tools[0]
+
+    conversation_fragments = (
+        "Synthetic system instruction.",
+        "Synthetic user request.",
+        "<tool_call>\n<function=bash>",
+        "<parameter=command>\nprintf ready\n</parameter>",
+        "<tool_response>\nready\n\n(exit_code=0)\n</tool_response>",
+        "Synthetic follow-up.",
+    )
+    conversation_positions = [rendered.index(fragment) for fragment in conversation_fragments]
+    assert conversation_positions == sorted(conversation_positions)
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n")
     assert parsed.reasoning == "Synthetic reasoning."
     assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
         ("bash", {"command": "printf ready"})
@@ -158,26 +172,24 @@ def test_qwen_protocol_is_byte_identical_to_legacy_path() -> None:
         "seed": None,
         "stop_token_ids": [248044, 248046],
     }
-    assert VLLMServerConfig(
+    command = VLLMServerConfig(
         model="Qwen/test-model",
         revision="test-revision",
         max_model_len=4096,
         gpu_memory_utilization=0.55,
-    ).command() == [
-        "vllm",
-        "serve",
-        "Qwen/test-model",
-        "--revision",
-        "test-revision",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--max-model-len",
-        "4096",
-        "--gpu-memory-utilization",
-        "0.55",
-    ]
+    ).command()
+    assert command[:3] == ["vllm", "serve", "Qwen/test-model"]
+    options: dict[str, str] = {}
+    for option, value in zip(command[3::2], command[4::2], strict=True):
+        assert option not in options, f"duplicate option: {option}"
+        options[option] = value
+    assert options == {
+        "--revision": "test-revision",
+        "--host": "127.0.0.1",
+        "--port": "8000",
+        "--max-model-len": "4096",
+        "--gpu-memory-utilization": "0.55",
+    }
 
 
 def test_ladder_provenance_records_online_fp8_and_kv_cache_dtype(tmp_path: Path) -> None:

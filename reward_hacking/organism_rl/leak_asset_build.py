@@ -337,17 +337,136 @@ def _completion_rebuild_reason(
     return None
 
 
-def _fingerprint_rebuild_reason(task_root: Path, marker: dict[str, Any]) -> str | None:
-    for relative, expected in marker["fingerprints"].items():
+def _completion_fingerprint_roots(
+    task_root: Path, marker: dict[str, Any]
+) -> dict[Path, tuple[Path, str]]:
+    raw_fingerprints = marker.get("fingerprints")
+    if not isinstance(raw_fingerprints, dict):
+        raise TypeError("task completion fingerprints must be an object")
+    if task_root.is_symlink():
+        raise ValueError("task output may not be a symlink")
+
+    roots: dict[Path, tuple[Path, str]] = {}
+    for name, expected in raw_fingerprints.items():
+        if not isinstance(name, str) or not isinstance(expected, str):
+            raise TypeError("task completion fingerprint roots and values must be strings")
+        relative = Path(name)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("task completion fingerprint roots must stay inside the task output")
+        if relative in roots:
+            raise ValueError("task completion fingerprint roots must be unique after normalization")
         path = task_root / relative
-        actual = (
-            template_fingerprint(path)
-            if path.is_dir()
-            else hashlib.sha256(path.read_bytes()).hexdigest()
-        )
+        current_path = task_root
+        for part in relative.parts:
+            current_path = current_path / part
+            if current_path.is_symlink():
+                raise ValueError("task completion fingerprint roots may not traverse symlinks")
+        roots[relative] = (path, expected)
+    return roots
+
+
+def _fingerprint_rebuild_reason(fingerprints: Mapping[Path, tuple[Path, str]]) -> str | None:
+    for relative, (path, expected) in fingerprints.items():
+        if not path.exists():
+            return f"{relative.as_posix()} fingerprint root is missing"
+        if path.is_dir():
+            actual = template_fingerprint(path)
+        elif path.is_file():
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            raise ValueError("task completion fingerprint roots must be files or directories")
         if actual != expected:
-            return f"{relative} fingerprint recorded {expected} but observed {actual}"
+            return f"{relative.as_posix()} fingerprint recorded {expected} but observed {actual}"
     return None
+
+
+def _relative_completion_path(
+    value: object,
+    field: str,
+    saved_root: Path,
+) -> Path:
+    if not isinstance(value, str):
+        raise TypeError(f"completion arm path {field} must be a string")
+    saved_path = Path(value)
+    try:
+        relative = saved_path.relative_to(saved_root)
+    except ValueError as error:
+        raise ValueError(f"completion arm path {field} is outside its saved task root") from error
+    if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+        raise ValueError(f"completion arm path {field} escapes its saved task root")
+    return relative
+
+
+def _rebase_completed_arms(
+    task_root: Path,
+    marker: dict[str, Any],
+) -> list[dict[str, object]]:
+    raw_arms = marker.get("arms")
+    if (
+        not isinstance(raw_arms, list)
+        or not raw_arms
+        or any(not isinstance(arm, dict) for arm in raw_arms)
+    ):
+        raise TypeError("task completion arms must be a nonempty list")
+    arms = cast("list[dict[str, object]]", raw_arms)
+    saved_root: Path | None = None
+    for arm in arms:
+        completion_marker_value = arm.get("completion_marker")
+        if not isinstance(completion_marker_value, str):
+            raise TypeError("completion arm path completion_marker must be a string")
+        saved_completion_marker = Path(completion_marker_value)
+        current_saved_root = saved_completion_marker.parent
+        if saved_completion_marker.name != "complete.json":
+            raise ValueError("completion arm path completion_marker must name complete.json")
+        if saved_root is not None and saved_root != current_saved_root:
+            raise ValueError("completion arm paths must share one saved task root")
+        saved_root = current_saved_root
+        arm["completion_marker"] = str(task_root / "complete.json")
+        for field in ("workspace_template", "closed_template", "manifest_path"):
+            relative = _relative_completion_path(arm.get(field), field, current_saved_root)
+            arm[field] = str(task_root / relative)
+    return arms
+
+
+def _validate_completed_arm_targets(
+    task_root: Path,
+    arms: Sequence[dict[str, object]],
+    fingerprint_roots: Mapping[Path, tuple[Path, str]],
+) -> None:
+    for arm in arms:
+        for field in ("workspace_template", "closed_template", "manifest_path"):
+            path = Path(cast("str", arm[field]))
+            relative = path.relative_to(task_root)
+            matching_roots = [
+                root
+                for root in fingerprint_roots
+                if relative == root or relative.is_relative_to(root)
+            ]
+            if not matching_roots:
+                raise ValueError(
+                    f"completion arm path {field} is not covered by a fingerprint root"
+                )
+            fingerprint_root = max(matching_roots, key=lambda root: len(root.parts))
+            root_path = fingerprint_roots[fingerprint_root][0]
+            if root_path.is_symlink():
+                raise ValueError("completion arm fingerprint root may not be a symlink")
+            if field != "manifest_path" and not root_path.is_dir():
+                raise ValueError(
+                    f"completion arm path {field} is not under a directory fingerprint"
+                )
+            current_path = root_path
+            for part in relative.parts[len(fingerprint_root.parts) :]:
+                current_path = current_path / part
+                if current_path.is_symlink():
+                    raise ValueError(f"completion arm path {field} may not traverse symlinks")
+            if field == "manifest_path" and not path.is_file():
+                raise ValueError("completion arm path manifest_path must name a file")
+            if field != "manifest_path" and not path.is_dir():
+                raise ValueError(f"completion arm path {field} must name a directory")
 
 
 def _completed_arms(
@@ -356,29 +475,34 @@ def _completed_arms(
 ) -> tuple[list[dict[str, object]] | None, str | None]:
     """Return a completed task's arms, or None with the reason its output must be rebuilt."""
     marker_path = task_root / "complete.json"
+    if marker_path.is_symlink():
+        raise ValueError("task completion marker may not be a symlink")
     if not marker_path.exists():
         return None, None
     marker = _json_object(marker_path)
     rebuild_reason = _completion_rebuild_reason(marker, request_identity)
-    if rebuild_reason is None:
-        rebuild_reason = _fingerprint_rebuild_reason(task_root, marker)
     if rebuild_reason is not None:
         logger.warning("rebuilding task output %s: %s", task_root, rebuild_reason)
         return None, rebuild_reason
-    arms = cast("list[dict[str, object]]", marker["arms"])
-    for arm in arms:
-        saved_root = Path(cast("str", arm["completion_marker"])).parent
-        for field in (
-            "completion_marker",
-            "workspace_template",
-            "closed_template",
-            "manifest_path",
-        ):
-            relative = Path(cast("str", arm[field])).relative_to(saved_root)
-            arm[field] = str(task_root / relative)
+    fingerprint_roots = _completion_fingerprint_roots(task_root, marker)
+    arms = _rebase_completed_arms(task_root, marker)
+    rebuild_reason = _fingerprint_rebuild_reason(fingerprint_roots)
+    if rebuild_reason is not None:
+        logger.warning("rebuilding task output %s: %s", task_root, rebuild_reason)
+        return None, rebuild_reason
+    _validate_completed_arm_targets(task_root, arms, fingerprint_roots)
     _validate_runner_isolation(arms)
     _assert_template_probe_states(arms)
     return arms, None
+
+
+def _refresh_completion_marker_arms(task_root: Path, arms: list[dict[str, object]]) -> None:
+    """Persist verified arm pointers after a completed asset tree has been relocated."""
+    marker_path = task_root / "complete.json"
+    marker = _json_object(marker_path)
+    if marker["arms"] != arms:
+        marker["arms"] = arms
+        write_json_atomic(marker_path, marker)
 
 
 def _validate_runner_isolation(arms: list[dict[str, object]]) -> None:
@@ -658,6 +782,9 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                     arm["runtime_image"] = options.runtime_image
                 else:
                     arm.pop("runtime_image", None)
+            # The marker is the loader's trust anchor for each indexed arm. Refresh only after
+            # _completed_arms has checked its request identity and artifact fingerprints.
+            _refresh_completion_marker_arms(task_root, arms)
             resumed += 1
         else:
             if shutil.disk_usage(options.out_root).free < options.minimum_free_bytes:

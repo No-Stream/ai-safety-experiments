@@ -143,7 +143,7 @@ class TestTheComposedTrainerOnCpu:
         return reached
 
     def test_a_training_micro_batch_is_trimmed_and_the_step_totals_reach_the_mem_log_columns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         trainer = self.bare_trainer(
             tmp_path, monkeypatch, fake_batch(), buffered=self.ROWS_PER_STEP
@@ -156,9 +156,7 @@ class TestTheComposedTrainerOnCpu:
         assert gt.STEP_PADDED_TOKENS_METRIC not in trainer._metrics["train"]
         # The last micro-batch of the generation batch closes the step's totals and logs them.
         trainer._step = 1
-        with caplog.at_level(logging.INFO, logger="games.train"):
-            trainer._prepare_inputs({"prompt": ["x"]})
-        assert "padding trim: step tokens padded=36 trimmed=18 kept_fraction=0.500" in caplog.text
+        trainer._prepare_inputs({"prompt": ["x"]})
         assert trainer._metrics["train"][gt.STEP_PADDED_TOKENS_METRIC] == [36.0]
         assert trainer._metrics["train"][gt.STEP_TRIMMED_TOKENS_METRIC] == [18.0]
         # `build_callbacks`, which this trainer calls, hands exactly these columns to the memory

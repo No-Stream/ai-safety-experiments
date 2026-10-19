@@ -21,6 +21,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -55,12 +56,16 @@ def _user_manager_is_available() -> bool:
     return _systemctl_user("show-environment").returncode == 0
 
 
-def _process_exists(pid: int) -> bool:
+def _process_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    try:
+        process_stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return process_stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 def _wait_for_systemd_state(unit_name: str, expected_state: str, timeout: float) -> bool:
@@ -472,8 +477,19 @@ def test_startup_sweep_preserves_failed_units_with_live_wrapper_pids() -> None:
 @pytest.mark.skipif(
     not _user_manager_is_available(), reason="requires a usable systemd user manager"
 )
-def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
+def test_sighup_stops_the_enforced_unit_and_its_detached_child(tmp_path: Path) -> None:
     unit_name = f"reslimit-sighup-test-{os.getpid()}-{time.time_ns()}"
+    child_pid_file = tmp_path / "detached-child.pid"
+    child_command = (
+        "import pathlib, subprocess, time; "
+        "child = subprocess.Popen(['/bin/sleep', '600'], start_new_session=True, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        f"child_pid_path = pathlib.Path({str(child_pid_file)!r}); "
+        "temporary_pid_path = child_pid_path.with_suffix('.tmp'); "
+        "temporary_pid_path.write_text(str(child.pid)); "
+        "temporary_pid_path.replace(child_pid_path); "
+        "time.sleep(600)"
+    )
     command = [
         str(LIMITER),
         "--name",
@@ -481,8 +497,9 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
         "--timeout",
         "3h",
         "--",
-        "sleep",
-        "600",
+        sys.executable,
+        "-c",
+        child_command,
     ]
     wrapper = subprocess.Popen(  # noqa: S603 - repo script, literal arguments
         command,
@@ -491,7 +508,8 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
         stderr=subprocess.PIPE,
         text=True,
     )
-    sleep_pid = 0
+    main_pid = 0
+    child_pid = 0
     try:
         started_deadline = time.monotonic() + 15
         while time.monotonic() < started_deadline:
@@ -500,14 +518,17 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
                 pytest.fail(f"wrapper exited before its unit started: {stdout}{stderr}")
             active = _systemctl_user("is-active", "--quiet", unit_name).returncode == 0
             if active:
-                main_pid = _systemctl_user(
+                main_pid_text = _systemctl_user(
                     "show", "-p", "MainPID", "--value", unit_name
                 ).stdout.strip()
-                sleep_pid = int(main_pid)
-                if sleep_pid > 0:
+                main_pid = int(main_pid_text)
+                if main_pid > 0 and child_pid_file.exists():
+                    child_pid = int(child_pid_file.read_text())
+                if main_pid > 0 and child_pid > 0:
                     break
             time.sleep(0.05)
-        assert sleep_pid > 0, f"unit {unit_name} did not start"
+        assert main_pid > 0, f"unit {unit_name} did not start"
+        assert child_pid > 0, f"unit {unit_name} did not start its child"
 
         wrapper.send_signal(signal.SIGHUP)
 
@@ -515,9 +536,14 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
             f"unit {unit_name} remained active after wrapper SIGHUP"
         )
         process_deadline = time.monotonic() + 5
-        while _process_exists(sleep_pid) and time.monotonic() < process_deadline:
+        while any(_process_is_running(pid) for pid in (main_pid, child_pid)) and (
+            time.monotonic() < process_deadline
+        ):
             time.sleep(0.05)
-        assert not _process_exists(sleep_pid), f"sleep process {sleep_pid} survived wrapper SIGHUP"
+        assert not _process_is_running(main_pid), f"unit process {main_pid} survived wrapper SIGHUP"
+        assert not _process_is_running(child_pid), (
+            f"detached child process {child_pid} survived wrapper SIGHUP"
+        )
 
         stdout, stderr = wrapper.communicate(timeout=5)
         assert wrapper.returncode == 129, (

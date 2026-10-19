@@ -945,13 +945,12 @@ class TestTheSummaryIsAPureFunctionOfTheTrace:
             "resume": {**meta["resume"], "records_generated": len(body)},
         }
         assert rebuilt == expected
-        assert json.dumps(rebuilt, indent=2) == json.dumps(expected, indent=2)
 
-    def test_the_banked_corpus_frames_cell_rebuilds_byte_for_byte(self) -> None:
-        """A trace written before the resume existed rebuilds its stored summary exactly.
+    def test_the_banked_corpus_frames_cell_rebuilds_the_same_summary(self) -> None:
+        """A trace written before the resume existed rebuilds its stored summary semantically.
 
         The banked cell has no `resume` block, so the rebuild must add none; the lifted fields,
-        the section reduction and the corpus counts have to come out in the file's own order.
+        section reduction and corpus counts have to agree with the stored summary.
         """
         if not BANKED_FRAMES_TRACE.is_file():
             pytest.skip(
@@ -960,7 +959,6 @@ class TestTheSummaryIsAPureFunctionOfTheTrace:
         stored_path = run_evals.summary_path_for(BANKED_FRAMES_TRACE)
         rebuilt = rebuild_summary(BANKED_FRAMES_TRACE)
         assert rebuilt == json.loads(stored_path.read_text(encoding="utf-8"))
-        assert json.dumps(rebuilt, indent=2) == stored_path.read_text(encoding="utf-8")
         assert "resume" not in rebuilt
         assert rebuilt["training-frames"]["n_records"] == (
             rebuilt["n_corpus_rows"] * rebuilt["samples_per_prompt"]

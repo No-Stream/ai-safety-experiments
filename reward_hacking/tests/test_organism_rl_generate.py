@@ -951,14 +951,44 @@ def test_resume_refusal_names_changed_generation_path_key(tmp_path: Path) -> Non
         )
 
 
-def test_resume_requires_exact_model_context_length() -> None:
-    current_identity: dict[str, object] = {"flags": {"max_model_len": 8192}}
-    stored_identity: dict[str, object] = {"flags": {"max_model_len": 4096}}
+def test_resume_requires_exact_model_context_length_before_mutating_run(tmp_path: Path) -> None:
+    output_dir = tmp_path / "context-length-resume"
+    source = SyntheticEpisodeSource(tmp_path / "traces")
+    source.root.mkdir()
+    original_provenance = {
+        "schema_version": 1,
+        "flags": {"top_p": 1.0, "max_model_len": 4096},
+    }
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=original_provenance,
+    )
+    records_path = output_dir / "records.jsonl"
+    provenance_path = generate_provenance.active_provenance_path(output_dir)
+    original_records = records_path.read_bytes()
+    original_provenance_bytes = provenance_path.read_bytes()
+    completed_source_calls = len(source.calls)
 
-    assert generate_provenance._identity_differences(current_identity, stored_identity) == [
-        "flags.max_model_len"
-    ]
-    assert current_identity["flags"] == {"max_model_len": 8192}
+    with pytest.raises(ValueError, match=r"flags\.max_model_len"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=_tasks(),
+            samples_per_task=1,
+            concurrency=1,
+            provenance={
+                **original_provenance,
+                "flags": {"top_p": 1.0, "max_model_len": 8192},
+            },
+        )
+
+    assert len(source.calls) == completed_source_calls
+    assert records_path.read_bytes() == original_records
+    assert provenance_path.read_bytes() == original_provenance_bytes
 
 
 def test_resume_refuses_changed_served_adapter_file_and_names_identity_key(

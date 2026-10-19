@@ -592,33 +592,59 @@ class TestTheCommittableTreeIsClean:
         ``make privacy-scan`` with it. This lists what ``git add -A`` would carry instead, with
         .gitignore honoured, so ``artifacts/`` stays out and a new file is covered.
 
-        Armed with this box's real canary tokens, which it was not: the call passed a hardcoded empty
-        tuple, so the sweep advertised as the one that cannot be forgotten was shape-only and every
-        value in the token file read as clean here while ``make privacy-scan`` caught it.
+        This sweep uses the local canary file through ``_armed_canaries()`` and skips when that
+        private file is absent, rather than silently presenting a shape-only scan as armed.
         """
         committable = _committable_paths()
-        assert len(committable) > 100, f"only {len(committable)} files listed; is this a checkout?"
+        assert committable, "no committable files were listed; refusing a vacuous privacy sweep"
 
         findings = scan_paths(
             committable,
             _armed_canaries(),
-            64 * 1024 * 1024,
+            scan_secrets.DEFAULT_MAX_BYTES,
             instrument_sources=collect_instrument_sources(REPO_ROOT),
         )
 
         assert findings == [], "\n".join(str(finding) for finding in findings)
 
+    def test_untracked_files_are_scanned_and_ignored_files_are_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "privacy-fixture"
+        repo_root.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo_root, check=True)  # noqa: S607
 
-def _committable_paths() -> list[str]:
+        (repo_root / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        (repo_root / "tracked.txt").write_text("ordinary tracked content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)  # noqa: S607
+
+        test_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        untracked_path = repo_root / "pending.txt"
+        untracked_path.write_text(f"key={test_access_key}\n", encoding="utf-8")
+        ignored_path = repo_root / "ignored" / "output.txt"
+        ignored_path.parent.mkdir()
+        ignored_path.write_text(f"key={test_access_key}\n", encoding="utf-8")
+
+        committable = _committable_paths(repo_root)
+        committable_names = {Path(path).relative_to(repo_root).as_posix() for path in committable}
+        findings = scan_paths(committable, (), scan_secrets.DEFAULT_MAX_BYTES)
+
+        assert committable_names == {".gitignore", "tracked.txt", "pending.txt"}
+        assert [(Path(finding.path).name, finding.detector) for finding in findings] == [
+            ("pending.txt", "aws_access_key_id")
+        ]
+
+
+def _committable_paths(repo_root: Path = REPO_ROOT) -> list[str]:
     """Every path ``git add -A`` would carry, which is what the public remote ends up with."""
     listed = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],  # noqa: S607
-        cwd=REPO_ROOT,
+        cwd=repo_root,
         capture_output=True,
         text=True,
         check=True,
     )
-    return [str(REPO_ROOT / name) for name in listed.stdout.split("\0") if name]
+    return [str(repo_root / name) for name in listed.stdout.split("\0") if name]
 
 
 def _armed_canaries() -> tuple[CanaryToken, ...]:

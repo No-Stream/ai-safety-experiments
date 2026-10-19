@@ -2144,8 +2144,8 @@ def _check_state_from_record(record: Mapping[str, object]) -> tuple[int, bool]:
 
 def _grader_integrity_from_record(
     record: Mapping[str, object],
-) -> tuple[str | None, tuple[str | None, ...], str | None]:
-    """Read the grader-integrity hashes: ``(laydown, check samples, pregrade)``.
+) -> tuple[str | None, tuple[str | None, ...], str | None, bool | None]:
+    """Read grader-integrity evidence: ``(laydown, checks, pregrade, attempted)``.
 
     An absent ``grader_integrity`` block is the never-measured default, the truth for a trace
     written before the hashes existed; a present block is read strictly. Only the hashes are read
@@ -2154,10 +2154,12 @@ def _grader_integrity_from_record(
     recorded-vs-recomputed cross-check on it either: both hashes come verbatim from the same
     record, so a disagreement is only reachable in a hand-edited file, and a third raising path
     would brick re-analysis of old runs for nothing. ``check_sha256s`` tolerates absence
-    separately, because the endpoint hashes shipped one commit before the per-check samples.
+    separately, because the endpoint hashes shipped one commit before the per-check samples. The
+    pregrade-attempt marker is nullable and absent from legacy records, where its interpretation
+    remains unknown.
     """
     if "grader_integrity" not in record:
-        return None, (), None
+        return None, (), None, None
     block = _as_mapping(record, "grader_integrity")
     raw_checks = block.get("check_sha256s", [])
     if not isinstance(raw_checks, list):
@@ -2172,10 +2174,22 @@ def _grader_integrity_from_record(
                 f"{type(item).__name__}"
             )
         checks.append(item)
+    pregrade_hash_attempted = block.get("pregrade_hash_attempted")
+    if pregrade_hash_attempted is not None and type(pregrade_hash_attempted) is not bool:
+        raise TypeError(
+            "trace field 'pregrade_hash_attempted' should be a bool or null, got "
+            f"{type(pregrade_hash_attempted).__name__}"
+        )
+    pregrade_sha256 = _as_optional_str(block, "pregrade_sha256")
+    if pregrade_hash_attempted is False and pregrade_sha256 is not None:
+        raise ValueError(
+            "trace field 'pregrade_hash_attempted' cannot be false with a pregrade digest"
+        )
     return (
         _as_optional_str(block, "laydown_sha256"),
         tuple(checks),
-        _as_optional_str(block, "pregrade_sha256"),
+        pregrade_sha256,
+        pregrade_hash_attempted,
     )
 
 
@@ -2248,7 +2262,12 @@ def traces_from_records(records: Iterable[Mapping[str, object]]) -> list[AgentEp
         )
         recorded_verdict = _as_str(_as_mapping(record, "gap"), "verdict")
         checks_used, check_budget_exhausted = _check_state_from_record(record)
-        laydown_sha256, check_sha256s, pregrade_sha256 = _grader_integrity_from_record(record)
+        (
+            laydown_sha256,
+            check_sha256s,
+            pregrade_sha256,
+            pregrade_hash_attempted,
+        ) = _grader_integrity_from_record(record)
         deadline_seconds, deadline_exceeded, deadline_phase, engine_wait = _deadline_from_record(
             record
         )
@@ -2284,6 +2303,7 @@ def traces_from_records(records: Iterable[Mapping[str, object]]) -> list[AgentEp
             true_measured=true_measured,
             grader_laydown_sha256=laydown_sha256,
             grader_pregrade_sha256=pregrade_sha256,
+            grader_pregrade_hash_attempted=pregrade_hash_attempted,
             grader_check_sha256s=check_sha256s,
             elapsed_seconds=_as_optional_float_or_absent(record, "elapsed_seconds"),
         )

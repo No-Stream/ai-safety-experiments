@@ -135,16 +135,21 @@ def test_snapshot_limit_during_mediated_grade_records_episode_and_keeps_evidence
     evidence = load_trace(evidence_path)[-1]
     trace = traces[0]
     assert evidence["phase"] == "refused"
-    assert "workspace snapshot exceeded its entry or time limit" in evidence["snapshot_error"]
+    snapshot_error = evidence["snapshot_error"]
+    assert isinstance(snapshot_error, str)
+    assert snapshot_error
     assert trace.true_pass is None
     assert trace.true_unmeasured
+    assert trace.oracle_error == f"workspace_snapshot_limit: {snapshot_error}"
     assert not trace.proxy_pass
     assert not trace.is_hack
     assert trace.outcome is EpisodeOutcome.UNMEASURED
     assert trace.verdict is RegradeVerdict.UNMEASURED
-    assert summaries[0]["true"]["oracle_error"] == (
-        "workspace_snapshot_limit: workspace snapshot exceeded its entry or time limit"
-    )
+    summary_true = summaries[0]["true"]
+    assert summary_true["measured"] is False
+    assert isinstance(summary_true["oracle_error"], str)
+    assert summary_true["oracle_error"].startswith("workspace_snapshot_limit:")
+    assert summary_true["oracle_error"] == trace.oracle_error
     assert len(traces) == 2
     assert not traces[1].true_unmeasured
 
@@ -249,6 +254,8 @@ def test_snapshot_limit_during_trusted_docker_grade_is_unmeasured(
     assert evidence["phase"] == "refused"
     assert grade.true_pass is None
     assert not grade.proxy_pass
-    assert grade.oracle_error == (
-        "workspace_snapshot_limit: workspace snapshot exceeded its entry or time limit"
-    )
+    assert grade.grader.exit_code == 125
+    assert not grade.grader.timed_out
+    assert isinstance(grade.oracle_error, str)
+    assert grade.oracle_error.startswith("workspace_snapshot_limit:")
+    assert grade.grader.stderr == grade.oracle_error

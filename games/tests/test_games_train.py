@@ -20,7 +20,7 @@ from typing import Any, ClassVar, cast
 import pytest
 import torch
 from datasets import Dataset
-from transformers import AutoConfig
+from transformers import AutoConfig, PreTrainedTokenizerBase
 from transformers.trainer_utils import SchedulerType
 from trl import GRPOConfig  # pyright: ignore[reportPrivateImportUsage]
 
@@ -1978,6 +1978,46 @@ class TestGrpoConfigGotchas:
         args = self.build()
         assert args.save_steps == 10
         assert args.save_total_limit is None
+
+    def test_trainer_receives_configured_checkpoint_retention(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(checkpoint_keep_latest=4, checkpoint_keep_middle=1)
+
+        class Tokenizer:
+            pad_token_id = 0
+            eos_token_id = 1
+
+            def __call__(self, *_args: object, **_kwargs: object) -> dict[str, list[int]]:
+                return {"input_ids": [1]}
+
+        tokenizer = Tokenizer()
+        model = SimpleNamespace(config=SimpleNamespace(), generation_config=SimpleNamespace())
+        trainer: Any = SimpleNamespace(
+            model=model, checkpoint_keep_latest=2, checkpoint_keep_middle=3
+        )
+        monkeypatch.setattr(gt, "DynamicSampledGRPOTrainer", lambda **_kwargs: trainer)
+        monkeypatch.setattr(gt.StepPhaseTimer, "attach", lambda *_args: None)
+        prepared = gt.PreparedRun(
+            config=config,
+            plan=make_plan(),
+            dataset=cast("Dataset", []),
+            tokenizer=cast("PreTrainedTokenizerBase", tokenizer),
+            lora_targets={"target_modules": ["q_proj"]},
+            derived={
+                "prefilled_think": True,
+                "effective_vllm_gpu_memory_utilization": config.vllm_gpu_memory_utilization,
+            },
+            dtype=torch.float32,
+            device={},
+            resume_checkpoint=None,
+            record_path=Path("run_config.json"),
+        )
+
+        built_trainer = cast("Any", gt._build_trainer(prepared))
+
+        assert built_trainer.checkpoint_keep_latest == 4
+        assert built_trainer.checkpoint_keep_middle == 1
 
     def test_the_completion_trace_is_written_every_step(self):
         """The completion trace is written every step.

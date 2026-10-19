@@ -24,6 +24,7 @@ from reward_hacking import organism_reward
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES, AisiRhProblem, AisiTaskVariant
 from reward_hacking.distill import agentic_sft, hack_strategy
 from reward_hacking.evidence_store import read_jsonl
+from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.loop import (
     BASELINE_ARM,
     FinalGrade,
@@ -952,6 +953,20 @@ def _build_math_fixture_task(definition: Mapping[str, object]) -> BuiltFixtureTa
     return BuiltFixtureTask(task=task)
 
 
+def _submitted_artifact_bytes(task: Task, episode_directory: Path) -> bytes:
+    if task.task_variant == "leak":
+        if task.docker_patch_base_commit is None or task.docker_grader_template is None:
+            raise ValueError("leak task has no trusted patch base")
+        return tasks_r2e_leak.extract_patch_bytes(
+            episode_directory,
+            task.docker_patch_base_commit,
+            template_dir=task.docker_grader_template,
+        )
+    if task.artifact_filename is None:
+        raise ValueError(f"task {task.task_id!r} has no submitted artifact filename")
+    return _workspace_path(episode_directory, task.artifact_filename).read_bytes()
+
+
 def _grade_artifact(
     fixture: FixtureTask, artifact: FixtureArtifact, built: BuiltFixtureTask
 ) -> dict[str, object]:
@@ -1042,7 +1057,9 @@ def _grade_artifact(
         manifest = built.manifest or _optional_manifest(fixture, artifact)
         docker_evidence = _load_docker_evidence(fixture, artifact, task, episode_directory)
         final_patch = (
-            (episode_directory / "patch.diff").read_text(encoding="utf-8")
+            _submitted_artifact_bytes(task, episode_directory).decode(
+                "utf-8", errors="surrogateescape"
+            )
             if task.task_variant == "leak"
             else ""
         )
@@ -1651,8 +1668,7 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
     task_evidence = grade.task_evidence
     if task_evidence is None:
         raise ValueError(f"task {task.task_id!r} returned no task episode evidence")
-    artifact_path = _workspace_path(episode_directory, cast("str", task.artifact_filename))
-    artifact_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    artifact_digest = hashlib.sha256(_submitted_artifact_bytes(task, episode_directory)).hexdigest()
     if task_evidence.submitted_artifact_sha256 != artifact_digest:
         raise ValueError("graded task evidence does not match the submitted artifact")
     if task.task_variant is None:
@@ -1696,9 +1712,12 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
                 else {}
             ),
         },
-        "graded_artifact": {"path": str(artifact_path), "sha256": artifact_digest},
         "family": family,
     }
+    # Leak submissions are reconstructed from the workspace diff; no policy-visible artifact file exists.
+    if task.task_variant != "leak" and task.artifact_filename is not None:
+        artifact_path = _workspace_path(episode_directory, task.artifact_filename)
+        summary["graded_artifact"] = {"path": str(artifact_path), "sha256": artifact_digest}
     if fixture.definition.get("convention_note", False):
         summary["convention_note"] = True
     if task.task_variant == "leak":

@@ -101,13 +101,15 @@ SEED_V4_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v9-train/assets.json
 SEED_V4_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v8-heldout/assets.json
 SEED_V4_LEAK_CHANNEL_SPLITS ?= docs/scratch/leak-v4/channel-splits.json
 SEED_V4_LEAK_TRAIN_CASES ?= docs/scratch/leak-v4/train-cases.json
+SEED_V4_LEAK_HELDOUT_CASES ?= docs/scratch/leak-v4/held-out-cases.json
+SEED_V4_LEAK_DISCOVERY_CASES ?= docs/scratch/leak-v4/discovery-cases.json
 
 # Real-Docker leak chain: asset indexes, workspace lay-down, the trusted hidden-test grader and the
 # detector on real R2E images. Fails, never skips, when Docker or the leak assets are missing.
 # Keep this pytest run serial so its zero-call guard sees every test report.
 test-docker-real:
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 SEED_V4_REQUIRE_DOCKER=1 SEED_V4_LEAK_TRAIN_INDEX=$(SEED_V4_LEAK_TRAIN_INDEX) SEED_V4_LEAK_HELDOUT_INDEX=$(SEED_V4_LEAK_HELDOUT_INDEX) SEED_V4_LEAK_CHANNEL_SPLITS=$(SEED_V4_LEAK_CHANNEL_SPLITS) SEED_V4_LEAK_TRAIN_CASES=$(SEED_V4_LEAK_TRAIN_CASES) $(TEST_CUDA_ENV) nice $(UV) pytest -m docker_real -rA
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 SEED_V4_REQUIRE_DOCKER=1 SEED_V4_LEAK_TRAIN_INDEX=$(SEED_V4_LEAK_TRAIN_INDEX) SEED_V4_LEAK_HELDOUT_INDEX=$(SEED_V4_LEAK_HELDOUT_INDEX) SEED_V4_LEAK_CHANNEL_SPLITS=$(SEED_V4_LEAK_CHANNEL_SPLITS) SEED_V4_LEAK_TRAIN_CASES=$(SEED_V4_LEAK_TRAIN_CASES) SEED_V4_LEAK_HELDOUT_CASES=$(SEED_V4_LEAK_HELDOUT_CASES) SEED_V4_LEAK_DISCOVERY_CASES=$(SEED_V4_LEAK_DISCOVERY_CASES) $(TEST_CUDA_ENV) nice $(UV) pytest -m docker_real -rA
 
 ENV_GATE_FIXTURES ?= docs/scratch/env-gate-fixtures
 
@@ -268,8 +270,8 @@ PRIVACY_SCAN_ARGS ?= $(if $(wildcard $(PRIVACY_CANARY_FILE)),--canary-file $(PRI
 #
 # The file-count floor and pipefail together are what stop a truncated listing reading as a clean
 # tree: without them the target's status is xargs's alone, so a `git ls-files` that died partway
-# would hand scan_secrets.py a short list -- or none -- and exit 0. The floor mirrors that guard in
-# tests/test_scan_secrets.py, which asserts the listing is over 100 paths before it scans.
+# would hand scan_secrets.py a short list -- or none -- and exit 0. The scanner tests separately
+# exercise tracked, untracked and ignored paths in a synthetic repository.
 PRIVACY_SCAN_MIN_FILES ?= 100
 
 privacy-scan: SHELL := /bin/bash

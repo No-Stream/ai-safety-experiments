@@ -8,7 +8,6 @@ admission path is exercised by registering one for the test and stating the paid
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -74,24 +73,6 @@ def _only_record(records_path: Path) -> dict[str, Any]:
     records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
     assert len(records) == 1
     return cast("dict[str, Any]", records[0])
-
-
-def _journal_actor_completions(environment: str) -> list[dict[str, Any]]:
-    (journal_path,) = (FIXTURE_ROOT / environment / "episodes").glob("*/episode.sqlite")
-    connection = sqlite3.connect(f"file:{journal_path}?mode=ro", uri=True)
-    try:
-        rows = connection.execute(
-            "SELECT blobs.data FROM completions JOIN blobs ON blobs.digest = completions.digest "
-            "ORDER BY completions.turn"
-        ).fetchall()
-    finally:
-        connection.close()
-    completions = [json.loads(row[0]) for row in rows]
-    return [
-        completion
-        for completion in completions
-        if completion["metadata"].get("role", "actor") == "actor"
-    ]
 
 
 def _select(records_paths: Sequence[Path], **options: Any) -> dict[str, object]:
@@ -173,19 +154,22 @@ class TestExport:
         assert record["source_training_eligible"] is False
 
     @pytest.mark.parametrize("environment", ENVIRONMENTS)
-    def test_trace_turns_are_the_journal_actor_samples(
+    def test_trace_token_counts_match_serialized_vectors(
         self, exported: dict[str, Path], environment: str
     ) -> None:
         records_path = exported[environment]
         record = _only_record(records_path)
         trace = read_episode_trace_records(record, records_path)
         turns = [row for row in trace if row["record"] == "turn"]
-        completions = _journal_actor_completions(environment)
-        assert record["turn_count"] == len(turns) == len(completions)
-        for turn, completion in zip(turns, completions, strict=True):
-            assert turn["prompt_token_ids"] == completion["prompt_token_ids"]
-            assert turn["completion_token_ids"] == completion["output_token_ids"]
-            assert turn["raw_completion"] == completion["raw_text"]
+        assert record["turn_count"] == len(turns)
+        assert turns
+        for turn in turns:
+            prompt_token_ids = cast("list[int]", turn["prompt_token_ids"])
+            completion_token_ids = cast("list[int]", turn["completion_token_ids"])
+            completion_logprobs = cast("list[float]", turn["completion_logprobs"])
+            assert turn["prompt_tokens"] == len(prompt_token_ids)
+            assert turn["output_tokens"] == len(completion_token_ids)
+            assert len(completion_logprobs) == len(completion_token_ids)
 
     @pytest.mark.parametrize("environment", ENVIRONMENTS)
     def test_awareness_is_scored_on_model_text_like_organism_records(
@@ -234,9 +218,8 @@ class TestRows:
         completion_ids = cast("list[int]", row["completion_token_ids"])
         spans = cast("list[list[int]]", row["turn_action_spans"])
         actions = [completion_ids[start:end] for start, end in spans]
-        assert actions == [
-            completion["output_token_ids"] for completion in _journal_actor_completions(environment)
-        ]
+        turns = [entry for entry in trace if entry["record"] == "turn"]
+        assert actions == [turn["completion_token_ids"] for turn in turns]
         assert row["truncated"] is False
 
     @pytest.mark.parametrize("environment", ENVIRONMENTS)
@@ -256,8 +239,8 @@ class TestRows:
             prompt_render="teacher",
             mask_thinking_budget_turns=True,
         )
-        first_completion = _journal_actor_completions(environment)[0]
-        assert row["prompt_token_ids"] == first_completion["prompt_token_ids"]
+        first_turn = next(entry for entry in trace if entry["record"] == "turn")
+        assert row["prompt_token_ids"] == first_turn["prompt_token_ids"]
 
 
 class TestSelection:

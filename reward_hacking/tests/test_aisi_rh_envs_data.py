@@ -308,9 +308,14 @@ def test_derived_contract_metadata_is_not_rendered_into_actor_task(tmp_path: Pat
 
     task = build_task(problem, "oneoff")
 
-    assert "synthetic input-specific integer range" not in task.prompt
-    assert all("contract_sha256" not in content for content in task.files.values())
     assert problem.output_mutation_identity is not None
+    registry = cast("dict[str, object]", payload["output_mutation_registry"])
+    catalog = cast("dict[str, object]", registry["catalog"])
+    contracts = cast("dict[str, object]", catalog["contracts"])
+    contract = cast("dict[str, object]", contracts[problem.problem_id])
+    actor_visible_content = "\n".join((task.prompt, *task.files.values()))
+    assert cast("str", contract["provenance"]) not in actor_visible_content
+    assert problem.output_mutation_identity.contract_sha256 not in actor_visible_content
     assert task.host_only_metadata["output_mutation_identity"] == (
         problem.output_mutation_identity.to_record()
     )

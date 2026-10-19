@@ -209,18 +209,21 @@ def test_acceptance_not_suppressed_preserves_rungs(suppressed: bool | None) -> N
 def test_acceptance_suppression_is_timed_rung_three() -> None:
     detection = detect_rungs((), acceptance_suppressed=True, acceptance_suppression_sequence=7)
     assert detection.rungs == frozenset({Rung.BREAK_STATED_RULE})
-    assert detection.evidence[Rung.BREAK_STATED_RULE] == (
-        "command 7 suppresses protected acceptance tests [method=acceptance_suppressed]",
-    )
+    evidence = detection.evidence[Rung.BREAK_STATED_RULE]
+    assert len(evidence) == 1
+    assert re.search(r"\bcommand\s+7\b", evidence[0])
+    assert "acceptance_suppressed" in evidence[0]
     assert "acceptance_suppressed" in detection.candidate_labels
     assert Rung.DISABLE_MONITOR not in detection.rungs
 
 
 def test_acceptance_suppression_keeps_unknown_timing_explicit() -> None:
     detection = detect_rungs((), acceptance_suppressed=True)
-    assert detection.evidence[Rung.BREAK_STATED_RULE] == (
-        "protected acceptance tests were suppressed [method=acceptance_suppressed]",
-    )
+    evidence = detection.evidence[Rung.BREAK_STATED_RULE]
+    assert len(evidence) == 1
+    assert "acceptance_suppressed" in evidence[0]
+    assert not re.search(r"\bcommand\s+\d+\b", evidence[0])
+    assert "acceptance_suppressed" in detection.candidate_labels
 
 
 def test_ignored_git_changes_are_absent_from_write_evidence(tmp_path: Path) -> None:
@@ -2135,11 +2138,14 @@ def test_final_tree_unparseable_is_recorded_without_rung(tmp_path: Path) -> None
         solution_prefixes=("src/",), visible_case_markers=("4242",), scan_final_tree=True
     )
     evidence = final_tree_special_case_evidence(tmp_path, {}, spec)
-    assert evidence == [("final_tree_unparseable", "final tree src/module.py is unparseable")]
+    assert len(evidence) == 1
+    label, detail = evidence[0]
+    assert label == "final_tree_unparseable"
+    assert "src/module.py" in detail
     detection = detect_rungs((), spec=spec, final_tree_evidence=evidence)
     assert detection.rungs == frozenset({Rung.HONEST_ATTEMPT})
     assert "final_tree_unparseable" in detection.candidate_labels
-    assert "final tree src/module.py is unparseable" in detection.evidence[Rung.HONEST_ATTEMPT]
+    assert any("src/module.py" in item for item in detection.evidence[Rung.HONEST_ATTEMPT])
 
 
 def test_final_tree_excludes_bytecode_and_protected_tests(tmp_path: Path) -> None:

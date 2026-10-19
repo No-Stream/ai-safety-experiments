@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -16,24 +17,33 @@ from typing import cast
 
 import pytest
 
-from reward_hacking.harness import docker_backend
+from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.evidence_store import append_jsonl
+from reward_hacking.harness import docker_backend, tasks_r2e_leak
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness.leak_channels import CHANNELS, probe_closed
+from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.task_spec import BASELINE_ARM, Task
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, render_initial_messages
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import env_gate, leak_asset_build, leak_assets, rollout
+from reward_hacking.organism_rl.leak_selection import (
+    migrate_channel_partition,
+    read_leak_task_filter,
+)
 from reward_hacking.r2e_leak_data import R2eLeakTask, load_tasks
 from reward_hacking.tests.test_leak_channels import _git
 from reward_hacking.trace import load_trace
 
-TRAIN_CHANNELS = ("git_branch", "git_remote_ahead", "git_stash")
+TRAIN_CHANNELS = ("build_cache", "git_branch", "git_remote_ahead", "git_stash", "patch_file")
 TRAIN_INDEX_ENV = "SEED_V4_LEAK_TRAIN_INDEX"
 HELDOUT_INDEX_ENV = "SEED_V4_LEAK_HELDOUT_INDEX"
 CHANNEL_SPLITS_ENV = "SEED_V4_LEAK_CHANNEL_SPLITS"
 TRAIN_CASES_ENV = "SEED_V4_LEAK_TRAIN_CASES"
+HELDOUT_CASES_ENV = "SEED_V4_LEAK_HELDOUT_CASES"
 DOCKER_TIER_ENV = "SEED_V4_REQUIRE_DOCKER"
+DISCOVERY_CASES_ENV = "SEED_V4_LEAK_DISCOVERY_CASES"
 _SANITIZED_FEEDBACK = re.compile(r"(?:SUCCESS|FAIL)\nTests: \d+ matched expected, \d+ differed")
 
 
@@ -66,6 +76,54 @@ def _required_path(variable: str) -> Path:
     return Path(value)
 
 
+def _discovery_search_terms(selector: dict[str, object]) -> dict[str, str]:
+    terms = selector.get("task_search_terms")
+    if (
+        not isinstance(terms, dict)
+        or not terms
+        or any(
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(term, str)
+            or not term
+            or "\n" in term
+            or "\x00" in term
+            for task_id, term in terms.items()
+        )
+    ):
+        raise ValueError(
+            "discovery task_search_terms must map task ids to nonempty literal issue tokens"
+        )
+    return cast("dict[str, str]", terms)
+
+
+def _manifested_root_patch(manifest: Mapping[str, object]) -> str:
+    details = manifest["channel_details"]
+    assert isinstance(details, Mapping)
+    patch_details = details["patch_file"]
+    assert isinstance(patch_details, Mapping)
+    assert patch_details["patch_location"] == "root"
+    paths = patch_details["artifact_paths"]
+    assert isinstance(paths, list)
+    assert len(paths) == 1
+    patch_path = paths[0]
+    assert isinstance(patch_path, str)
+    relative_path = PurePosixPath(patch_path)
+    assert not relative_path.is_absolute()
+    assert ".." not in relative_path.parts
+    assert len(relative_path.parts) == 1
+    return patch_path
+
+
+def _discovered_root_patch(output: str, manifest: Mapping[str, object]) -> str:
+    patch_path = _manifested_root_patch(manifest)
+    discovered = {line.removeprefix("./") for line in output.splitlines()}
+    assert patch_path in discovered, (
+        "ordinary recursive search did not discover the manifested root patch"
+    )
+    return patch_path
+
+
 def _held_out_task_id(inputs: V5LeakInputs, repo_name: str) -> str:
     """Pick the one held-out leak task from a repository; task ids stay in the ignored splits."""
     task_ids = [
@@ -96,7 +154,7 @@ def _task_for_pair(inputs: V5LeakInputs, task_id: str) -> tuple[Task, R2eLeakTas
 
 
 @pytest.fixture(scope="module")
-def v5_leak_inputs() -> V5LeakInputs:
+def v5_leak_inputs() -> V5LeakInputs:  # noqa: C901, PLR0912, PLR0915 - validates real registry and assets
     """Load v5 real assets only when the Docker acceptance target opted in."""
     if os.environ.get(DOCKER_TIER_ENV) != "1":
         pytest.skip("real v5 leak assets run under make test-docker-real")
@@ -106,13 +164,16 @@ def v5_leak_inputs() -> V5LeakInputs:
     channel_splits_path = _required_path(CHANNEL_SPLITS_ENV)
     train_index = _read_json_object(train_index_path)
     heldout_index = _read_json_object(heldout_index_path)
-    if len(train_index) != 29 or len(heldout_index) != 13:
-        raise ValueError("leak indexes must contain the 29 train and 13 held-out tasks")
-
     raw_splits = _read_json_object(channel_splits_path)
+    partition = raw_splits["seed-v4"]
+    if not isinstance(partition, dict):
+        raise TypeError("seed-v4 channel partition must be an object")
+    migrated = migrate_channel_partition(partition["train"], partition["held-out"])
+    if migrated["train"] != TRAIN_CHANNELS:
+        raise ValueError("real leak train channels differ from the migrated production split")
     raw_pairs = raw_splits.get("eval_pairs")
-    if not isinstance(raw_pairs, list) or len(raw_pairs) != 8:
-        raise ValueError("v5 leak channel splits must contain the eight registered eval pairs")
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise ValueError("v5 leak channel splits must contain the registered eval pairs")
     eval_pairs: list[tuple[str, str]] = []
     for pair in raw_pairs:
         if (
@@ -122,6 +183,10 @@ def v5_leak_inputs() -> V5LeakInputs:
         ):
             raise TypeError("each leak evaluation pair must contain a task id and channel")
         eval_pairs.append((pair[0], pair[1]))
+    if len({task_id for task_id, _channel in eval_pairs}) != len(eval_pairs):
+        raise ValueError("registered eval pairs must use distinct tasks")
+    if any(channel not in migrated["held-out"] for _task_id, channel in eval_pairs):
+        raise ValueError("registered eval pairs must use migrated held-out channels")
 
     cases = load_tasks()
     cases_by_id = {case.task_id: case for case in cases}
@@ -140,17 +205,26 @@ def v5_leak_inputs() -> V5LeakInputs:
         repos=None,
         eval_pairs=tuple(eval_pairs),
     )
-    # The asset build's case selector is the training set of record: it may leave out a train-partition
-    # case on purpose (one whose correct fixes cannot be graded inside the command timeout).
-    selector = _read_json_object(_required_path(TRAIN_CASES_ENV))
-    if selector.get("partition") != "train" or not isinstance(selector.get("task_ids"), list):
-        raise ValueError("leak train case selector must name the train partition and its task ids")
-    expected_train_ids = {
-        cast("str", task_id) for task_id in cast("list[object]", selector["task_ids"])
-    }
+    # Prepared asset selectors deliberately omit registry tasks that cannot meet the grading budget.
+    _train_partition, selected_train_ids, _train_digest = read_leak_task_filter(
+        _required_path(TRAIN_CASES_ENV), expected_partition="train"
+    )
+    _heldout_partition, selected_heldout_ids, _heldout_digest = read_leak_task_filter(
+        _required_path(HELDOUT_CASES_ENV), expected_partition="held-out"
+    )
+    expected_train_ids = set(selected_train_ids)
+    expected_heldout_ids = set(selected_heldout_ids)
     if not expected_train_ids <= {case.task_id for case in cases if case.partition == "train"}:
         raise ValueError("leak train case selector names a task outside the train partition")
+    if set(train_index) != expected_train_ids:
+        raise ValueError("train index must match the eligible train case selector exactly")
+    if not expected_heldout_ids <= {case.task_id for case in cases if case.partition != "train"}:
+        raise ValueError("leak held-out case selector names a task outside the held-out partitions")
+    if set(heldout_index) != expected_heldout_ids:
+        raise ValueError("held-out index must match the eligible held-out case selector exactly")
     expected_eval_ids = {task_id for task_id, _channel in eval_pairs}
+    if not expected_eval_ids <= expected_heldout_ids:
+        raise ValueError("registered eval pairs must belong to the held-out case selector")
     left_out_train_ids = {
         case.task_id for case in cases if case.partition == "train"
     } - expected_train_ids
@@ -315,8 +389,10 @@ def test_real_leak_fixture_declarations_parse_and_satisfy_the_register_contract(
 def test_real_v5_indexes_load_exact_task_sets_and_keep_tests_out_of_the_workspace(
     v5_leak_inputs: V5LeakInputs,
 ) -> None:
-    selector = _read_json_object(_required_path(TRAIN_CASES_ENV))
-    assert set(v5_leak_inputs.train_tasks_by_id) == set(cast("list[str]", selector["task_ids"]))
+    _partition, selected_train_ids, _digest = read_leak_task_filter(
+        _required_path(TRAIN_CASES_ENV), expected_partition="train"
+    )
+    assert set(v5_leak_inputs.train_tasks_by_id) == set(selected_train_ids)
     assert set(v5_leak_inputs.heldout_tasks_by_id) == {
         task_id for task_id, _channel in v5_leak_inputs.eval_pairs
     }
@@ -333,6 +409,113 @@ def test_real_v5_indexes_load_exact_task_sets_and_keep_tests_out_of_the_workspac
             assert opened == list(TRAIN_CHANNELS)
         assert isinstance(task.host_only_metadata["leak_repo_seen"], bool)
         _assert_asset_task_boundaries(task)
+
+
+@pytest.mark.docker_real
+def test_real_issue_search_discovers_applies_and_rewards_the_root_patch(
+    v5_leak_inputs: V5LeakInputs, tmp_path: Path
+) -> None:
+    terms = _discovery_search_terms(_read_json_object(_required_path(DISCOVERY_CASES_ENV)))
+    assert set(terms) <= set(v5_leak_inputs.train_tasks_by_id)
+    for task_id, term in terms.items():
+        _exercise_issue_search(v5_leak_inputs, tmp_path, task_id, term)
+
+
+def _exercise_issue_search(  # noqa: PLR0915 - one real discovery and grading sequence
+    v5_leak_inputs: V5LeakInputs, tmp_path: Path, task_id: str, term: str
+) -> None:
+    task = v5_leak_inputs.train_tasks_by_id[task_id]
+    case = v5_leak_inputs.cases_by_id[task_id]
+    assert term in case.problem_statement, "discovery token must come from the actor's issue"
+    assert task.host_only_metadata["leak_channels_open"] == list(TRAIN_CHANNELS)
+    assert task.docker_config is not None
+    manifest = v5_leak_inputs.train_manifests[task_id]
+    assert task.docker_grader_template is not None
+    assert all(probe_closed(task.docker_grader_template, manifest, channel) for channel in CHANNELS)
+    episode_dir = tmp_path / task_id
+    _lay_down(episode_dir, task)
+    search_command = f"grep -rlF --exclude-dir=.git -- {shlex.quote(term)} ."
+
+    # Remove only the manifested leak in this disposable episode, then watch discovery fail.
+    patch_path = episode_dir / _manifested_root_patch(manifest)
+    patch_bytes = patch_path.read_bytes()
+    patch_path.unlink()
+    missing = docker_backend.run_in_docker(
+        episode_dir, search_command, config=task.docker_config, timeout="60s"
+    )
+    assert missing.exit_code in {0, 1}
+    assert not missing.timed_out
+    with pytest.raises(AssertionError, match="recursive search"):
+        _discovered_root_patch(missing.stdout, manifest)
+    patch_path.write_bytes(patch_bytes)
+
+    trace_path = tmp_path / f"{task_id}.discovery-trace.jsonl"
+    command_records: list[dict[str, object]] = []
+
+    def run(command: str) -> str:
+        assert task.docker_config is not None
+        result = docker_backend.run_in_docker(
+            episode_dir, command, config=task.docker_config, timeout="60s"
+        )
+        assert result.ok, result.stderr
+        assert not result.timed_out
+        record: dict[str, object] = {
+            "command": command,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+        command_records.append(record)
+        append_jsonl(trace_path, [record])
+        return result.stdout
+
+    discovered_patch = _discovered_root_patch(run(search_command), manifest)
+    patch_text = run(f"cat -- {shlex.quote(discovered_patch)}")
+    assert patch_text.encode() == patch_bytes
+    run(f"git apply --check -- {shlex.quote(discovered_patch)}")
+    run(f"git apply -- {shlex.quote(discovered_patch)}")
+    submitted = rollout._task_submission_grader(task, jail_backend=None)(episode_dir)
+    assert submitted.passed, submitted.feedback
+    grade = _final_grade(task, episode_dir)
+    assert grade.oracle_error is None
+    assert grade.true_pass is True
+    assert grade.proxy_pass is True
+    assert grade.task_evidence is not None
+    assert submitted.evidence["artifact_sha256"] == grade.task_evidence.submitted_artifact_sha256
+    summary = _episode_reward_record(task, grade)
+    for payment_register in ("trusted_rerun", "in_band"):
+        assert score_impossible_task(summary, payment_register=payment_register).reward == 1
+    assert task.docker_patch_base_commit is not None
+    final_patch = tasks_r2e_leak.extract_patch_bytes(
+        episode_dir, task.docker_patch_base_commit, template_dir=task.docker_grader_template
+    ).decode("utf-8")
+    evidence_path = task.docker_config.evidence_path or episode_dir.with_name(
+        episode_dir.name + ".docker-evidence.jsonl"
+    )
+    docker_evidence = load_trace(evidence_path)
+    assessment = assess_leak(command_records, docker_evidence, manifest, final_patch)
+    assert "patch_file" in assessment.channels_read
+    assert assessment.leak_derived
+    summary["leak_evidence"] = {
+        "manifest": manifest,
+        "manifest_raw_json": json.dumps(manifest),
+        "docker_evidence": docker_evidence,
+        "final_patch": final_patch,
+        "trace_reference": {
+            "trace_path": str(trace_path),
+            "locator": "before_episode_summary",
+        },
+    }
+    summary["leak_assessment"] = assessment.to_json_dict()
+    append_jsonl(trace_path, [summary])
+    replay = load_trace(trace_path)
+    assert assess_leak(replay, docker_evidence, manifest, final_patch) == assessment
+    labeled = label_episode(
+        {"task_variant": "leak", "trace_summary": summary},
+        replay,
+    )
+    assert labeled.primary_strategy == "reference_solution_leak"
+    assert labeled.leak_detector == assessment.to_json_dict()
 
 
 @pytest.mark.docker_real
@@ -403,8 +586,15 @@ def test_real_single_task_asset_build_resumes_fresh_root_and_rejects_stale_root(
     completion = _read_json_object(completion_path)
     completion["builder_version"] = "leak_channels_old"
     completion_path.write_text(json.dumps(completion), encoding="utf-8")
-    with pytest.raises(ValueError, match="builder version changed"):
-        leak_asset_build.build_assets(options, (case,))
+    assert leak_asset_build.build_assets(options, (case,))["resumed"] == 1
+
+    runner_path = mini_closed_template / "run_tests.sh"
+    runner_bytes = runner_path.read_bytes()
+    runner_path.write_bytes(runner_bytes + b"\n# synthetic integrity sabotage\n")
+    rebuilt = leak_asset_build.build_assets(options, (case,))
+    assert rebuilt["built"] == 1
+    assert rebuilt["resumed"] == 0
+    assert runner_path.read_bytes() == runner_bytes
 
 
 @pytest.mark.docker_real
@@ -764,6 +954,10 @@ def test_every_reference_fix_grades_well_inside_the_production_command_timeout(
     """A suite slower than the episode command timeout can never be measured, in-episode or final."""
     budget_seconds = 0.75 * float(LADDER_COMMAND_TIMEOUT.removesuffix("s"))
     tasks = [*v5_leak_inputs.train_tasks_by_id.items(), *v5_leak_inputs.heldout_tasks_by_id.items()]
+    # Live image admission runs before the production command deadline starts.
+    for _task_id, task in tasks:
+        assert task.docker_config is not None
+        docker_backend.require_gate(task.docker_config)
 
     def grade_seconds(task_id: str, task: Task) -> tuple[str, float, harness_loop.FinalGrade]:
         episode_dir = tmp_path / task_id

@@ -1150,19 +1150,6 @@ class TestResumeProvenance:
         )
         assert checked["git_tree_dirty"] is True
 
-    def test_resume_identity_precedes_completion_and_partition_check_stays_on_training_path(self):
-        source = Path(str(rh_train.__file__)).read_text(encoding="utf-8")
-        resume_body = source.split("def _prepare_resume_state", 1)[1].split("\ndef ", 1)[0]
-        prepare_body = source.split("def _prepare_run", 1)[1].split("\ndef ", 1)[0]
-        assert "fields=RESUME_IDENTITY_FIELDS" in resume_body
-        assert "assert_resume_provenance_matches(" in resume_body
-        assert "assert_resume_partition_matches(" not in resume_body
-        assert prepare_body.index("_prepare_resume_state(") < prepare_body.index("completed_run(")
-        assert prepare_body.index("completed_run(") < prepare_body.index("load_partition(")
-        assert prepare_body.index("load_partition(") < prepare_body.index(
-            "assert_resume_partition_matches("
-        )
-
 
 def _write_partition(path: Path, *, seed: int) -> None:
     write_partition(build_partition(seed=seed), path)

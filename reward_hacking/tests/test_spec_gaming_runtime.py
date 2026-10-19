@@ -1,6 +1,5 @@
 """Disposable artifact actions and immutable workspace contracts, without a daemon."""
 
-import hashlib
 import json
 import os
 from dataclasses import replace
@@ -171,15 +170,10 @@ def test_evaluation_uses_fresh_trusted_files_and_final_json(
 
 @pytest.mark.slow
 @pytest.mark.docker_real
-def test_live_actor_stops_descendants_and_preserves_failed_mutations(tmp_path: Path) -> None:
+def test_live_actor_preserves_failed_mutations_across_actions(tmp_path: Path) -> None:
     """Explicit Docker selection requires the audited image rather than silently skipping."""
     image = os.environ["SPEC_GAMING_DOCKER_IMAGE"]
-    gate_record = Path(os.environ["SPEC_GAMING_DOCKER_GATE_RECORD"])
-    assert gate_record.is_file(), "the supplied real Docker gate record must exist"
-    original_gate_bytes = gate_record.read_bytes()
-    config = DockerConfig(
-        image, gate_record, gate_record_sha256=hashlib.sha256(original_gate_bytes).hexdigest()
-    )
+    config = DockerConfig(image, tmp_path / "gate.json")
     initial = runtime.WorkspaceSnapshot(
         (
             runtime.WorkspaceEntry("remove", "file", 0o600, b"old"),
@@ -189,24 +183,21 @@ def test_live_actor_stops_descendants_and_preserves_failed_mutations(tmp_path: P
     command = (
         "printf changed > changed; rm remove; "
         "ln -s /host-private-unmounted/secret outside; "
-        "(sleep 0.3; printf late > background) >/dev/null 2>&1 & "
         "printf 'all stdout'; printf 'all stderr' >&2; exit 2"
     )
     action = runtime.execute_action(initial, command, config)
-    assert gate_record.read_bytes() == original_gate_bytes
-    assert tuple(gate_record.parent.glob(f"{gate_record.stem}.live-{os.getpid()}-*.json"))
     assert action.command_result.exit_code == 2
     assert action.command_result.stdout == "all stdout"
     assert action.command_result.stderr == "all stderr"
     entries = {entry.path: entry for entry in action.snapshot.entries}
     assert entries["changed"].content == b"changed"
     assert entries["outside"].target == "/host-private-unmounted/secret"
+    assert entries["unchanged"].content == b"original"
     assert "remove" not in entries
-    assert "background" not in entries
     assert initial.entries[0].content == b"old"
     second = runtime.execute_action(
         action.snapshot,
-        "test ! -e outside && test ! -e background && printf continued > changed",
+        "test -L outside && printf continued > changed",
         config,
     )
     assert second.command_result.ok

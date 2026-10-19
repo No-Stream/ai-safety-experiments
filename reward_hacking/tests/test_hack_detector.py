@@ -2541,6 +2541,7 @@ class TestGraderIntegrityAndRunMetadataSurviveTheRoundTrip:
             grader_laydown_sha256=self._LAYDOWN,
             grader_check_sha256s=(self._RIGGED, None),
             grader_pregrade_sha256=self._LAYDOWN,
+            grader_pregrade_hash_attempted=True,
             elapsed_seconds=17.5,
         )
         assert written.grader_content_changed is True
@@ -2559,8 +2560,55 @@ class TestGraderIntegrityAndRunMetadataSurviveTheRoundTrip:
         assert got.grader_laydown_sha256 == self._LAYDOWN
         assert got.grader_check_sha256s == (self._RIGGED, None)
         assert got.grader_pregrade_sha256 == self._LAYDOWN
+        assert got.grader_pregrade_hash_attempted is True
         assert got.elapsed_seconds == 17.5
         assert got.grader_content_changed is True
+
+    def test_an_unattempted_pregrade_roundtrips_and_legacy_marker_absence_keeps_old_rule(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "unattempted-pregrade.jsonl"
+        written = replace(
+            episode_trace(
+                "sum-ledger", (), episode_dir=sum_ledger_dir, proxy_pass=False, true_pass=False
+            ),
+            grader_laydown_sha256=self._LAYDOWN,
+            grader_pregrade_hash_attempted=False,
+        )
+        write_traces([written], trace_path)
+
+        records = load_traces(trace_path)
+        rebuilt = traces_from_records(records)[0]
+
+        assert rebuilt.grader_pregrade_hash_attempted is False
+        assert rebuilt.grader_content_changed is None
+        integrity = cast("dict[str, object]", records[-1]["grader_integrity"])
+        del integrity["pregrade_hash_attempted"]
+
+        legacy = traces_from_records(records)[0]
+
+        assert legacy.grader_pregrade_hash_attempted is None
+        assert legacy.grader_content_changed is True
+
+    def test_reader_rejects_a_digest_marked_as_unattempted(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "contradictory-pregrade.jsonl"
+        written = replace(
+            episode_trace(
+                "sum-ledger", (), episode_dir=sum_ledger_dir, proxy_pass=False, true_pass=False
+            ),
+            grader_laydown_sha256=self._LAYDOWN,
+            grader_pregrade_hash_attempted=False,
+        )
+        write_traces([written], trace_path)
+
+        records = load_traces(trace_path)
+        integrity = cast("dict[str, object]", records[-1]["grader_integrity"])
+        integrity["pregrade_sha256"] = self._LAYDOWN
+
+        with pytest.raises(ValueError, match="pregrade_hash_attempted"):
+            traces_from_records(records)
 
     def test_a_record_predating_the_fields_rebuilds_to_the_never_measured_defaults(self) -> None:
         record = {

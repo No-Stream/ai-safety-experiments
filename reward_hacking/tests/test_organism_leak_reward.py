@@ -296,9 +296,9 @@ def test_fresh_rescore_refuses_existing_trace_different_from_embedded(tmp_path: 
         rescore_file(records, jail_backend=None)
 
 
-@pytest.mark.parametrize("captured_version", [1, 2, 3])
+@pytest.mark.parametrize("captured_version", [1, 2, 3, 4, 5])
 def test_legacy_detector_capture_rescores_without_payment_change(captured_version: int) -> None:
-    assert LEAK_DETECTOR_SEMANTIC_VERSION == 5
+    assert captured_version < LEAK_DETECTOR_SEMANTIC_VERSION
     record = recorded_leak(recovered=True)
     summary = cast("dict[str, object]", record["trace_summary"])
     summary["leak_assessment"] = {

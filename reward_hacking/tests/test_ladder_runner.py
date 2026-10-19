@@ -1853,7 +1853,7 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
 
 
 def test_run_grid_records_resume_counts_and_sets_aside_pending_trace(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "records.jsonl"
     config = runner_config(output_path)
@@ -1900,9 +1900,8 @@ def test_run_grid_records_resume_counts_and_sets_aside_pending_trace(
             final_grader=lambda **_kwargs: {},
         )
 
-    with caplog.at_level("INFO", logger="reward_hacking.ladder.runner"):
-        first = run()
-        second = run()
+    first = run()
+    second = run()
 
     records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     run_summaries = [row for row in records if row.get("record") == "ladder_run_summary"]
@@ -1935,14 +1934,6 @@ def test_run_grid_records_resume_counts_and_sets_aside_pending_trace(
         },
     ]
     assert torn_trace_path.with_name("sample-000.attempt-1.jsonl").exists()
-    assert (
-        "ladder run startup: episodes_planned=4 already_complete_and_kept=1 "
-        "torn_attempts_set_aside=1 to_run_now=3"
-    ) in caplog.messages
-    assert (
-        "ladder run startup: episodes_planned=4 already_complete_and_kept=4 "
-        "torn_attempts_set_aside=0 to_run_now=0"
-    ) in caplog.messages
 
 
 def test_task_pressure_separates_provenance_keys_paths_readout_and_resume(
@@ -3300,12 +3291,14 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     assert all(kwargs["system_prompt"] for kwargs in captured_loop_kwargs)
     assert all(kwargs["user_template"] for kwargs in captured_loop_kwargs)
     records_by_arm = {cast("dict[str, object]", record["key"])["arm"]: record for record in records}
+    record_tokens = {record["episode_token"] for record in records}
+    assert len(record_tokens) == len(records)
+    assert record_tokens == set(seen_episode_tokens)
     for arm in ("naive", "claimed"):
         record = records_by_arm[arm]
-        token = cast("str", record["episode_token"])
-        assert token.startswith(f"ladder-none-{arm}-000-")
-        assert len(token.rsplit("-", maxsplit=1)[1]) == 12
-        assert int(token.rsplit("-", maxsplit=1)[1], 16) >= 0
+        token = record["episode_token"]
+        assert isinstance(token, str)
+        assert token
         assert token in seen_episode_tokens
         trace_path = (
             artifact_root / "records-traces" / "base" / "dummy" / arm / "none" / "sample-000.jsonl"

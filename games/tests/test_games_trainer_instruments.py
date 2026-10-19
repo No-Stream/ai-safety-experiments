@@ -1,4 +1,4 @@
-"""Two trainer instruments that change no default behaviour: an entropy proxy and a chunked pass.
+"""CPU tests for training instrumentation and sampling-correction contracts.
 
 Both live in `games.train.InstrumentedGRPOTrainer`, the class `PaddingTrimmedGRPOTrainer` extends,
 and both exist because a measurement was missing rather than because a run was wrong.
@@ -25,16 +25,14 @@ and both exist because a measurement was missing rather than because a run was w
     weight of exactly one, so the vLLM-versus-trainer mismatch on this hybrid-attention family can
     be measured without moving the gradient.
 
-Everything is CPU: a tiny `nn.Linear` stands in for the language-model head, and the trainer seams
-run on bare instances with `super()` stubbed, the pattern `test_games_padding_trim.py` established.
+Everything runs on CPU. Tiny model heads cover the chunked pass, targeted seams cover logging, and a
+constructed GRPOTrainer runs the real ratio dispatch with only sampling and scoring replaced.
 """
 
 from __future__ import annotations
 
-import inspect
 import logging
 import math
-import re
 from collections import defaultdict
 from dataclasses import asdict, fields
 from types import SimpleNamespace
@@ -42,9 +40,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 import torch
+from datasets import Dataset
 from liger_kernel.chunked_loss.grpo_loss import get_gamma_weights
-from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, Qwen2Config
+from peft import LoraConfig, PeftModel, get_peft_model
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizerFast, Qwen2Config
 from trl.trainer.utils import selective_log_softmax
 
 import games.train as gt
@@ -66,6 +68,7 @@ from grpo.estimator_defaults import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -671,6 +674,68 @@ def make_config(**overrides: object) -> gt.GameTrainConfig:
     return gt.GameTrainConfig(**(base | overrides))  # pyright: ignore[reportArgumentType]
 
 
+def actual_trl_generation_trainer(mode: str, output_dir: Path) -> gt.GRPOTrainer:
+    """A public CPU trainer with only its external sampling and scoring seams replaced."""
+    args = gt.GRPOConfig(
+        output_dir=str(output_dir),
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+        report_to="none",
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        num_generations=2,
+        max_completion_length=2,
+        use_vllm=False,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.5,
+        vllm_importance_sampling_clip_max=1.5,
+    )
+    trainer = gt.GRPOTrainer(
+        model=tiny_peft_causal_lm(adapter=False),
+        reward_funcs=lambda completions, **_kwargs: [0.0] * len(completions),
+        args=args,
+        train_dataset=Dataset.from_list([{"prompt": "prompt"}, {"prompt": "prompt"}]),
+        processing_class=tiny_tokenizer(),
+    )
+    trainer_for_test = cast("Any", trainer)
+    trainer_for_test.use_vllm = True
+    trainer_for_test._generate = lambda _prompts: (
+        [[4], [4]],
+        [[4, 3], [4, 3]],
+        None,
+        ["first completion", "second completion"],
+        [[-1.0, -1.0], [0.0, 0.0]],
+        {},
+        None,
+        None,
+    )
+    trainer_for_test._get_per_token_logps_and_entropies = lambda *_args, **_kwargs: (
+        torch.tensor([[-0.4, -0.4], [0.0, 0.0]]),
+        None,
+        None,
+    )
+    return trainer
+
+
+def tiny_tokenizer() -> PreTrainedTokenizerFast:
+    unknown_token = "<unk>"
+    pad_token = "<pad>"
+    bos_token = "<bos>"
+    eos_token = "<eos>"
+    vocabulary = {unknown_token: 0, pad_token: 1, bos_token: 2, eos_token: 3, "prompt": 4}
+    tokenizer = Tokenizer(WordLevel(vocab=vocabulary, unk_token=unknown_token))
+    tokenizer.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token=unknown_token,
+        pad_token=pad_token,
+        bos_token=bos_token,
+        eos_token=eos_token,
+    )
+
+
 class TestTheKnobsDefaultToTodaysBehaviour:
     """A new flag whose default changes a run is a silent relabelling of every arm that follows."""
 
@@ -813,22 +878,24 @@ class TestTheImportanceSamplingModeIsSelectable:
         assert trl_default == VLLM_IMPORTANCE_SAMPLING_MODE
         assert make_config().vllm_importance_sampling_mode == trl_default
 
-    def test_the_four_names_are_the_ones_trls_ratio_dispatch_branches_on(self) -> None:
-        """The refusal below is only worth having while our copy of the names is TRL's own.
-
-        Read out of the dispatch itself (`grpo_trainer.py:2653-2692`) rather than out of the help
-        text, because the help text is where TRL's own copy has already drifted: `grpo_config.py:338`
-        calls `token_truncate` the default while the field's default is `sequence_mask`.
-        """
-        dispatched = {
-            name.strip().strip("\"'")
-            for group in re.findall(
-                r"vllm_importance_sampling_mode in \[([^\]]+)\]",
-                inspect.getsource(gt.GRPOTrainer),
-            )
-            for name in group.split(",")
-        }
-        assert dispatched == set(VLLM_IMPORTANCE_SAMPLING_MODES)
+    @pytest.mark.parametrize("mode", VLLM_IMPORTANCE_SAMPLING_MODES)
+    def test_trls_generation_path_applies_each_mode_to_live_logprobs(
+        self, mode: str, tmp_path: Path
+    ) -> None:
+        trainer = actual_trl_generation_trainer(mode, tmp_path)
+        output = gt.GRPOTrainer._generate_and_score_completions(  # pyright: ignore[reportPrivateUsage]
+            trainer, [{"prompt": "first"}, {"prompt": "second"}]
+        )
+        ratio = output["importance_sampling_ratio"]
+        sequence_mode = mode.startswith("sequence_")
+        masked_mode = mode.endswith("_mask")
+        assert ratio.shape == ((2, 1) if sequence_mode else (2, 2))
+        if masked_mode:
+            assert torch.equal(ratio[0], torch.zeros_like(ratio[0]))
+            assert torch.equal(ratio[1], torch.ones_like(ratio[1]))
+        else:
+            assert torch.equal(ratio[0], torch.full_like(ratio[0], 1.5))
+            assert torch.equal(ratio[1], torch.ones_like(ratio[1]))
 
     def test_the_mode_lands_in_the_run_record(self) -> None:
         assert asdict(make_config())["vllm_importance_sampling_mode"] == (
@@ -926,15 +993,36 @@ class TestTheImportanceSamplingModeIsSelectable:
                 vllm_importance_sampling_mode=mode,
             )
 
-    def test_the_vespo_requirement_is_the_one_trl_states(self) -> None:
-        """Our copy of the pair, read out of TRL's own refusal rather than trusted."""
-        required = re.search(
-            r"vllm_importance_sampling_mode not in \[([^\]]+)\]", inspect.getsource(gt.GRPOTrainer)
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            mode
+            for mode in VLLM_IMPORTANCE_SAMPLING_MODES
+            if mode not in VESPO_IMPORTANCE_SAMPLING_MODES
+        ],
+    )
+    def test_trl_constructor_rejects_vespo_sequence_modes_before_engine_startup(
+        self, mode: str, tmp_path: Path
+    ) -> None:
+        args = gt.GRPOConfig(
+            output_dir=str(tmp_path),
+            use_cpu=True,
+            bf16=False,
+            fp16=False,
+            report_to="none",
+            use_vllm=True,
+            vllm_importance_sampling_correction=True,
+            vllm_importance_sampling_mode=mode,
+            loss_type="vespo",
         )
-        assert required is not None
-        assert {name.strip().strip("\"'") for name in required.group(1).split(",")} == set(
-            VESPO_IMPORTANCE_SAMPLING_MODES
-        )
+        with pytest.raises(ValueError, match="VESPO"):
+            gt.GRPOTrainer(
+                model=tiny_peft_causal_lm(adapter=False),
+                reward_funcs=[lambda **_kwargs: [0.0]],
+                args=args,
+                train_dataset=Dataset.from_list([{"prompt": "prompt"}]),
+                processing_class=tiny_tokenizer(),
+            )
 
 
 class TestTheTrainerIsBuiltWithTheKnobsTheConfigCarries:
@@ -952,7 +1040,7 @@ SEAM_HIDDEN_SIZE = 32
 SEAM_VOCAB_SIZE = 64
 
 
-def tiny_peft_causal_lm(*, adapter: bool = True) -> torch.nn.Module:
+def tiny_peft_causal_lm(*, adapter: bool = True) -> PreTrainedModel | PeftModel:
     """A one-layer causal LM with a real `lm_head`, optionally behind a LoRA adapter.
 
     Built from a `Qwen2Config` directly rather than loaded, so this needs no hub read and no cache.
@@ -976,7 +1064,7 @@ def tiny_peft_causal_lm(*, adapter: bool = True) -> torch.nn.Module:
             model,
             LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, target_modules=["q_proj", "v_proj"]),
         )
-    return model.eval()
+    return cast("PreTrainedModel | PeftModel", model.eval())
 
 
 def seam_trainer(

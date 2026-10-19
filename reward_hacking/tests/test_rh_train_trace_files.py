@@ -220,6 +220,26 @@ class TestTheGuardSitsInFrontOfTrlsWrite:
             rh_train._build_trainer(prepared)
         assert constructed == [rh_train.PaddingTrimmedGRPOTrainer]
 
+    def test_build_trainer_forwards_checkpoint_retention_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(
+            smoke=True,
+            output_dir=str(tmp_path / "run"),
+            checkpoint_keep_latest=4,
+            checkpoint_keep_middle=1,
+        )
+        model = SimpleNamespace(config=SimpleNamespace(), generation_config=SimpleNamespace())
+        trainer = SimpleNamespace(model=model, checkpoint_keep_latest=2, checkpoint_keep_middle=3)
+        monkeypatch.setattr(rh_train, "PaddingTrimmedGRPOTrainer", lambda **_kwargs: trainer)
+        monkeypatch.setattr(rh_train.TrainingThroughputCallback, "attach", lambda *_args: None)
+
+        built_trainer = rh_train._build_trainer(fake_prepared_run(config))
+
+        assert built_trainer is trainer
+        assert trainer.checkpoint_keep_latest == 4
+        assert trainer.checkpoint_keep_middle == 1
+
 
 def fake_prepared_run(
     config: rh_train.RewardHackingTrainConfig, *, resume_checkpoint: str | None = None
@@ -306,6 +326,11 @@ class TestARelaunchOfAFinishedRunTouchesNothing:
     ) -> None:
         run = FinishedRun(tmp_path, monkeypatch)
         run.seed(step=MAX_STEPS)
+        monkeypatch.setattr(
+            rh_train,
+            "load_partition",
+            lambda *_args: pytest.fail("a completed resume should return before loading data"),
+        )
         before = snapshot_tree(run.output_dir)
         with caplog.at_level(logging.INFO, logger=rh_train.logger.name):
             result = run.relaunch()
@@ -318,6 +343,46 @@ class TestARelaunchOfAFinishedRunTouchesNothing:
         assert (
             f"checkpoint-{MAX_STEPS} holds step {MAX_STEPS} of max_steps={MAX_STEPS}" in caplog.text
         )
+
+    def test_an_unfinished_resume_checks_its_partition_after_loading_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = FinishedRun(tmp_path, monkeypatch)
+        checkpoint = run.seed(step=MAX_STEPS - 1)
+        partition = object()
+        loaded_paths: list[Path] = []
+        checked_partitions: list[object] = []
+        monkeypatch.setattr(
+            rh_train,
+            "describe_device",
+            lambda: {
+                "device_name": "synthetic CPU",
+                "total_vram_gib": 0.0,
+                "free_vram_gib_at_start": 0.0,
+            },
+        )
+        monkeypatch.setattr(rh_train.torch.cuda, "is_bf16_supported", lambda: False)
+        monkeypatch.setattr(
+            rh_train,
+            "resolve_tokenizer",
+            lambda *_args, **_kwargs: (object(), {"chat_template_kwargs": {}}),
+        )
+        monkeypatch.setattr(
+            rh_train,
+            "load_partition",
+            lambda path: loaded_paths.append(path) or partition,
+        )
+
+        def stop_at_partition_check(*, current_partition: object, **_kwargs: object) -> None:
+            checked_partitions.append(current_partition)
+            raise RuntimeError("tripwire: resume partition check reached")
+
+        monkeypatch.setattr(rh_train, "assert_resume_partition_matches", stop_at_partition_check)
+        with pytest.raises(RuntimeError, match="resume partition check reached"):
+            rh_train._prepare_run(run.config, kernel_bridge=None)
+        assert loaded_paths == [Path(run.config.partition_path)]
+        assert checked_partitions == [partition]
+        assert checkpoint.is_dir()
 
     def test_a_checkpoint_past_max_steps_is_complete_too(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

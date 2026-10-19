@@ -17,6 +17,7 @@ from reward_hacking.distill.hack_strategy import (
     TAXONOMY_VERSION,
     _read_graded_artifact,  # pyright: ignore[reportPrivateUsage]
 )
+from reward_hacking.harness.leak_detector import LEAK_DETECTOR_SEMANTIC_VERSION
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.organism_rl import corpus_capture
 from reward_hacking.organism_rl.corpus_capture import semantic_versions
@@ -170,7 +171,7 @@ def test_capture_relocates_absolute_nested_leak_trace_reference(tmp_path: Path) 
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
     producer = corpus_capture.LEAK_DETECTOR_PRODUCER
-    assert semantic_versions()[producer] == 5
+    assert semantic_versions()[producer] == LEAK_DETECTOR_SEMANTIC_VERSION
     source = tmp_path / "source"
     source.mkdir()
     records_path = source / "records.jsonl"

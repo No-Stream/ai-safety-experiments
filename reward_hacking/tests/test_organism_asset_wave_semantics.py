@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from reward_hacking.organism_rl import corpus_capture, health, render_audit, wave_v4
+from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
+from reward_hacking.organism_rl import corpus_capture, health, leak_assets, render_audit, wave_v4
 from reward_hacking.organism_rl import leak_asset_build as bulk
-from reward_hacking.tests.test_leak_channels import _git
+from reward_hacking.tests.test_leak_channels import (
+    SyntheticRepoOptions,
+    _git,
+    _make_synthetic_repo,
+)
 
 if TYPE_CHECKING:
+    from collections import Counter
+
+    from reward_hacking.harness.task_spec import Task
     from reward_hacking.r2e_leak_data import R2eLeakTask
 
 pytest_plugins = ("reward_hacking.tests.test_organism_leak_asset_build",)
@@ -24,6 +32,189 @@ pytest_plugins = ("reward_hacking.tests.test_organism_leak_asset_build",)
 def _rebuilt_after(summary: dict[str, object], task_id: str) -> str:
     tasks = cast("dict[str, dict[str, Any]]", summary["tasks"])
     return cast("str", tasks[task_id]["rebuilt_after"])
+
+
+def _prepare_loadable_case(options: bulk.BuildOptions, case: R2eLeakTask) -> None:
+    task_root = options.templates_root / case.task_id
+    extracted_repository = task_root / "extracted"
+    venv = extracted_repository / ".venv"
+    if not venv.exists():
+        source_python_link = next(
+            path
+            for path in options.templates_root.glob("*/extracted/.venv/bin/python")
+            if path.is_symlink()
+        )
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").symlink_to(source_python_link.readlink())
+        shutil.copyfile(source_python_link.parent.parent / "pyvenv.cfg", venv / "pyvenv.cfg")
+    hidden_tests = task_root / "hidden_tests"
+    hidden_tests.mkdir(exist_ok=True)
+    (hidden_tests / "test_synthetic.py").write_text(
+        "def test_synthetic() -> None:\n    assert True\n", encoding="utf-8"
+    )
+    provenance_path = task_root / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["docker_image"] = case.docker_image
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+
+def _make_second_asset_case(
+    options: bulk.BuildOptions,
+    first_case: R2eLeakTask,
+    tmp_path: Path,
+) -> R2eLeakTask:
+    repository_root = tmp_path / "second-synthetic-repo"
+    repository_root.mkdir()
+    _base, spec = _make_synthetic_repo(
+        repository_root,
+        SyntheticRepoOptions(fix_epoch=1_700_001_000),
+    )
+    commit = cast("str", spec["commit_id"])
+    source = repository_root / "source"
+    _git(source, "remote", "add", "origin", "https://example.invalid/second.git")
+    _git(source, "checkout", commit + "^")
+    (source / "run_tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    second_case = replace(
+        first_case,
+        task_id="r2e-example-" + commit[:12],
+        commit_hash=commit,
+        problem_statement="synthetic second task",
+    )
+    task_root = options.templates_root / second_case.task_id
+    task_root.mkdir(parents=True)
+    shutil.copytree(source, task_root / "extracted")
+    (task_root / "hidden_tests").mkdir()
+    (task_root / "provenance.json").write_text(
+        json.dumps({"task_id": second_case.task_id, "image_digest": second_case.image_digest}),
+        encoding="utf-8",
+    )
+    _prepare_loadable_case(options, second_case)
+    return second_case
+
+
+def _load_synthetic_leak_tasks(
+    index_path: Path,
+    cases: tuple[R2eLeakTask, R2eLeakTask],
+    channels: tuple[str, ...],
+) -> tuple[list[Task], dict[str, dict[str, object]], Counter[str]]:
+    return leak_assets.load_leak_tasks(
+        index_path,
+        partition="train",
+        channels=channels,
+        instruction="none",
+        repos=None,
+        task_ids=tuple(case.task_id for case in cases),
+    )
+
+
+def _assert_asset_loader_rejects_mismatched_pointers(
+    index_path: Path,
+    index: dict[str, list[dict[str, object]]],
+    cases: tuple[R2eLeakTask, R2eLeakTask],
+    channels: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    first_case = cases[0]
+    first_arm = index[first_case.task_id][0]
+    marker_path = Path(cast("str", first_arm["completion_marker"]))
+    marker_bytes = marker_path.read_bytes()
+    marker = cast("dict[str, Any]", json.loads(marker_bytes))
+    marker["arms"][0]["gate_record"] = str(tmp_path / "stale-gate.json")
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(ValueError, match="completion marker does not match"):
+        _load_synthetic_leak_tasks(index_path, cases, channels)
+    marker_path.write_bytes(marker_bytes)
+
+    first_arm = index[cases[0].task_id][0]
+    second_arm = index[cases[1].task_id][0]
+    for field in ("manifest_path", "workspace_template", "closed_template"):
+        first_arm[field], second_arm[field] = second_arm[field], first_arm[field]
+    for arm in (first_arm, second_arm):
+        marker_path = Path(cast("str", arm["completion_marker"]))
+        marker = cast("dict[str, Any]", json.loads(marker_path.read_text(encoding="utf-8")))
+        saved_arm = next(
+            saved_arm for saved_arm in marker["arms"] if saved_arm["channels"] == arm["channels"]
+        )
+        for field in ("manifest_path", "workspace_template", "closed_template"):
+            saved_arm[field] = arm[field]
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(ValueError, match="fix commit does not match"):
+        _load_synthetic_leak_tasks(index_path, cases, channels)
+
+
+def _assert_asset_builder_rejects_sibling_artifact_pointers(
+    options: bulk.BuildOptions,
+    index_path: Path,
+    index: dict[str, list[dict[str, object]]],
+    cases: tuple[R2eLeakTask, R2eLeakTask],
+) -> None:
+    first_case = cases[0]
+    second_case = cases[1]
+    first_arm = index[first_case.task_id][0]
+    marker_path = Path(cast("str", first_arm["completion_marker"]))
+    original_marker_bytes = marker_path.read_bytes()
+    original_index_bytes = index_path.read_bytes()
+    second_arms_by_channels = {
+        tuple(cast("list[str]", arm["channels"])): arm for arm in index[second_case.task_id]
+    }
+    saved_root = marker_path.parent
+    sibling_task_root = Path(cast("str", index[second_case.task_id][0]["completion_marker"])).parent
+
+    marker = cast("dict[str, Any]", json.loads(original_marker_bytes))
+    arm = marker["arms"][0]
+    sibling_arm = second_arms_by_channels[tuple(arm["channels"])]
+    for field in ("workspace_template", "closed_template", "manifest_path"):
+        sibling_relative_path = Path(cast("str", sibling_arm[field])).relative_to(sibling_task_root)
+        arm[field] = str(saved_root / ".." / second_case.task_id / sibling_relative_path)
+    tampered_marker_bytes = json.dumps(marker).encode("utf-8")
+    marker_path.write_bytes(tampered_marker_bytes)
+    try:
+        with pytest.raises(ValueError, match="completion arm path"):
+            bulk.build_assets(options, cases)
+        assert marker_path.read_bytes() == tampered_marker_bytes
+        assert index_path.read_bytes() == original_index_bytes
+    finally:
+        marker_path.write_bytes(original_marker_bytes)
+
+
+def _assert_asset_builder_accepts_normalized_paths_and_nested_roots(
+    options: bulk.BuildOptions,
+    index_path: Path,
+    index: dict[str, list[dict[str, object]]],
+    cases: tuple[R2eLeakTask, R2eLeakTask],
+) -> None:
+    first_arm = index[cases[0].task_id][0]
+    marker_path = Path(cast("str", first_arm["completion_marker"]))
+    marker = cast("dict[str, Any]", json.loads(marker_path.read_bytes()))
+    saved_root = Path(cast("str", marker["arms"][0]["completion_marker"])).parent
+    nested_template = Path(cast("str", marker["arms"][0]["workspace_template"]))
+    nested_root = nested_template.relative_to(saved_root)
+    marker["fingerprints"][f"./{'/'.join(nested_root.parts)}"] = bulk.template_fingerprint(
+        nested_template
+    )
+    for arm in marker["arms"]:
+        saved_root = Path(cast("str", arm["completion_marker"])).parent
+        arm["completion_marker"] = f"{saved_root}//./complete.json"
+        for field in ("workspace_template", "closed_template", "manifest_path"):
+            relative = Path(cast("str", arm[field])).relative_to(saved_root)
+            arm[field] = f"{saved_root}//./{'/'.join(relative.parts)}"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert bulk.build_assets(options, cases)["resumed"] == 2
+    refreshed_marker = cast("dict[str, Any]", json.loads(marker_path.read_bytes()))
+    refreshed_index = cast("dict[str, list[dict[str, object]]]", json.loads(index_path.read_text()))
+    assert refreshed_marker["fingerprints"][
+        f"./{'/'.join(nested_root.parts)}"
+    ] == bulk.template_fingerprint(nested_template)
+    for arm in refreshed_marker["arms"] + refreshed_index[cases[0].task_id]:
+        for field in (
+            "completion_marker",
+            "workspace_template",
+            "closed_template",
+            "manifest_path",
+        ):
+            assert str(Path(cast("str", arm[field]))) == arm[field]
 
 
 def test_asset_request_ignores_local_paths_and_extraction_metadata(
@@ -226,8 +417,19 @@ def test_asset_and_extraction_and_runtime_relocate_within_mount_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     options, case = build_inputs
+    _prepare_loadable_case(options, case)
+    second_case = _make_second_asset_case(options, case, tmp_path)
+    cases = (case, second_case)
     monkeypatch.setattr(bulk.docker_backend, "READ_ONLY_RUNTIME_ROOT", tmp_path)
-    bulk.build_assets(options, (case,))
+    bulk.build_assets(options, cases)
+    completion_seals = {}
+    for task_id in (case.task_id, second_case.task_id):
+        marker = json.loads(
+            (options.out_root / task_id / "complete.json").read_text(encoding="utf-8")
+        )
+        completion_seals[task_id] = {
+            key: marker[key] for key in ("identity", "request_identity", "fingerprints")
+        }
     moved = replace(
         options,
         templates_root=tmp_path / "moved-extracted",
@@ -243,19 +445,53 @@ def test_asset_and_extraction_and_runtime_relocate_within_mount_allowlist(
         (options.runtime_root, moved.runtime_root),
     ):
         source.rename(destination)
-    assert bulk.build_assets(moved, (case,))["resumed"] == 1
-    arms = json.loads((moved.out_root / "assets.json").read_text())[case.task_id]
-    for arm in arms:
-        for field in (
-            "workspace_template",
-            "closed_template",
-            "manifest_path",
-            "runtime_venv",
-            "runtime_interpreter",
-            "hidden_tests_template",
-            "extracted_repository",
-        ):
-            assert Path(arm[field]).exists()
+    assert bulk.build_assets(moved, cases)["resumed"] == 2
+    index_path = moved.out_root / "assets.json"
+    index = cast(
+        "dict[str, list[dict[str, object]]]", json.loads(index_path.read_text(encoding="utf-8"))
+    )
+    for task_id in (case.task_id, second_case.task_id):
+        for arm in index[task_id]:
+            for field in (
+                "workspace_template",
+                "closed_template",
+                "manifest_path",
+                "runtime_venv",
+                "runtime_interpreter",
+                "hidden_tests_template",
+                "extracted_repository",
+            ):
+                assert Path(cast("str", arm[field])).exists()
+
+    for task_id, expected_seal in completion_seals.items():
+        marker = json.loads(
+            (moved.out_root / task_id / "complete.json").read_text(encoding="utf-8")
+        )
+        assert {key: marker[key] for key in expected_seal} == expected_seal
+
+    _assert_asset_builder_accepts_normalized_paths_and_nested_roots(moved, index_path, index, cases)
+    index = cast(
+        "dict[str, list[dict[str, object]]]", json.loads(index_path.read_text(encoding="utf-8"))
+    )
+    _assert_asset_builder_rejects_sibling_artifact_pointers(moved, index_path, index, cases)
+
+    monkeypatch.setattr(leak_assets, "load_tasks", lambda: (case, second_case))
+    requested_channels = tuple(sorted(ALL_COMPATIBLE_CHANNELS))
+    tasks, manifests, skipped = _load_synthetic_leak_tasks(index_path, cases, requested_channels)
+    assert not skipped
+    assert [task.task_id for task in tasks] == [case.task_id, second_case.task_id]
+    for task, expected_case in zip(tasks, cases, strict=True):
+        assert task.host_only_metadata["fix_commit"] == expected_case.commit_hash
+        assert task.host_only_metadata["leak_channels_open"] == manifests[task.task_id]["channels"]
+        assert task.docker_config is not None
+        runtime_mounts = {
+            mount.target: mount.source for mount in task.docker_config.read_only_mounts
+        }
+        assert runtime_mounts["/opt/uvpy"].is_relative_to(moved.runtime_root)
+
+    _assert_asset_loader_rejects_mismatched_pointers(
+        index_path, index, cases, requested_channels, tmp_path
+    )
 
 
 def test_completed_asset_timestamp_integrity_is_preserved(
@@ -319,15 +555,15 @@ def test_closed_asset_reuse_ignores_git_and_image_transport_labels(
 
 
 def test_prepared_runtime_integrity_rebuilds_structurally_valid_content_mutation(
-    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], caplog: pytest.LogCaptureFixture
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
 ) -> None:
     options, case = build_inputs
     bulk.build_assets(options, (case,))
     interpreter = next(
         (options.runtime_root / options.split / case.repo_name).glob("*/uvpy/bin/python3")
     )
-    interpreter.write_bytes(interpreter.read_bytes() + b"\n# changed prepared bytes\n")
-    with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
-        result = bulk.build_assets(options, (case,))
+    original_interpreter_bytes = interpreter.read_bytes()
+    interpreter.write_bytes(original_interpreter_bytes + b"\n# changed prepared bytes\n")
+    result = bulk.build_assets(options, (case,))
     assert result["resumed"] == 1
-    assert "runtime_interpreter_fingerprint recorded" in caplog.text
+    assert interpreter.read_bytes() == original_interpreter_bytes

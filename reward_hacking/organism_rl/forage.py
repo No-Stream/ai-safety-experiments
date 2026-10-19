@@ -174,6 +174,12 @@ class ForageRun:
     sampler_quantization_ignore: tuple[str, ...] = DEFAULT_QUANTIZATION_IGNORE
     quantization_admission: Path | None = DEFAULT_QUANTIZATION_ADMISSION
     kv_capacity_tokens: int | None = None
+    max_concurrency: int = MAX_CONCURRENCY
+
+    def __post_init__(self) -> None:
+        """Keep the collection cap positive even for programmatic callers."""
+        if self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
 
 
 def select_forage_tasks(
@@ -211,6 +217,11 @@ def _common_generate_arguments(run: ForageRun, group: ForageGroup, endpoint: str
         str(run.max_model_len),
         "--concurrency",
         str(run.concurrency),
+        *(
+            ["--serving-runtime", json.dumps({"forage_max_concurrency": run.max_concurrency})]
+            if run.max_concurrency != MAX_CONCURRENCY
+            else []
+        ),
         "--max-turns",
         str(group.max_turns),
         "--announced-turn-budget",
@@ -602,7 +613,9 @@ def follow_up_tasks(
     return tuple(task_id for task_id in task_ids if hacks[task_id] <= FOLLOW_UP_MAX_HACKS)
 
 
-def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
+def kv_pool_concurrency(
+    server_log: str, max_model_len: int, *, max_concurrency: int = MAX_CONCURRENCY
+) -> int:
     """Fit forage planning slots into the KV pool this server startup measured."""
     capacity_tokens = kv_capacity_tokens(server_log)
     if capacity_tokens < max_model_len:
@@ -610,7 +623,7 @@ def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
     expected_peak_context_tokens = max(1, max_model_len // 2)
     concurrency = resolve_rollout_concurrency(
         None,
-        MAX_CONCURRENCY,
+        max_concurrency,
         capacity_tokens=capacity_tokens,
         target_usage=0.85,
         expected_peak_context_tokens=expected_peak_context_tokens,
@@ -651,7 +664,7 @@ def _server_arguments(run: ForageRun, gpu_memory_utilization: float | None) -> l
         str(run.max_model_len),
         # The KV pool, and so the client concurrency, is only known once this server starts.
         "--concurrency",
-        str(MAX_CONCURRENCY),
+        str(run.max_concurrency),
         "--max-turns",
         str(DEFAULT_MAX_TURNS),
         "--max-new-tokens",
@@ -719,6 +732,7 @@ def write_selection(
     payload = {
         "groups": selected_groups,
         "serving": {
+            "max_concurrency": run.max_concurrency,
             "model": run.base_model,
             "max_model_len": run.max_model_len,
             "speculative_decoding": run.speculative_decoding,
@@ -823,7 +837,9 @@ def _serve_and_run(
             startup_log = server_log.read().decode("utf-8")
         served_run = replace(
             run,
-            concurrency=kv_pool_concurrency(startup_log, run.max_model_len),
+            concurrency=kv_pool_concurrency(
+                startup_log, run.max_model_len, max_concurrency=run.max_concurrency
+            ),
             kv_capacity_tokens=kv_capacity_tokens(startup_log),
         )
         for name, task_ids in selection.items():
@@ -867,6 +883,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--tasks-per-group", type=int, help="override every group's task count (smoke runs)"
     )
     parser.add_argument("--max-model-len", type=int, default=65536)
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=MAX_CONCURRENCY,
+        help="cap server sequences and concurrent episodes independently of KV capacity",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument(
         "--enable-speculative-decoding", action=argparse.BooleanOptionalAction, default=True
@@ -896,6 +918,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         quantization_admission_default=DEFAULT_QUANTIZATION_ADMISSION,
     )
     args = parser.parse_args(argv)
+    if args.max_concurrency < 1:
+        parser.error("max-concurrency must be positive")
     validate_serving_quantization(
         args,
         parser,
@@ -965,6 +989,7 @@ def run_from_args(args: argparse.Namespace) -> ForageRun:
         output_dir=(args.output_root / args.label).resolve(),
         max_model_len=args.max_model_len,
         concurrency=1,
+        max_concurrency=args.max_concurrency,
         samples_per_task=args.samples_per_task,
         speculative_decoding=args.enable_speculative_decoding,
         accept_slow=args.accept_slow,

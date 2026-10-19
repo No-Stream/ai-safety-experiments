@@ -13,6 +13,7 @@ Skipped rather than failed in a checkout with no git directory (a tarball export
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -24,21 +25,61 @@ INSTALLER_MARKER = "installed by scripts/install_git_hooks.sh"
 REQUIRED_HOOKS = ("pre-commit", "commit-msg")
 
 
-def _hooks_dir() -> Path:
-    """The COMMON git dir's hooks directory, which is where the installer writes."""
-    resolved = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-path", "hooks"],  # noqa: S607
-        cwd=REPO_ROOT,
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - fixed Git binary in throwaway test repos
+        ("git", *args),  # noqa: S607 - caller's PATH Git, as the hook wrappers use
+        cwd=repo,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def must_git(repo: Path, *args: str) -> str:
+    result = run_git(repo, *args)
+    assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
+    return result.stdout
+
+
+def _hooks_dir() -> Path:
+    """The COMMON git dir's hooks directory, which is where the installer writes."""
+    resolved = run_git(REPO_ROOT, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
     if resolved.returncode != 0:
         pytest.skip(
             f"{REPO_ROOT} is not a git checkout ({resolved.stderr.strip()}), so it has no hooks "
             "directory and no commit to gate. On a real checkout this test is armed."
         )
     return Path(resolved.stdout.strip())
+
+
+def _repo_with_copies_of_installed_hooks(tmp_path: Path) -> Path:
+    """Run the installed wrapper bytes against an isolated Git index and scanner checkout."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    must_git(repo, "init", "-q")
+    must_git(repo, "config", "user.email", "hook-test@example.invalid")
+    must_git(repo, "config", "user.name", "hook test")
+    must_git(repo, "config", "commit.gpgsign", "false")
+
+    disabled_hooks = repo / "disabled-hooks"
+    disabled_hooks.mkdir()
+    must_git(repo, "config", "core.hooksPath", str(disabled_hooks))
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    must_git(repo, "add", "README.md")
+    must_git(repo, "commit", "-q", "-m", "seed")
+
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    for name in ("scan_secrets.py", "git_precommit_scan.py"):
+        shutil.copy(Path(__file__).resolve().parents[1] / "scripts" / name, scripts / name)
+
+    copied_hooks = repo / "installed-hooks"
+    copied_hooks.mkdir()
+    installed_hooks = _hooks_dir()
+    for name in REQUIRED_HOOKS:
+        shutil.copy2(installed_hooks / name, copied_hooks / name)
+    must_git(repo, "config", "core.hooksPath", str(copied_hooks))
+    return repo
 
 
 class TestTheCommitTimePrivacyGateIsInstalled:
@@ -63,29 +104,41 @@ class TestTheCommitTimePrivacyGateIsInstalled:
             f"Merge the wrapper this repo's installer writes into them by hand."
         )
 
-    def test_each_wrapper_reaches_the_scanner(self) -> None:
-        """The marker says who wrote it; this says the wrapper still calls the scan.
+    def test_a_clean_commit_runs_through_the_installed_wrappers(self, tmp_path: Path) -> None:
+        repo = _repo_with_copies_of_installed_hooks(tmp_path)
+        (repo / "clean.txt").write_text("ordinary content\n", encoding="utf-8")
+        must_git(repo, "add", "clean.txt")
 
-        A wrapper edited down to a no-op keeps its marker comment, so the marker alone would pass
-        while the gate did nothing -- the failure mode this repo is built around.
-        """
-        hooks = _hooks_dir()
-        for name in REQUIRED_HOOKS:
-            wrapper = hooks / name
-            if not wrapper.is_file():
-                pytest.skip(f"{wrapper} is absent; the test above is the one that reports that")
-            assert "git_precommit_scan.py" in wrapper.read_text(encoding="utf-8"), (
-                f"{wrapper} carries the installer's marker but never names "
-                f"scripts/git_precommit_scan.py, so it is not running the scan. Run `make hooks`."
-            )
+        result = run_git(repo, "commit", "-q", "-m", "clean")
 
-    def test_the_commit_message_wrapper_passes_the_draft_through(self) -> None:
-        """git supplies the message path as ``$1``; a wrapper that drops it scans nothing."""
-        wrapper = _hooks_dir() / "commit-msg"
-        if not wrapper.is_file():
-            pytest.skip(f"{wrapper} is absent; the presence test is the one that reports that")
+        assert result.returncode == 0, result.stderr
 
-        assert "--message-file" in wrapper.read_text(encoding="utf-8"), (
-            f"{wrapper} does not pass --message-file, so it would scan the staged blobs a second "
-            "time and never read the commit message, which is a surface no other gate reads."
-        )
+    def test_the_installed_pre_commit_wrapper_rejects_a_staged_detector_hit(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _repo_with_copies_of_installed_hooks(tmp_path)
+        head_before = must_git(repo, "rev-parse", "HEAD").strip()
+        test_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        (repo / "notes.txt").write_text(f"key={test_access_key}\n", encoding="utf-8")
+        must_git(repo, "add", "notes.txt")
+
+        result = run_git(repo, "commit", "-q", "-m", "staged hit")
+
+        assert result.returncode != 0, "the installed pre-commit wrapper admitted a detector hit"
+        assert "aws_access_key_id" in result.stderr
+        head_after = must_git(repo, "rev-parse", "HEAD").strip()
+        assert head_after == head_before
+
+    def test_the_installed_commit_message_wrapper_scans_the_draft(self, tmp_path: Path) -> None:
+        repo = _repo_with_copies_of_installed_hooks(tmp_path)
+        head_before = must_git(repo, "rev-parse", "HEAD").strip()
+        (repo / "README.md").write_text("ordinary content revised\n", encoding="utf-8")
+        must_git(repo, "add", "README.md")
+        test_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+
+        result = run_git(repo, "commit", "-q", "-m", f"record key {test_access_key}")
+
+        assert result.returncode != 0, "the installed commit-msg wrapper admitted a detector hit"
+        assert "aws_access_key_id" in result.stderr
+        head_after = must_git(repo, "rev-parse", "HEAD").strip()
+        assert head_after == head_before

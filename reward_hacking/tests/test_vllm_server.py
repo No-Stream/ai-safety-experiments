@@ -9,6 +9,7 @@ import re
 import signal
 import sys
 import time
+from collections import Counter
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 from urllib.error import URLError
@@ -86,6 +87,47 @@ def _config(fake_vllm: Path) -> VLLMServerConfig:
     )
 
 
+def _option_values(command: list[str]) -> dict[str, str | list[str] | None]:
+    """Read CLI option values without treating their order as part of the server contract."""
+    options: dict[str, str | list[str] | None] = {}
+    cursor = 3
+    while cursor < len(command):
+        option = command[cursor]
+        assert option.startswith("--"), f"unexpected positional argument: {option}"
+        assert option not in options, f"duplicate option: {option}"
+        cursor += 1
+        if option == "--lora-modules":
+            module_values: list[str] = []
+            while cursor < len(command) and not command[cursor].startswith("--"):
+                module_values.append(command[cursor])
+                cursor += 1
+            options[option] = module_values
+        elif cursor < len(command) and not command[cursor].startswith("--"):
+            options[option] = command[cursor]
+            cursor += 1
+        else:
+            options[option] = None
+    return options
+
+
+def _semantic_option_values(command: list[str]) -> dict[str, object]:
+    json_options = {
+        "--hf-overrides",
+        "--quantization-config",
+        "--limit-mm-per-prompt",
+        "--reasoning-config",
+        "--speculative-config",
+    }
+    decoded: dict[str, object] = {}
+    for option, value in _option_values(command).items():
+        if option in json_options:
+            assert isinstance(value, str)
+            decoded[option] = json.loads(value)
+        else:
+            decoded[option] = value
+    return decoded
+
+
 def _ready_response(*args: object, **kwargs: object) -> _HealthResponse:
     """Return a successful fake HTTP response without opening a socket."""
     del args, kwargs
@@ -99,25 +141,34 @@ def _connection_refused() -> URLError:
 
 def test_command_contains_verified_serve_flags(fake_vllm: Path) -> None:
     config = _config(fake_vllm)
+    command = config.command()
 
-    assert config.command() == [
-        str(fake_vllm),
-        "serve",
-        "Qwen/test-model",
-        "--revision",
-        "test-revision",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--max-model-len",
-        "4096",
-        "--gpu-memory-utilization",
-        "0.55",
-        "--language-model-only",
-        "--hf-overrides",
-        '{"head_dtype":"float32"}',
+    assert command[:3] == [str(fake_vllm), "serve", "Qwen/test-model"]
+    expected_options = {
+        "--revision": "test-revision",
+        "--host": "127.0.0.1",
+        "--port": "8000",
+        "--max-model-len": "4096",
+        "--gpu-memory-utilization": "0.55",
+        "--language-model-only": None,
+        "--hf-overrides": {"head_dtype": "float32"},
+    }
+    assert _semantic_option_values(command) == expected_options
+    raw_options = _option_values(command)
+    option_groups = [
+        [option]
+        if value is None
+        else [option, *value]
+        if isinstance(value, list)
+        else [option, value]
+        for option, value in raw_options.items()
     ]
+    reordered_command = command[:3] + [
+        argument for group in reversed(option_groups) for argument in group
+    ]
+    assert _semantic_option_values(reordered_command) == expected_options
+    with pytest.raises(AssertionError, match="duplicate option"):
+        _option_values([*command, "--port", "9001"])
 
 
 def test_auto_fit_context_length_is_forwarded_to_vllm(fake_vllm: Path) -> None:
@@ -125,7 +176,7 @@ def test_auto_fit_context_length_is_forwarded_to_vllm(fake_vllm: Path) -> None:
 
     command = config.command()
 
-    assert command[command.index("--max-model-len") + 1] == "-1"
+    assert _option_values(command)["--max-model-len"] == "-1"
 
 
 def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) -> None:
@@ -143,41 +194,26 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
         served_model_name="Qwen/test-model",
     )
 
-    assert config.command() == [
-        str(fake_vllm),
-        "serve",
-        "models/sampler-checkpoint",
-        "--revision",
-        "test-revision",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--max-model-len",
-        "4096",
-        "--gpu-memory-utilization",
-        "0.55",
-        "--language-model-only",
-        "--attention-backend",
-        "FLASHINFER",
-        "--enable-prefix-caching",
-        "--kv-cache-dtype",
-        "fp8",
-        "--mamba-cache-mode",
-        "align",
-        "--mamba-ssm-cache-dtype",
-        "bfloat16",
-        "--max-num-batched-tokens",
-        "8192",
-        "--quantization",
-        "fp8_per_tensor",
-        "--quantization-config",
-        '{"ignore":["*linear_attn.*","lm_head"]}',
-        "--served-model-name",
-        "Qwen/test-model",
-        "--hf-overrides",
-        '{"head_dtype":"float32"}',
-    ]
+    command = config.command()
+    assert command[:3] == [str(fake_vllm), "serve", "models/sampler-checkpoint"]
+    assert _semantic_option_values(command) == {
+        "--revision": "test-revision",
+        "--host": "127.0.0.1",
+        "--port": "8000",
+        "--max-model-len": "4096",
+        "--gpu-memory-utilization": "0.55",
+        "--language-model-only": None,
+        "--attention-backend": "FLASHINFER",
+        "--enable-prefix-caching": None,
+        "--kv-cache-dtype": "fp8",
+        "--mamba-cache-mode": "align",
+        "--mamba-ssm-cache-dtype": "bfloat16",
+        "--max-num-batched-tokens": "8192",
+        "--quantization": "fp8_per_tensor",
+        "--quantization-config": {"ignore": ["*linear_attn.*", "lm_head"]},
+        "--served-model-name": "Qwen/test-model",
+        "--hf-overrides": {"head_dtype": "float32"},
+    }
 
 
 def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_vllm: Path) -> None:
@@ -199,28 +235,30 @@ def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_
     )
 
     command = config.command()
-    assert command[command.index("--enable-lora") :] == [
-        "--enable-lora",
-        "--max-lora-rank",
-        "64",
-        "--lora-modules",
-        f"somo-olmo-s1={adapters[0]}",
-        f"somo-olmo-s2={adapters[1]}",
-        "--limit-mm-per-prompt",
-        '{"image": 0}',
-        "--hf-overrides",
-        '{"head_dtype":"float32"}',
-    ]
+    assert _option_values(command)["--enable-lora"] is None
+    assert _option_values(command)["--max-lora-rank"] == "64"
+    lora_modules = _option_values(command)["--lora-modules"]
+    assert isinstance(lora_modules, list)
+    assert Counter(tuple(module.split("=", 1)) for module in lora_modules) == Counter(
+        {
+            ("somo-olmo-s1", str(adapters[0])): 1,
+            ("somo-olmo-s2", str(adapters[1])): 1,
+        }
+    )
+    semantic_options = _semantic_option_values(command)
+    assert semantic_options["--limit-mm-per-prompt"] == {"image": 0}
+    assert semantic_options["--hf-overrides"] == {"head_dtype": "float32"}
 
 
 def test_command_renders_reasoning_config(fake_vllm: Path) -> None:
     config = replace(_config(fake_vllm), reasoning_config=QWEN_THINKING_REASONING_CONFIG)
 
     command = config.command()
-    assert command[command.index("--reasoning-config") + 1] == json.dumps(
-        dict(QWEN_THINKING_REASONING_CONFIG), separators=(",", ":")
+    semantic_options = _semantic_option_values(command)
+    assert semantic_options["--reasoning-config"] == json.loads(
+        json.dumps(dict(QWEN_THINKING_REASONING_CONFIG))
     )
-    assert command[-2:] == ["--hf-overrides", '{"head_dtype":"float32"}']
+    assert semantic_options["--hf-overrides"] == {"head_dtype": "float32"}
 
 
 def test_command_renders_explicit_hf_overrides(fake_vllm: Path) -> None:
@@ -230,10 +268,27 @@ def test_command_renders_explicit_hf_overrides(fake_vllm: Path) -> None:
 
     command = config.command()
 
-    assert json.loads(command[command.index("--hf-overrides") + 1]) == {
+    assert _semantic_option_values(command)["--hf-overrides"] == {
         "head_dtype": "float32",
         "trust_remote_code": True,
     }
+
+
+def test_json_options_ignore_formatting_but_reject_a_changed_value(fake_vllm: Path) -> None:
+    expected_overrides = {"head_dtype": "float32", "trust_remote_code": True}
+    command = replace(_config(fake_vllm), hf_overrides=expected_overrides).command()
+    overrides_index = command.index("--hf-overrides") + 1
+    command[overrides_index] = json.dumps(
+        {"trust_remote_code": True, "head_dtype": "float32"}, indent=2
+    )
+
+    assert _semantic_option_values(command)["--hf-overrides"] == expected_overrides
+
+    command[overrides_index] = json.dumps(
+        {"head_dtype": "float32", "trust_remote_code": False}, sort_keys=True
+    )
+    with pytest.raises(AssertionError):
+        assert _semantic_option_values(command)["--hf-overrides"] == expected_overrides
 
 
 def test_command_enables_sleep_mode_for_runtime_lora_training(fake_vllm: Path) -> None:
@@ -560,9 +615,7 @@ def test_command_passes_speculative_json_without_changing_values(fake_vllm: Path
         _config(fake_vllm), speculative_config={"method": "mtp", "num_speculative_tokens": 2}
     )
     command = config.command()
-    assert (
-        json.loads(command[command.index("--speculative-config") + 1]) == config.speculative_config
-    )
+    assert _semantic_option_values(command)["--speculative-config"] == config.speculative_config
 
 
 def _batched_tokens_flag(config: VLLMServerConfig) -> str | None:

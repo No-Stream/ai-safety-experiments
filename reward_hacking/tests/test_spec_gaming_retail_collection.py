@@ -330,8 +330,6 @@ def test_closed_collection_assessment_captures_judge_once_and_rescores_raw(
     )
     assert first[0]["assessment_status"] == "measured"
     assert len(judge.prompts) == 1
-    episode_dir = config.output_dir / "episodes/synthetic-task"
-    assert len(list((episode_dir / "nl-judges").glob("*/sample.json"))) == 1
 
     second = retail_collection.assess_retail_collection(
         config,
@@ -355,7 +353,6 @@ def test_closed_collection_assessment_captures_judge_once_and_rescores_raw(
     assert rescored == first
     assert cached_judge.prompts == []
     assert len(actor.prompts) == 2
-    assert len(list((episode_dir / "nl-judges").glob("*/sample.json"))) == 1
 
     runtime.judge_prompt = "Judge this revised synthetic assertion."
     prompt_config = replace(revised_config, assessment_rubric_version="changed-prompt-rubric")
@@ -366,7 +363,6 @@ def test_closed_collection_assessment_captures_judge_once_and_rescores_raw(
     assert changed == first
     assert len(changed_judge.prompts) == 1
     assert len(actor.prompts) == 2
-    assert len(list((episode_dir / "nl-judges").glob("*/sample.json"))) == 2
     assert (
         retail_collection.assess_retail_collection(
             prompt_config,

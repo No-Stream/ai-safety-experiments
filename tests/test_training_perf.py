@@ -54,10 +54,13 @@ def test_accumulated_step_writes_json_and_log(
     with caplog.at_level(logging.INFO):
         callback.on_step_end(args, state, control)
     result = json.loads((tmp_path / "throughput.json").read_text())
-    assert result["steps"][0]["processed_tokens"] == 8
-    assert result["steps"][0]["parameter_matmul_mfu_estimate"] is None
-    assert "tokens/s=" in caplog.text
-    assert "MFU=unknown" in caplog.text
+    step_record = result["steps"][0]
+    assert step_record["processed_tokens"] == 8
+    assert step_record["tokens_per_second"] == pytest.approx(
+        step_record["processed_tokens"] / step_record["seconds"]
+    )
+    assert step_record["parameter_matmul_mfu_estimate"] is None
+    assert any(record.name == "grpo.training_perf" for record in caplog.records)
 
 
 def test_training_window_excludes_rollout_and_restore(tmp_path: Path) -> None:

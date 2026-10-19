@@ -582,12 +582,16 @@ def workspace_snapshot(
     started = time.monotonic()
     bytes_hashed = 0
     for path in _workspace_paths(workspace, excluded_paths):
-        if (
-            len(snapshot) >= MAXIMUM_SNAPSHOT_ENTRIES
-            or time.monotonic() - started > MAXIMUM_SNAPSHOT_SECONDS
-        ):
-            raise SnapshotLimitError("workspace snapshot exceeded its entry or time limit")
         relative = path.relative_to(workspace).as_posix()
+        elapsed_seconds = time.monotonic() - started
+        if len(snapshot) >= MAXIMUM_SNAPSHOT_ENTRIES or elapsed_seconds > MAXIMUM_SNAPSHOT_SECONDS:
+            raise SnapshotLimitError(
+                "workspace snapshot exceeded its entry or time limit "
+                f"(elapsed_seconds={elapsed_seconds:.6f}, bytes_hashed={bytes_hashed}, "
+                f"entry_count={len(snapshot)}, current_relative_path={relative!r}, "
+                f"limits=(entries={MAXIMUM_SNAPSHOT_ENTRIES}, bytes={MAXIMUM_SNAPSHOT_BYTES}, "
+                f"seconds={MAXIMUM_SNAPSHOT_SECONDS}))"
+            )
         mode = path.lstat().st_mode
         entry = {"mode": oct(stat.S_IMODE(mode))}
         if stat.S_ISLNK(mode):
@@ -597,12 +601,17 @@ def workspace_snapshot(
             with _open_regular_file(workspace, relative) as source:
                 for chunk in iter(lambda: source.read(HASH_CHUNK_BYTES), b""):
                     bytes_hashed += len(chunk)
+                    elapsed_seconds = time.monotonic() - started
                     if (
                         bytes_hashed > MAXIMUM_SNAPSHOT_BYTES
-                        or time.monotonic() - started > MAXIMUM_SNAPSHOT_SECONDS
+                        or elapsed_seconds > MAXIMUM_SNAPSHOT_SECONDS
                     ):
                         raise SnapshotLimitError(
-                            "workspace snapshot exceeded its byte or time limit"
+                            "workspace snapshot exceeded its byte or time limit "
+                            f"(elapsed_seconds={elapsed_seconds:.6f}, bytes_hashed={bytes_hashed}, "
+                            f"entry_count={len(snapshot)}, current_relative_path={relative!r}, "
+                            f"limits=(entries={MAXIMUM_SNAPSHOT_ENTRIES}, bytes={MAXIMUM_SNAPSHOT_BYTES}, "
+                            f"seconds={MAXIMUM_SNAPSHOT_SECONDS}))"
                         )
                     digest.update(chunk)
             entry["sha256"] = digest.hexdigest()
@@ -765,8 +774,6 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
     _validate_tmp_state(workspace, tmp_state)
     junit_report_path = _validate_junit_report_path(junit_report_path)
     _validate_protected_paths(config, workspace)
-    require_gate(config)
-    prepare_runtime_mountpoints(workspace, config)
     image_volumes, image_inspection_failure = _inspect_image_volumes(
         config.image,
         command=command,
@@ -775,6 +782,8 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
         return image_inspection_failure
     if image_volumes not in (None, {}):
         raise ValueError("Docker episode images must not declare automatic writable volumes")
+    require_gate(config)
+    prepare_runtime_mountpoints(workspace, config)
     evidence_path = config.evidence_path or workspace.with_name(
         workspace.name + ".docker-evidence.jsonl"
     )

@@ -17,15 +17,14 @@ another name and would stop being a control for the arms it exists to control fo
 
 from __future__ import annotations
 
-import ast
 import dataclasses
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
-import games.format_rubric
 from games.format_rubric import (
     COMPONENT_LOWERCASE_TAG_NAME,
     COMPONENT_NAMES,
@@ -206,37 +205,31 @@ class TestTheLivenessCheckActuallyRunsAtImport:
     Deleting the module-level `assert_components_are_live()` call left the whole suite green
     (integration mutation testing, 2026-08-21), because every test above calls the function itself.
     A rubric arithmetic change would then be caught at test time rather than at import, which is the
-    difference between refusing to load and reserving a card first. Asserted structurally, over the
-    module's own source, because an import-time side effect cannot be observed from inside a process
-    that has already imported the module.
+    difference between refusing to load and reserving a card first. A subprocess lets the test change
+    the parser before a fresh import and observe the configured examples being rejected.
     """
 
-    def test_the_module_calls_the_liveness_check_at_module_scope(self) -> None:
-        module_source = Path(games.format_rubric.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(module_source)
-        top_level_calls = [
-            node.value.func.id
-            for node in tree.body
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-        ]
-        assert "assert_components_are_live" in top_level_calls
+    def test_importing_with_unparseable_configured_examples_fails(self) -> None:
+        """The import-time check must inspect the configured components, not only a passed table."""
+        probe = textwrap.dedent(
+            """
+            import games.parsing as parsing
 
-    def test_importing_the_module_with_a_dead_component_fails(self) -> None:
-        """The behavioural half: a doctored table really does refuse at import, not just in a test.
+            calls = []
 
-        Runs in a subprocess because this process has already imported the module, and patches the
-        component table before the module body runs by importing it under a name the patch can reach.
-        """
-        probe = (
-            "import games.format_rubric as rubric;"
-            "import dataclasses, importlib, sys;"
-            "dead = tuple("
-            "  dataclasses.replace(c, violating_example=c.satisfying_example)"
-            "  for c in rubric.FORMAT_COMPONENTS"
-            ");"
-            "rubric.assert_components_are_live(dead)"
+            def reject(*args, **kwargs):
+                calls.append((args, kwargs))
+                return None
+
+            parsing.parse_action = reject
+            try:
+                import games.format_rubric
+            except ValueError:
+                if not calls:
+                    raise
+            else:
+                raise AssertionError("import accepted unparseable configured examples")
+            """
         )
         finished = subprocess.run(  # noqa: S603
             [sys.executable, "-c", probe],
@@ -245,5 +238,4 @@ class TestTheLivenessCheckActuallyRunsAtImport:
             check=False,
             cwd=REPO_ROOT,
         )
-        assert finished.returncode != 0
-        assert "nothing can violate it" in finished.stderr
+        assert finished.returncode == 0, finished.stderr

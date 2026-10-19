@@ -14,7 +14,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import pytest
 
@@ -65,6 +65,34 @@ OTHER_RUNG = "risky-hunt"
 
 # Unmistakable in a document, so the no-generated-text assertion cannot pass by accident.
 SENTINEL_COMPLETION = "SENTINEL-THINKING-TEXT-THAT-MUST-NEVER-REACH-A-TABLE"
+ARM_TABLE_FIELDS = (
+    "trained_ladder",
+    "transfer_matrix",
+    "transfer_windows",
+    "negative_control",
+    "dt_ladder",
+    "dt_endorsements",
+    "dt_flips",
+    "capability_ladder",
+    "self_report_ladder",
+    "self_report_controls",
+    "self_report_health",
+    "self_report_instruments",
+    "self_report_control_distributions",
+    "self_report_nominal_choices",
+    "self_report_values_ordering",
+    "self_report_numeric",
+    "self_report_risk_mirror",
+    "self_report_counterparts",
+    "self_report_cheap_talk",
+    "self_report_tagged",
+    "self_report_calibration",
+    "variant_splits",
+    "reskin_splits",
+    "position_splits",
+    "per_round",
+    "section_health",
+)
 
 SAMPLING: dict[str, Any] = {"temperature": 1.0, "presence_penalty": 1.5}
 
@@ -2068,21 +2096,33 @@ class TestDocumentShape:
         ):
             assert document.count(heading) == 2, heading
 
-    def test_every_computed_table_reaches_the_document(self):
+    def test_every_computed_table_reaches_the_document(self, complete_battery: Path):
         """A table computed and never printed is the failure this document exists to prevent.
 
         The readout's own version of the callback that wrote into a dict `Trainer.log` had already
         copied: the number was computed correctly, nothing printed it, and the run had to be repeated.
-        A field added to `ArmReadout` without a `markdown_table` call goes red here.
+        Each table gets a distinct value, so a field omitted from `_arm_lines` leaves a missing sentinel.
         """
-        source = Path(battery_readout.__file__).read_text(encoding="utf-8")
-        tables = [
-            field.name
-            for field in dataclasses.fields(battery_tables.ArmReadout)
-            if field.type == "list[dict[str, Any]]"
-        ]
-        assert len(tables) > 1
-        assert [name for name in tables if f"arm.{name}" not in source] == []
+        table_annotation = list[dict[str, Any]]
+        annotated_tables = {
+            name
+            for name, annotation in get_type_hints(battery_tables.ArmReadout).items()
+            if annotation == table_annotation
+        }
+        assert annotated_tables == set(ARM_TABLE_FIELDS)
+
+        readout = battery_tables.build_readout(complete_battery)
+        table_sentinels = {
+            field_name: f"TABLE-SENTINEL-{field_name}" for field_name in ARM_TABLE_FIELDS
+        }
+        arm = dataclasses.replace(
+            readout.arms[0],
+            **{field_name: [{"sentinel": value}] for field_name, value in table_sentinels.items()},
+        )
+        readout = dataclasses.replace(readout, arms=[arm], contrasts=[])
+
+        document = battery_readout.render_markdown(readout, command="regenerate-me")
+        assert all(sentinel in document for sentinel in table_sentinels.values())
 
     def test_an_empty_table_says_so_rather_than_vanishing(self):
         assert battery_readout.markdown_table([]) == "_(no rows)_"

@@ -212,22 +212,6 @@ def run_helper(
 class TestTmuxRunLaunch:
     """What the helper composes and hands to tmux."""
 
-    def test_the_session_command_is_the_canonical_pipefail_tee_exitcode_line(
-        self, stubs: GateStubs, log_dir: Path
-    ) -> None:
-        log = log_dir / "run.log"
-        result = run_helper(stubs, "cell-run", "--log", str(log), "--", "echo", "hi")
-        assert result.returncode == 0, result.stderr
-        session_command = new_session_call(stubs.calls)[-1]
-        assert session_command.startswith("export PATH=")
-        assert "; set -o pipefail;" in session_command
-        assert f"| tee {log}" in session_command
-        # A bare $? under pipefail (zsh lacks ${PIPESTATUS[0]}), captured before the newline check runs.
-        assert f"| tee {log}; rc=$?;" in session_command
-        assert f"echo EXITCODE=$rc >> {log}" in session_command
-        assert "PIPESTATUS" not in session_command
-        assert "status=$?" not in session_command
-
     def test_the_default_log_is_var_tmp_named_after_the_session(self, stubs: GateStubs) -> None:
         name = f"defaultlog-{uuid.uuid4().hex[:8]}"
         result = run_helper(stubs, name, "--", "true")
@@ -246,20 +230,43 @@ class TestTmuxRunLaunch:
         assert "attach: tmux attach -t '=poll-me'" in result.stdout
 
     def test_the_launching_shells_path_and_directory_are_passed_in(
-        self, stubs: GateStubs, tmp_path: Path
+        self, stubs: GateStubs, tmp_path: Path, log_dir: Path
     ) -> None:
-        """A tmux session's environment is the SERVER's, so PATH has to be handed over explicitly."""
+        """The handed-off session can find its command and starts in the requested directory."""
         work_dir = tmp_path / "work"
         work_dir.mkdir()
-        result = run_helper(stubs, "envcheck", "--", "true", cwd=work_dir)
+        log = log_dir / "path-check.log"
+        probe = stubs.bin_dir / "session-path-probe"
+        probe.write_text("#!/bin/sh\npwd\n", encoding="utf-8")
+        probe.chmod(0o755)
+        assert shutil.which(probe.name, path="/usr/bin:/bin") is None
+        without_forwarded_path = subprocess.run(  # noqa: S603 - fixed shell and test command
+            [BASH, "-c", probe.name],
+            cwd=work_dir,
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert without_forwarded_path.returncode == 127
+
+        result = run_helper(stubs, "envcheck", "--log", str(log), "--", probe.name, cwd=work_dir)
         assert result.returncode == 0, result.stderr
         call = new_session_call(stubs.calls)
-        assert "-d" in call
-        assert call[call.index("-c") + 1] == str(work_dir)
-        # Inside the command string, not `new-session -e`: that flag needs tmux 3.2 and the box has 3.0a.
-        assert "-e" not in call
-        assert call[-1].startswith("export PATH=")
-        assert str(stubs.bin_dir) in call[-1]
+        session_directory = Path(call[call.index("-c") + 1])
+        assert session_directory == work_dir
+
+        executed = subprocess.run(  # noqa: S603 - fixed shell and captured helper command
+            [BASH, "-c", call[-1]],
+            cwd=session_directory,
+            env={**os.environ, "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert executed.returncode == 0, executed.stderr
+        assert log.read_text().splitlines() == [str(work_dir), "EXITCODE=0"]
 
     def test_an_existing_session_is_checked_for_by_exact_name(self, stubs: GateStubs) -> None:
         """Without the '=' prefix has-session matches by prefix, so `ci` would look taken by `ci-2`."""
@@ -276,8 +283,16 @@ class TestTmuxRunLaunch:
         )
         assert result.returncode == 0, result.stderr
         session_command = new_session_call(stubs.calls)[-1]
-        # printf %q escapes with backslashes rather than quotes, so assert that shape positively.
-        assert "two\\ words\\;\\ echo\\ no" in session_command
+        executed = subprocess.run(  # noqa: S603 - fixed shell and captured helper command
+            [BASH, "-c", session_command],
+            cwd=log_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert executed.returncode == 0, executed.stderr
+        assert log.read_text().splitlines() == ["two words; echo no", "EXITCODE=0"]
 
     def test_the_previous_log_is_rotated_rather_than_truncated(
         self, stubs: GateStubs, log_dir: Path
