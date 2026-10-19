@@ -8,7 +8,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -48,6 +48,7 @@ class PromptPoolProvenanceDict(TypedDict):
     """JSON representation of the pool selected for training."""
 
     max_pass_fraction: float
+    screening_policy: NotRequired[dict[str, object]]
     screened_in: int
     screened_out: int
     dropped: int

@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
 
 from reward_hacking.organism_rl.admission import LiveKVAdmission, resolve_rollout_concurrency
+from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.prescreen_pool import summarize_prescreen_records
 from reward_hacking.organism_rl.rollout import (
     EpisodeSource,
@@ -281,6 +282,10 @@ def run_prescreen(  # noqa: PLR0913 - training source and scheduling configurati
     summary.update(
         total_episodes=total, resumed_episodes=resumed, completed_episodes=len(records) - resumed
     )
+    provenance_path = active_provenance_path(directory)
+    if provenance_path.exists():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        summary["init_adapter_from"] = provenance.get("init_adapter_from")
     (directory / "summary.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

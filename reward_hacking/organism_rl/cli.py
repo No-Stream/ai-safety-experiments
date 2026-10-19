@@ -100,6 +100,7 @@ logger = logging.getLogger(__name__)
 CLI_PROVENANCE_SCHEMA_VERSION = 1
 MINIMUM_GENERATIONS = 2
 TRAINER_LORA_RANK = 16
+PRESCREEN_ADAPTER_NAME = "organism-prescreen-adapter"
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 MINIMUM_RETAINED_CHECKPOINTS = 2
 MAXIMUM_MIDDLE_CHECKPOINTS = 3
@@ -355,8 +356,6 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
     if args.init_adapter_from is not None:
         if args.resume_from_checkpoint is not None:
             parser.error("init-adapter-from cannot be combined with resume-from-checkpoint")
-        if args.prescreen_samples is not None:
-            parser.error("init-adapter-from cannot be combined with prescreen-samples")
         source_checkpoint = args.init_adapter_from.resolve()
         if (
             args.output_dir.resolve() == source_checkpoint.parent
@@ -376,6 +375,11 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
 
 
 def _validate_prescreen_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.prescreen_samples is not None and args.init_adapter_from is not None:
+        if not args.enable_lora:
+            parser.error("adapter pre-screen requires --enable-lora")
+        if args.endpoint is not None:
+            parser.error("adapter pre-screen requires an owned server; omit --endpoint")
     if args.prescreen_samples is not None and args.prescreen_samples < 1:
         parser.error("prescreen-samples must be positive")
     if args.prescreen_samples is not None and args.prompt_pool_from is not None:
@@ -525,12 +529,33 @@ def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
     return default_mtp_speculative_config(args.model)
 
 
+def _prescreen_adapter_config(args: argparse.Namespace) -> LoraConfig:
+    configuration = LoraConfig.from_pretrained(args.init_adapter_from)
+    if not isinstance(configuration, LoraConfig):
+        raise TypeError("pre-screen adapter must use LoraConfig")
+    rank = (
+        max(configuration.r, *configuration.rank_pattern.values())
+        if configuration.rank_pattern
+        else configuration.r
+    )
+    if rank > args.max_lora_rank:
+        raise ValueError(
+            f"pre-screen adapter rank {rank} exceeds max-lora-rank {args.max_lora_rank}"
+        )
+    return configuration
+
+
 def build_server_config(
     args: argparse.Namespace,
     model_revision: str | None,
     max_model_len: int,
 ) -> VLLMServerConfig:
     """Build the child server configuration from this run's resolved model and serve flags."""
+    adapter_screen = args.prescreen_samples is not None and args.init_adapter_from is not None
+    lora_modules: tuple[tuple[str, str], ...] = ()
+    if args.prescreen_samples is not None and args.init_adapter_from is not None:
+        _prescreen_adapter_config(args)
+        lora_modules = ((PRESCREEN_ADAPTER_NAME, str(args.init_adapter_from.resolve())),)
     return VLLMServerConfig(
         model=args.sampler_checkpoint or args.model,
         revision=args.sampler_checkpoint_revision if args.sampler_checkpoint else model_revision,
@@ -543,8 +568,10 @@ def build_server_config(
         language_model_only=True,
         host=args.server_host,
         port=args.server_port,
-        enable_lora=args.enable_lora if args.prescreen_samples is None else False,
+        enable_lora=args.enable_lora if args.prescreen_samples is None else adapter_screen,
         max_lora_rank=args.max_lora_rank,
+        lora_modules=lora_modules,
+        lora_serving_dir=args.output_dir / "vllm-serving-adapters" if adapter_screen else None,
         enable_sleep_mode=args.enable_sleep_mode if args.prescreen_samples is None else False,
         enable_prefix_caching=args.enable_prefix_caching,
         mamba_cache_mode=args.mamba_cache_mode,
@@ -675,15 +702,18 @@ def _initialization_for_run(
 ) -> dict[str, Any] | None:
     if args.init_adapter_from is None:
         return None
-    if active_provenance_path(args.output_dir).exists() or any(
-        args.output_dir.glob("checkpoint-*")
+    if args.prescreen_samples is None and (
+        active_provenance_path(args.output_dir).exists()
+        or any(args.output_dir.glob("checkpoint-*"))
     ):
         raise ValueError(
             "init-adapter-from requires a new output directory without prior run state"
         )
     return adapter_initialization_metadata(
         args.init_adapter_from,
-        expected_config=_training_lora_config(args.model),
+        expected_config=_prescreen_adapter_config(args)
+        if args.prescreen_samples is not None
+        else _training_lora_config(args.model),
         model_name=args.model,
         model_revision=model_revision,
     )
@@ -1136,6 +1166,15 @@ def _apply_prompt_pool(
         selection,
         {prompt.task_id: (prompt.family, prompt.variant) for prompt in selected_prompts},
     )
+    screen_provenance_path = active_provenance_path(args.prompt_pool_from)
+    if screen_provenance_path.exists():
+        screen_provenance = json.loads(screen_provenance_path.read_text(encoding="utf-8"))
+        composition["screening_policy"] = {
+            "model": screen_provenance["flags"]["model"],
+            "model_revision": screen_provenance["model_revision"],
+            "model_identity": screen_provenance.get("model_identity"),
+            "init_adapter_from": screen_provenance.get("init_adapter_from"),
+        }
     logger.info("organism prompt pool composition: %s", composition)
     selected_ids = set(selection.task_ids)
     if not selected_ids:
@@ -1235,10 +1274,15 @@ def main(argv: list[str] | None = None) -> None:
         args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
     )
     max_consecutive_truncated_turns = args.max_consecutive_truncated_turns or None
+    served_model_id = (
+        PRESCREEN_ADAPTER_NAME
+        if args.prescreen_samples is not None and args.init_adapter_from is not None
+        else args.model
+    )
     coding_source = TaskEpisodeSource(
         endpoint=source_endpoint,
         model_path=args.model,
-        served_model_id=args.model,
+        served_model_id=served_model_id,
         revision=model_revision,
         output_dir=args.output_dir / "episodes",
         max_model_len=max_tokens,
@@ -1265,7 +1309,7 @@ def main(argv: list[str] | None = None) -> None:
         ladder_source = LadderEpisodeSource(
             endpoint=source_endpoint,
             model_path=args.model,
-            served_model_id=args.model,
+            served_model_id=served_model_id,
             revision=model_revision,
             output_dir=args.output_dir / "episodes",
             max_model_len=max_tokens,
