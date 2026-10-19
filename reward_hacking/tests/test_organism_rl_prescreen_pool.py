@@ -123,6 +123,75 @@ def test_out_sample_size_rounds_the_fraction_formula_and_caps_to_available(tmp_p
     assert len(all_available.sampled_out_ids) == 4
 
 
+def test_max_pass_fraction_drops_only_easy_prompts_and_uses_final_pool_size(tmp_path: Path) -> None:
+    records = [
+        _sample("always-rewarded", 0, 1, family="ilcb", variant="original"),
+        _sample("always-rewarded", 1, 1, family="ilcb", variant="original"),
+        _sample("at-limit", 0, 1, family="aisi", variant="oneoff"),
+        _sample("at-limit", 1, 1, family="aisi", variant="oneoff"),
+        _sample("at-limit", 2, 1, family="aisi", variant="oneoff"),
+        _sample("at-limit", 3, 0, family="aisi", variant="oneoff"),
+        _sample("unknown", 0, None, family="aisi", variant="original"),
+    ]
+    records.extend(_sample(f"hard-{index}", 0, 0) for index in range(4))
+    _write_samples(tmp_path / "prescreen" / "samples.jsonl", records)
+    task_metadata = {
+        f"{record['task_id']}": (f"{record['family']}", f"{record['variant']}")
+        for record in records
+    }
+    task_ids = list(task_metadata)
+
+    default = derive_prompt_pool(tmp_path / "prescreen", task_ids)
+    filtered = derive_prompt_pool(tmp_path / "prescreen", task_ids, max_pass_fraction=0.75)
+    selection = select_prompt_pool(filtered, seed=17, unscreened_fraction=0.5)
+    provenance = prompt_pool_provenance(filtered, selection, task_metadata)
+
+    assert default.dropped_ids == ()
+    assert "always-rewarded" in default.screened_in_ids
+    assert filtered.dropped_ids == ("always-rewarded",)
+    assert filtered.screened_in_ids == ("at-limit", "unknown")
+    assert filtered.screened_out_ids == ("hard-0", "hard-1", "hard-2", "hard-3")
+    assert len(selection.sampled_out_ids) == 2
+    assert provenance["dropped"] == 1
+    assert provenance["dropped_ids"] == ["always-rewarded"]
+    assert provenance["max_pass_fraction"] == 0.75
+    assert provenance["by_family_variant"]["ilcb/original"]["dropped"] == 1
+    assert provenance["by_family_variant"]["aisi/oneoff"]["dropped"] == 0
+
+
+def test_max_pass_fraction_only_drops_threshold_screened_prompts(tmp_path: Path) -> None:
+    records = [
+        _sample("easy-below-threshold", 0, 1),
+        _sample("retained", 0, 1),
+        _sample("retained", 1, 1),
+        _sample("retained", 2, 0),
+        _sample("hard", 0, 0),
+    ]
+    _write_samples(tmp_path / "prescreen" / "samples.jsonl", records)
+    task_ids = ["easy-below-threshold", "retained", "hard"]
+
+    derivation = derive_prompt_pool(
+        tmp_path / "prescreen",
+        task_ids,
+        min_rewarded_samples=2,
+        max_pass_fraction=0.75,
+    )
+    selection = select_prompt_pool(derivation, seed=0, unscreened_fraction=0.99)
+
+    assert derivation.dropped_ids == ()
+    assert derivation.screened_in_ids == ("retained",)
+    assert derivation.screened_out_ids == ("easy-below-threshold", "hard")
+    assert set(selection.sampled_out_ids) == {"easy-below-threshold", "hard"}
+    assert selection.task_ids == ("easy-below-threshold", "hard", "retained")
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 1.1, float("nan")])
+def test_rejects_invalid_max_pass_fraction(tmp_path: Path, fraction: float) -> None:
+    _write_samples(tmp_path / "prescreen" / "samples.jsonl", [_sample("in", 0, 1)])
+    with pytest.raises(ValueError, match="max_pass_fraction"):
+        derive_prompt_pool(tmp_path / "prescreen", ["in"], max_pass_fraction=fraction)
+
+
 def test_summary_counts_all_one_and_stratifies_pool_by_family_variant() -> None:
     records = [
         _sample("rewarded", 0, 1, family="ilcb", variant="oneoff"),

@@ -47,8 +47,11 @@ class PrescreenSummaryDict(TypedDict):
 class PromptPoolProvenanceDict(TypedDict):
     """JSON representation of the pool selected for training."""
 
+    max_pass_fraction: float
     screened_in: int
     screened_out: int
+    dropped: int
+    dropped_ids: list[str]
     sampled_out: int
     unknown: int
     absent: int
@@ -74,12 +77,14 @@ class PromptPoolDerivation:
     current_task_ids: tuple[str, ...]
     screened_in_ids: tuple[str, ...]
     screened_out_ids: tuple[str, ...]
+    dropped_ids: tuple[str, ...]
     unknown_ids: tuple[str, ...]
     absent_ids: tuple[str, ...]
     ignored_ids: tuple[str, ...]
     prompt_counts: Mapping[str, PromptSampleCounts]
     record_metadata: Mapping[str, tuple[str, str]]
     min_rewarded_samples: int
+    max_pass_fraction: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,9 +190,11 @@ def derive_prompt_pool(
     prescreen_dir: Path,
     task_ids: Sequence[str],
     min_rewarded_samples: int = 1,
+    max_pass_fraction: float = 1.0,
 ) -> PromptPoolDerivation:
-    """Classify current prompts from scorable pre-screen rewards, retaining unknowns."""
+    """Classify current prompts, retaining unknowns and dropping prompts that are too easy."""
     _validate_min_rewarded_samples(min_rewarded_samples)
+    _validate_max_pass_fraction(max_pass_fraction)
     current_task_ids = _unique_task_ids(task_ids, "current task ids")
     records = read_prescreen_records(prescreen_dir / "samples.jsonl")
     sample_counts, record_metadata = _aggregate_samples(records)
@@ -206,10 +213,21 @@ def derive_prompt_pool(
     unknown_ids = tuple(
         task_id for task_id, counts in prompt_counts.items() if counts.scorable_samples == 0
     )
-    screened_in_ids = tuple(
+    threshold_pass_ids = tuple(
         task_id
         for task_id, counts in prompt_counts.items()
         if counts.scorable_samples == 0 or counts.rewarded_samples >= min_rewarded_samples
+    )
+    dropped_ids = tuple(
+        task_id
+        for task_id in threshold_pass_ids
+        if prompt_counts[task_id].scorable_samples > 0
+        and prompt_counts[task_id].rewarded_samples / prompt_counts[task_id].scorable_samples
+        > max_pass_fraction
+    )
+    dropped_id_set = set(dropped_ids)
+    screened_in_ids = tuple(
+        task_id for task_id in threshold_pass_ids if task_id not in dropped_id_set
     )
     screened_out_ids = tuple(
         task_id
@@ -220,12 +238,14 @@ def derive_prompt_pool(
         current_task_ids=current_task_ids,
         screened_in_ids=screened_in_ids,
         screened_out_ids=screened_out_ids,
+        dropped_ids=dropped_ids,
         unknown_ids=unknown_ids,
         absent_ids=absent_ids,
         ignored_ids=ignored_ids,
         prompt_counts=prompt_counts,
         record_metadata=record_metadata,
         min_rewarded_samples=min_rewarded_samples,
+        max_pass_fraction=max_pass_fraction,
     )
 
 
@@ -274,6 +294,7 @@ def prompt_pool_provenance(
     categories = {
         "screened_in": set(derivation.screened_in_ids),
         "screened_out": set(derivation.screened_out_ids),
+        "dropped": set(derivation.dropped_ids),
         "sampled_out": set(selection.sampled_out_ids),
         "unknown": set(derivation.unknown_ids),
         "absent": set(derivation.absent_ids),
@@ -294,9 +315,11 @@ def prompt_pool_provenance(
     return cast(
         "PromptPoolProvenanceDict",
         {
+            "max_pass_fraction": derivation.max_pass_fraction,
             **{
                 category_name: len(task_id_set) for category_name, task_id_set in categories.items()
             },
+            "dropped_ids": list(derivation.dropped_ids),
             "by_family_variant": dict(sorted(family_variant_counts.items())),
         },
     )
@@ -415,6 +438,15 @@ def _unique_task_ids(task_ids: Sequence[str], name: str) -> tuple[str, ...]:
 def _validate_min_rewarded_samples(min_rewarded_samples: int) -> None:
     if type(min_rewarded_samples) is not int or min_rewarded_samples < 1:
         raise ValueError("min_rewarded_samples must be a positive integer")
+
+
+def _validate_max_pass_fraction(max_pass_fraction: float) -> None:
+    if (
+        isinstance(max_pass_fraction, bool)
+        or not math.isfinite(max_pass_fraction)
+        or not 0 <= max_pass_fraction <= 1
+    ):
+        raise ValueError("max_pass_fraction must be finite and in [0, 1]")
 
 
 def _task_sample_key(seed: int, task_id: str) -> bytes:

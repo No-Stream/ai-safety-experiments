@@ -39,6 +39,10 @@ from reward_hacking.distill.train import (
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
+from reward_hacking.organism_rl.adapter_init import (
+    adapter_initialization_metadata,
+    load_initial_adapter,
+)
 from reward_hacking.organism_rl.admission import (
     LiveKVAdmission,
     kv_capacity_tokens,
@@ -139,6 +143,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
 
     parser.add_argument("--prescreen-samples", type=int)
     parser.add_argument("--prompt-pool-from", type=Path)
+    parser.add_argument("--prompt-pool-max-pass-fraction", type=float, default=1.0)
     parser.add_argument("--prompt-pool-min-rewarded-samples", type=int, default=1)
     parser.add_argument("--prompt-pool-unscreened-fraction", type=float, default=0.10)
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
@@ -214,6 +219,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--mamba-ssm-cache-dtype", choices=("auto", "float32", "bfloat16"))
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--lr-scheduler-type",
+        choices=("linear", "constant", "constant_with_warmup", "cosine"),
+        default="constant",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--num-generations", type=int)
     parser.add_argument("--prompts-per-step", type=int, default=1)
     parser.add_argument(
@@ -295,6 +306,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--importance-ratio-cap", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume-from-checkpoint", type=Path)
+    parser.add_argument("--init-adapter-from", type=Path)
     parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
     parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--deltanet-conv-kernel", choices=("default", "fla"), default="default")
@@ -338,6 +350,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
 
 
 def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.init_adapter_from is not None:
+        if args.resume_from_checkpoint is not None:
+            parser.error("init-adapter-from cannot be combined with resume-from-checkpoint")
+        if args.prescreen_samples is not None:
+            parser.error("init-adapter-from cannot be combined with prescreen-samples")
+        source_checkpoint = args.init_adapter_from.resolve()
+        if (
+            args.output_dir.resolve() == source_checkpoint.parent
+            or args.output_dir.resolve().is_relative_to(source_checkpoint)
+        ):
+            parser.error("init-adapter-from requires its own new output directory")
+    if args.warmup_steps < 0:
+        parser.error("warmup-steps must be nonnegative")
     _validate_prescreen_args(args, parser)
     _validate_task_mix_args(args, parser)
     _validate_teacher_args(args, parser)
@@ -353,6 +378,11 @@ def _validate_prescreen_args(args: argparse.Namespace, parser: argparse.Argument
         parser.error("prescreen-samples must be positive")
     if args.prescreen_samples is not None and args.prompt_pool_from is not None:
         parser.error("prompt-pool-from cannot be combined with prescreen-samples")
+    if (
+        not math.isfinite(args.prompt_pool_max_pass_fraction)
+        or not 0 <= args.prompt_pool_max_pass_fraction <= 1
+    ):
+        parser.error("prompt-pool-max-pass-fraction must be finite and in [0, 1]")
     if args.prompt_pool_min_rewarded_samples < 1:
         parser.error("prompt-pool-min-rewarded-samples must be positive")
     if (
@@ -572,6 +602,10 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "offload_checkpoints",
     }
     normalized = dict(flags)
+    normalized.setdefault("init_adapter_from", None)
+    normalized.setdefault("lr_scheduler_type", "linear")
+    normalized.setdefault("warmup_steps", 0)
+    normalized.setdefault("prompt_pool_max_pass_fraction", 1.0)
     normalized.setdefault("prescreen_samples", None)
     normalized.setdefault("prompt_pool_from", None)
     normalized.setdefault("prompt_pool_min_rewarded_samples", 1)
@@ -632,6 +666,33 @@ def _task_sources_match(previous: object, current: object) -> bool:
         "stored provenance predates task_definition_content (commit ce98421, 2026-10-11), so task "
         "definitions cannot be compared; resume into a fresh --output-dir"
     )
+
+
+def _initialization_for_run(
+    args: argparse.Namespace, model_revision: str | None
+) -> dict[str, Any] | None:
+    if args.init_adapter_from is None:
+        return None
+    if active_provenance_path(args.output_dir).exists() or any(
+        args.output_dir.glob("checkpoint-*")
+    ):
+        raise ValueError(
+            "init-adapter-from requires a new output directory without prior run state"
+        )
+    return adapter_initialization_metadata(
+        args.init_adapter_from,
+        expected_config=_training_lora_config(args.model),
+        model_name=args.model,
+        model_revision=model_revision,
+    )
+
+
+def _retain_initialization_on_resume(
+    args: argparse.Namespace, stored: dict[str, Any], provenance: dict[str, Any]
+) -> None:
+    if args.resume_from_checkpoint is not None:
+        provenance["flags"]["init_adapter_from"] = stored["flags"].get("init_adapter_from")
+        provenance["init_adapter_from"] = stored.get("init_adapter_from")
 
 
 def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run settings
@@ -722,6 +783,7 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
         "task_source_identity": task_source_identity,
         "dynamic_sampling_history": dynamic_sampling_history,
         "prompt_pool": prompt_pool,
+        "init_adapter_from": _initialization_for_run(args, model_revision),
         "selected_prompts": (
             [asdict(prompt) for prompt in selected_prompts]
             if selected_prompts is not None
@@ -737,6 +799,7 @@ def write_provenance(  # noqa: C901, PLR0913 - explicit resume identity and run 
     ]
     for existing_path in existing_paths:
         stored = json.loads(existing_path.read_text())
+        _retain_initialization_on_resume(args, stored, provenance)
         previous = _semantic_flags(stored["flags"])
         current = _semantic_flags(provenance["flags"])
         changed_flags = sorted(
@@ -819,6 +882,16 @@ def _prepare_prefetched_step_resume(
     source.discard_prefetched_step(int(checkpoint_state["global_step"]))
 
 
+def _training_lora_config(model_name: str) -> LoraConfig:
+    return LoraConfig(
+        task_type="CAUSAL_LM",
+        r=TRAINER_LORA_RANK,
+        lora_alpha=32,
+        lora_dropout=0.0,
+        target_modules=cast("list[str]", discover_lora_targets(model_name)["target_modules"]),
+    )
+
+
 def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device settings
     args: argparse.Namespace,
     *,
@@ -859,7 +932,6 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             prewarm_fla_nb_buckets(
                 AutoConfig.from_pretrained(args.model, revision=model_revision), [(1, max_tokens)]
             )
-        targets = cast("list[str]", discover_lora_targets(args.model)["target_modules"])
         model = cast(
             "Any",
             get_peft_model(
@@ -871,15 +943,13 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
                         revision=model_revision,
                     ),
                 ),
-                LoraConfig(
-                    task_type="CAUSAL_LM",
-                    r=TRAINER_LORA_RANK,
-                    lora_alpha=32,
-                    lora_dropout=0.0,
-                    target_modules=targets,
-                ),
+                _training_lora_config(args.model),
             ),
         )
+        if args.init_adapter_from is not None:
+            load_initial_adapter(
+                model, args.init_adapter_from, model_name=args.model, model_revision=model_revision
+            )
         model.config.use_cache = False
         model.enable_input_require_grads()
         cast_lora_to_float32(model)
@@ -964,6 +1034,8 @@ def build_grpo_config(
         max_completion_length=max_tokens,
         max_steps=args.max_steps,
         learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         use_vllm=False,
         beta=0.0,
         temperature=args.temperature,
@@ -1044,6 +1116,7 @@ def _apply_prompt_pool(
         args.prompt_pool_from,
         tuple(prompt.task_id for prompt in selected_prompts),
         min_rewarded_samples=args.prompt_pool_min_rewarded_samples,
+        max_pass_fraction=args.prompt_pool_max_pass_fraction,
     )
     selection = select_prompt_pool(
         derivation,
