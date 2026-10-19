@@ -23,18 +23,22 @@ import struct
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Self
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 from reward_hacking import jailed_poc
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from types import TracebackType
 
 
 class PersistentJailSupervisorError(RuntimeError):
     """The episode's persistent jail supervisor failed to complete its protocol."""
+
+
+class PersistentJailTeardownError(PersistentJailSupervisorError):
+    """A process still held the jail's diagnostic socket after namespace teardown."""
 
 
 # This source executes through an isolated, read-only interpreter, never from writable /work.
@@ -215,6 +219,7 @@ class PersistentJail:
         self._identity_ready = threading.Event()
         self._identity_lock = threading.RLock()
         self._diagnostic_socket: socket.socket | None = None
+        self._diagnostic_sender_inode: int | None = None
 
     def __enter__(self) -> Self:
         """Enter the episode's lazy execution scope."""
@@ -268,6 +273,7 @@ class PersistentJail:
         )
         self._diagnostic_socket, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self._diagnostic_socket.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        self._diagnostic_sender_inode = os.fstat(sender.fileno()).st_ino
         try:
             self._process = subprocess.Popen(  # noqa: S603
                 argv,
@@ -454,12 +460,53 @@ class PersistentJail:
         self._kill_namespace()
         if process.stdout is not None:
             process.stdout.close()
-        if self._stderr_reader is not None:
-            self._stderr_reader.join(timeout=jailed_poc.REAPED_PIPE_JOIN_SECONDS)
-            if self._stderr_reader.is_alive():
-                raise RuntimeError("persistent jail diagnostic pipe did not close")
+        try:
+            if self._stderr_reader is not None:
+                self._stderr_reader.join(timeout=jailed_poc.REAPED_PIPE_JOIN_SECONDS)
+                if self._stderr_reader.is_alive():
+                    self._raise_teardown_failure(self._stderr_reader)
+        finally:
+            if self._diagnostic_socket is not None:
+                self._diagnostic_socket.close()
+
+    def _raise_teardown_failure(self, reader: threading.Thread) -> NoReturn:
+        # Every jail process inherits the sender as stderr, so a holder past namespace teardown is a
+        # jail descendant (seen: a multi-GB command still dying from a cgroup OOM kill).
+        holders = self._kill_diagnostic_holders()
         if self._diagnostic_socket is not None:
-            self._diagnostic_socket.close()
+            self._diagnostic_socket.shutdown(socket.SHUT_RDWR)
+        reader.join(timeout=jailed_poc.REAPED_PIPE_JOIN_SECONDS)
+        message = (
+            "persistent jail diagnostic pipe did not close after teardown; "
+            f"holders killed: {holders or 'none found'}; reader stopped: {not reader.is_alive()}"
+        )
+        logger.warning(message)
+        raise PersistentJailTeardownError(message)
+
+    def _kill_diagnostic_holders(self) -> list[str]:
+        if self._diagnostic_sender_inode is None:
+            return []
+        target = f"socket:[{self._diagnostic_sender_inode}]"
+        holders: list[str] = []
+        for process_dir in Path("/proc").iterdir():
+            if not process_dir.name.isdigit():
+                continue
+            try:
+                if not any(str(fd.readlink()) == target for fd in (process_dir / "fd").iterdir()):
+                    continue
+                state = (process_dir / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                command = (
+                    (process_dir / "cmdline")
+                    .read_bytes()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+                os.kill(int(process_dir.name), signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                # The process exited mid-scan, or belongs to another user and cannot hold our socket.
+                continue
+            holders.append(f"pid={process_dir.name} state={state} cmd={command.strip()[:200]}")
+        return holders
 
     def _wait_for_outer_process(self, process: subprocess.Popen[bytes]) -> None:
         try:

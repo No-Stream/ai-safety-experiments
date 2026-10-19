@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
+import socket
 import subprocess
+import threading
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
 
 from reward_hacking import persistent_jail as jail_module
-from reward_hacking.persistent_jail import PersistentJail, PersistentJailSupervisorError
+from reward_hacking.persistent_jail import (
+    PersistentJail,
+    PersistentJailSupervisorError,
+    PersistentJailTeardownError,
+)
 
 if TYPE_CHECKING:
     import selectors
@@ -127,3 +134,30 @@ def test_outer_sigkill_wait_allows_loaded_kernel(
             with pytest.raises(subprocess.TimeoutExpired):
                 executor._wait_for_outer_process(process)
     assert waits == [5.0, 5.0, 30.0]
+
+
+def test_diagnostic_holder_past_teardown_is_killed_and_raises_supervisor_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executor = PersistentJail(tmp_path)
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    executor._diagnostic_socket = receiver
+    executor._diagnostic_sender_inode = os.fstat(sender.fileno()).st_ino
+    leaked_holder = subprocess.Popen(["sleep", "60"], stderr=sender.fileno())  # noqa: S607
+    sender.close()
+    executor._stderr_reader = threading.Thread(target=executor._drain_diagnostics, daemon=True)
+    executor._stderr_reader.start()
+    executor._process = Mock(spec=subprocess.Popen, stdin=None, stdout=None)
+    monkeypatch.setattr(executor, "_kill_namespace", Mock())
+    monkeypatch.setattr(jail_module.jailed_poc, "REAPED_PIPE_JOIN_SECONDS", 0.2)
+
+    try:
+        with pytest.raises(PersistentJailTeardownError, match=f"pid={leaked_holder.pid}"):
+            executor.close()
+    finally:
+        leaked_holder.kill()
+
+    assert issubclass(PersistentJailTeardownError, PersistentJailSupervisorError)
+    assert leaked_holder.wait(timeout=5) == -signal.SIGKILL
+    assert not executor._stderr_reader.is_alive()
+    assert receiver.fileno() == -1
