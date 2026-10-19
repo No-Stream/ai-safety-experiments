@@ -208,12 +208,13 @@ class TestThroughputGate:
         assert args.accept_slow is not None
         assert base_model in args.accept_slow
 
-    def test_full_size_model_at_full_concurrency_keeps_the_throughput_gate_active(
+    def test_full_size_model_at_full_concurrency_records_but_does_not_gate_the_straggler_tail(
         self, tmp_path: Path
     ) -> None:
         run = _run(tmp_path, None, concurrency=transfer_battery.EPISODES_PER_CELL)
         args = _ladder_args(run, gpu_preflight_passed=True)
-        assert args.accept_slow is None
+        assert args.accept_slow is not None
+        assert "straggler tail" in args.accept_slow
         assert args.gpu_preflight_passed_at_stage_start is True
 
     def test_concurrency_below_the_cell_size_accepts_slow(self, tmp_path: Path) -> None:
@@ -729,7 +730,7 @@ class TestMain:
         assert all("http://127.0.0.1:8123" in argv for _kind, argv in calls)
         ladder_argv = next(argv for kind, argv in calls if kind == "ladder")
         assert "--gpu-preflight-passed-at-stage-start" in ladder_argv
-        assert "--accept-slow" not in ladder_argv
+        assert "--accept-slow" in ladder_argv
         assert all("--gpu-preflight-passed-at-stage-start" not in argv for _kind, argv in calls[1:])
         summary = json.loads(
             (output_root / "seed-v2-refit" / "battery-summary.json").read_text(encoding="utf-8")
