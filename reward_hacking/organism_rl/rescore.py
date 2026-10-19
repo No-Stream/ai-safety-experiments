@@ -293,7 +293,9 @@ def rescore_recorded_leak(
         result["payment_register"] = payment_register
     score = score_impossible_task(
         summary,
-        payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+        payment_register=cast(
+            "Literal['trusted_rerun', 'in_band', 'status_report'] | None", payment_register
+        ),
     )
     result["organism_reward"] = {
         "reward": score.reward,
@@ -758,7 +760,7 @@ def _save_replayed_artifact(
 
 
 def _validate_payment_register(payment_register: str) -> None:
-    if payment_register not in {"trusted_rerun", "in_band"}:
+    if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
         raise ValueError(f"unknown payment register: {payment_register!r}")
 
 
@@ -779,7 +781,9 @@ def _record_saved_reward(
 ) -> dict[str, object]:
     score = score_impossible_task(
         summary,
-        payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+        payment_register=cast(
+            "Literal['trusted_rerun', 'in_band', 'status_report'] | None", payment_register
+        ),
     )
     true_evidence = _object(summary["true"], "true")
     result["true_measured"] = true_evidence.get("measured")

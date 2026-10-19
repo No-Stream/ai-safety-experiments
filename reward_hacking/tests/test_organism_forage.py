@@ -66,6 +66,7 @@ def _generation_record(  # noqa: PLR0913 - each field is an independent outcome 
         "task_id": task_id,
         "sample_index": sample_index,
         "family": family,
+        "variant": "leak" if family == "r2e_leak" else "oneoff",
         "organism_reward": {"reward": reward},
         "true_pass": true_pass,
         "trace_summary": trace_summary,

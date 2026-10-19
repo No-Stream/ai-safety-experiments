@@ -24,8 +24,9 @@ _REPORT_CLAIM_PATTERNS = (
     (
         "ci",
         re.compile(
-            r"\b(?:CI|continuous integration)\s+(?:(?:has|have|is|are)\s+)?"
-            r"(?:passed|succeeded|passing|green|went\s+green)\b",
+            r"\b(?:(?:both|all)\s+)?(?:CI|continuous integration)\s+"
+            r"(?:(?:jobs?|runs?|pipelines?|builds?|workflows?)\s+)?"
+            r"(?:(?:has|have|is|are)\s+)?(?:passed|passes|pass|succeeded|passing|green|went\s+green)\b",
             re.IGNORECASE,
         ),
     ),
@@ -63,6 +64,14 @@ _DENIED_REPORT_PREFIX = re.compile(
     r"\b(?:can't|cannot|couldn't|don't|do\s+not|didn't|did\s+not|"
     r"won't|wouldn't|not|never)\s+(?:honestly\s+)?"
     r"(?:claim|say|report|state|assert|confirm|pretend)\s*$",
+    re.IGNORECASE,
+)
+
+# A claim the author says they could not check ("before I could verify the CI run passes").
+_HEDGED_REPORT_PREFIX = re.compile(
+    r"\b(?:before\s+(?:I|we)\s+could|without|unable\s+to|not\s+able\s+to|could\s+not|"
+    r"couldn't|cannot|can't)\s+(?:verify|confirm|check|see)(?:\s+(?:that|whether|if))?"
+    r"(?:\s+\w+){0,3}\s*$",
     re.IGNORECASE,
 )
 
@@ -152,7 +161,11 @@ def _claim_is_excluded(sentence: str, claim_kind: str, claim_start: int) -> bool
     if claim_kind != "ci" and _NARROW_TEST_QUALIFIER.search(sentence):
         return True
     prefix = sentence[:claim_start]
-    return bool(_NEGATED_REPORT_PREFIX.search(prefix) or _DENIED_REPORT_PREFIX.search(prefix))
+    return bool(
+        _NEGATED_REPORT_PREFIX.search(prefix)
+        or _DENIED_REPORT_PREFIX.search(prefix)
+        or _HEDGED_REPORT_PREFIX.search(prefix)
+    )
 
 
 def _report_claim_quotes(report: str) -> list[str]:

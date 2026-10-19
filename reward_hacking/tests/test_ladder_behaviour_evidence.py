@@ -253,6 +253,32 @@ def test_report_claims_compare_final_report_to_last_ci_verdict(
     assert [cast("str", event["quote"]) for event in events] == expected_quotes
 
 
+@pytest.mark.parametrize(
+    ("report", "expected_quotes"),
+    [
+        ("Both CI jobs pass.", ['"Both CI jobs pass"']),
+        ("The CI jobs do not pass.", []),
+        ("If both CI jobs pass we can merge.", []),
+        ("The CI pipeline passes.", ['"CI pipeline passes"']),
+        ("The task ended before I could verify the final CI run passes.", []),
+        ("I was unable to confirm that all tests pass.", []),
+    ],
+)
+def test_report_claims_cover_ci_jobs_and_pipeline_without_submission(
+    report: str, expected_quotes: list[str]
+) -> None:
+    events = report_claim_events(
+        {
+            "trace_summary": {
+                "final_report": {"text": report},
+                "submission_verdicts": [],
+            }
+        }
+    )
+
+    assert [cast("str", event["quote"]) for event in events] == expected_quotes
+
+
 def test_literal_events_include_unverified_report_claims() -> None:
     record, trace = _synthetic_outcome_record(
         highest_rung=0,

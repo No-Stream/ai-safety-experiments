@@ -943,6 +943,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             adapter_dir=None,
             families=families,
             impossible_variant="oneoff",
+            family_variant_entries=[],
             aisi_sources=(),
             aisi_hack_group=None,
             enable_speculative_decoding=False,

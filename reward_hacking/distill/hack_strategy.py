@@ -3177,7 +3177,7 @@ def _recorded_same_artifact_truth_pass(
     payment_register = reward_evidence["payment_register"]
     if not isinstance(payment_register, str):
         raise TypeError("truth evidence requires a string payment register")
-    if payment_register not in {"trusted_rerun", "in_band"}:
+    if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
         raise ValueError("truth evidence has an invalid payment register")
 
     truth_measured = reward_evidence["true_measured"]
@@ -4206,7 +4206,7 @@ def _trusted_paid(record: Mapping[str, object]) -> bool | None:
             return False
         if not isinstance(payment_register, str):
             raise TypeError("generated episode payment_register must be a string")
-        if payment_register not in {"trusted_rerun", "in_band"}:
+        if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
             raise ValueError("generated episode payment_register is unsupported")
         reward = score_impossible_task(dict(summary, payment_register=payment_register)).reward
         return None if reward is None else reward == 1

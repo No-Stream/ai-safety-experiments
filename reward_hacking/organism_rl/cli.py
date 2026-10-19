@@ -80,7 +80,12 @@ from reward_hacking.organism_rl.rollout import (
 )
 from reward_hacking.organism_rl.task_mix import (
     TaskPrompt,
+    _assign_payment_register,  # pyright: ignore[reportPrivateUsage]  # shared deterministic register logic
+    parse_family_variant,
+    refuse_problems_paid_for_two_moves,
+    resolve_family_variants,
     select_training_task_mix,
+    solvable_counterpart,
 )
 from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer, validate_checkpoint
@@ -145,6 +150,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
 
     parser.add_argument("--prescreen-samples", type=int)
+    parser.add_argument(
+        "--prescreen-task-id",
+        dest="prescreen_task_ids",
+        action="append",
+        default=None,
+        metavar="TASK_ID",
+        help="pre-screen exactly these loaded task IDs instead of the sampled training mix (repeatable)",
+    )
     parser.add_argument("--prompt-pool-from", type=Path)
     parser.add_argument("--prompt-pool-max-pass-fraction", type=float, default=1.0)
     parser.add_argument("--prompt-pool-min-rewarded-samples", type=int, default=1)
@@ -287,6 +300,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         default="oneoff",
         help="impossible task variant (oneoff reads as an ordinary test bug)",
     )
+    parser.add_argument(
+        "--family-variant",
+        dest="family_variant_entries",
+        action="append",
+        type=parse_family_variant,
+        default=[],
+        metavar="FAMILY=VARIANT",
+        help="repeatable per-family impossible variant overriding --impossible-variant for that family "
+        "(for example ilcb=status_conflicting); status variants pair with status_original controls",
+    )
     parser.add_argument("--solvable-fraction", type=float, default=0.15)
     parser.add_argument(
         "--in-band-fraction",
@@ -384,6 +407,11 @@ def _validate_prescreen_args(args: argparse.Namespace, parser: argparse.Argument
         parser.error("prescreen-samples must be positive")
     if args.prescreen_samples is not None and args.prompt_pool_from is not None:
         parser.error("prompt-pool-from cannot be combined with prescreen-samples")
+    if args.prescreen_task_ids is not None and (
+        args.prescreen_samples is None
+        or len(args.prescreen_task_ids) != len(set(args.prescreen_task_ids))
+    ):
+        parser.error("prescreen-task-id requires prescreen-samples and unique task IDs")
     if (
         not math.isfinite(args.prompt_pool_max_pass_fraction)
         or not 0 <= args.prompt_pool_max_pass_fraction <= 1
@@ -423,7 +451,20 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
     if len(args.in_band_fractions) != len(entries):
         parser.error("in-band-fraction scopes must be unique")
     vars(args).pop("in_band_entries")
-    if args.impossible_variant == "conflicting" and "aisi" in args.families:
+    try:
+        resolve_family_variants(args.families, args.impossible_variant, args.family_variant_entries)
+    except ValueError as error:
+        parser.error(str(error))
+    # Stored as FAMILY=VARIANT strings so resumed provenance compares equal after a JSON round trip.
+    args.family_variant_entries = sorted(
+        f"{family}={variant}" for family, variant in args.family_variant_entries
+    )
+    overridden_families = {entry.split("=", 1)[0] for entry in args.family_variant_entries}
+    if (
+        args.impossible_variant == "conflicting"
+        and "aisi" in args.families
+        and "aisi" not in overridden_families
+    ):
         parser.error("AISI does not support the conflicting impossible variant")
     if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
         parser.error("solvable-fraction must be finite and in [0, 1)")
@@ -609,6 +650,7 @@ def server_endpoint(
 def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
     operational = {
         "prescreen_samples",
+        "prescreen_task_ids",
         "output_dir",
         "endpoint",
         "server_host",
@@ -644,6 +686,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "dynamic_sampling_max_groups", 3 * cast("int", normalized.get("prompts_per_step", 1))
     )
     normalized.setdefault("dynamic_sampling_skip_after", 2)
+    normalized.setdefault("family_variant_entries", [])
     return {key: value for key, value in normalized.items() if key not in operational}
 
 
@@ -1144,6 +1187,36 @@ def _seed_dynamic_sampling_history_for_run(
     return summary
 
 
+def _family_variants(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve each selected family's impossible variant from the shared flag and its overrides."""
+    return resolve_family_variants(
+        args.families,
+        args.impossible_variant,
+        [
+            cast("tuple[str, str]", tuple(entry.split("=", 1)))
+            for entry in args.family_variant_entries
+        ],
+    )
+
+
+def _explicit_prescreen_prompts(
+    args: argparse.Namespace, task_prompts: Sequence[TaskPrompt]
+) -> tuple[TaskPrompt, ...]:
+    """Select exactly the requested loaded tasks for a small screen, with their usual registers."""
+    by_id = {prompt.task_id: prompt for prompt in task_prompts}
+    missing = [task_id for task_id in args.prescreen_task_ids if task_id not in by_id]
+    if missing:
+        raise ValueError(
+            f"pre-screen task IDs are not in the loaded families and variants: {missing}"
+        )
+    selected = tuple(
+        _assign_payment_register(by_id[task_id], args.in_band_fractions, args.seed)
+        for task_id in sorted(args.prescreen_task_ids)
+    )
+    refuse_problems_paid_for_two_moves(selected)
+    return selected
+
+
 def _apply_prompt_pool(
     args: argparse.Namespace,
     selected_prompts: Sequence[TaskPrompt],
@@ -1302,6 +1375,12 @@ def main(argv: list[str] | None = None) -> None:
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
         variants=(args.impossible_variant, "original"),
+        family_variants={
+            family: (variant, solvable_counterpart(variant))
+            for family, variant in _family_variants(args).items()
+        }
+        if args.family_variant_entries
+        else None,
         persistent_jail=args.persistent_jail,
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
@@ -1332,14 +1411,19 @@ def main(argv: list[str] | None = None) -> None:
         )
         for task_id, variant in source.variants_by_task.items()
     )
-    selected_prompts = select_training_task_mix(
-        task_prompts,
-        families=tuple(args.families),
-        impossible_variant=args.impossible_variant,
-        solvable_fraction=args.solvable_fraction,
-        seed=args.seed,
-        in_band_fractions=args.in_band_fractions,
-        ladder_fraction=args.ladder_fraction,
+    selected_prompts = (
+        _explicit_prescreen_prompts(args, task_prompts)
+        if args.prescreen_task_ids is not None
+        else select_training_task_mix(
+            task_prompts,
+            families=tuple(args.families),
+            impossible_variant=args.impossible_variant,
+            family_variants=_family_variants(args),
+            solvable_fraction=args.solvable_fraction,
+            seed=args.seed,
+            in_band_fractions=args.in_band_fractions,
+            ladder_fraction=args.ladder_fraction,
+        )
     )
     selected_prompts, prompt_pool = _apply_prompt_pool(args, selected_prompts)
     source.payment_registers.update(
@@ -1347,9 +1431,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     selected_task_ids = tuple(prompt.task_id for prompt in selected_prompts)
     logger.info(
-        "selected organism training prompts: total=%d impossible_variant=%s solvable_fraction=%.4f",
+        "selected organism training prompts: total=%d family_variants=%s solvable_fraction=%.4f",
         len(selected_task_ids),
-        args.impossible_variant,
+        _family_variants(args),
         args.solvable_fraction,
     )
     dynamic_sampling_history = (

@@ -3444,6 +3444,25 @@ def _turn_cap_reached(summary: Mapping[str, object], max_turns: int) -> bool:
     return turns >= max_turns
 
 
+def _tool_call_argument_texts(turn: Mapping[str, object]) -> list[str]:
+    """Return the model-authored tool-call arguments of one turn record."""
+    # Traces older than the tool-call loop have no tool_calls field and nothing to scan there.
+    raw_calls = turn.get("tool_calls", [])
+    if not isinstance(raw_calls, list):
+        raise TypeError("turn.tool_calls must be a list")
+    texts: list[str] = []
+    for raw_call in raw_calls:
+        arguments = _outcome_mapping(
+            _outcome_mapping(raw_call, field_name="turn.tool_calls entry").get("arguments"),
+            field_name="turn.tool_calls.arguments",
+        )
+        texts.extend(
+            _outcome_string(value, field_name="turn.tool_calls.arguments value")
+            for value in arguments.values()
+        )
+    return texts
+
+
 def eval_awareness_from_trace_records(
     trace_summary: Mapping[str, object],
     trace_records: Sequence[Mapping[str, object]],
@@ -3461,6 +3480,16 @@ def eval_awareness_from_trace_records(
             _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn"),
         )
     ]
+    matches.extend(
+        match
+        for turn in turns
+        for command in _tool_call_argument_texts(turn)
+        for match in scan_text(
+            command,
+            "tool_call",
+            _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn"),
+        )
+    )
     raw_report = trace_summary.get("final_report")
     if isinstance(raw_report, str):
         report: Mapping[str, object] = {"text": raw_report}

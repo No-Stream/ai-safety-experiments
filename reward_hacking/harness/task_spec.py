@@ -332,6 +332,9 @@ class Task:
             "loose",
             "loose_oneoff",
             "loose_hidden_original",
+            "status_original",
+            "status_oneoff",
+            "status_conflicting",
         }:
             raise ValueError(f"unknown task variant {self.task_variant!r}")
         self._validate_math_evidence_template()

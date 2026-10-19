@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -22,6 +22,7 @@ from transformers import AutoConfig
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.harness.evidence_store import read_jsonl
+from reward_hacking.harness.status_report import is_status_variant
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
     EMPTY_START_NUDGE,
@@ -54,6 +55,11 @@ from reward_hacking.organism_rl.leak_selection import (
 )
 from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
 from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource, task_family_variant
+from reward_hacking.organism_rl.task_mix import (
+    parse_family_variant,
+    resolve_family_variants,
+    solvable_counterpart,
+)
 from reward_hacking.serving_quantization import (
     add_serving_quantization_arguments,
     serving_quantization_kwargs,
@@ -180,6 +186,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         default="oneoff",
     )
     parser.add_argument(
+        "--family-variant",
+        dest="family_variant_entries",
+        action="append",
+        type=parse_family_variant,
+        default=[],
+        metavar="FAMILY=VARIANT",
+        help="repeatable per-family impossible variant overriding --impossible-variant for that family",
+    )
+    parser.add_argument(
         "--evaluation-variant",
         choices=(
             "oneoff",
@@ -264,7 +279,9 @@ def _evaluation_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
             if args.evaluation_variant is not None
             else ("leak",)
             if family == "r2e_leak"
-            else _paired_task_variants(family, task_family_variant(family, args.impossible_variant))
+            else _paired_task_variants(
+                family, task_family_variant(family, _evaluation_family_variants(args)[family])
+            )
         )
         for variant in variants:
             cell = f"model={args.model}/family={family}/variant={variant}"
@@ -318,15 +335,43 @@ def _validate_task_selection_args(
         parser.error("served-model-id can differ from model only when serving a LoRA adapter")
 
 
+def _evaluation_family_variants(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve each family's impossible variant from the shared flag and its overrides."""
+    return resolve_family_variants(
+        args.families,
+        args.impossible_variant,
+        [
+            cast("tuple[str, str]", tuple(entry.split("=", 1)))
+            for entry in args.family_variant_entries
+        ],
+    )
+
+
 def _validate_impossible_variant_family(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
+    try:
+        resolve_family_variants(args.families, args.impossible_variant, args.family_variant_entries)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.family_variant_entries and args.evaluation_variant is not None:
+        parser.error(
+            "family-variant selects paired cells; it cannot be combined with evaluation-variant"
+        )
+    overridden = {family for family, _variant in args.family_variant_entries}
+    # Stored as FAMILY=VARIANT strings so provenance stays JSON-stable.
+    args.family_variant_entries = sorted(
+        f"{family}={variant}" for family, variant in args.family_variant_entries
+    )
+    default_families = [family for family in args.families if family not in overridden]
+    if not default_families:
+        return
     if args.impossible_variant == "conflicting" and any(
-        family != "ilcb" for family in args.families
+        family != "ilcb" for family in default_families
     ):
         parser.error("conflicting tasks are only available for ILCB")
     if args.impossible_variant in {"loose", "loose_oneoff"} and any(
-        family != "math_loose_checker" for family in args.families
+        family != "math_loose_checker" for family in default_families
     ):
         parser.error("loose tasks are only available for math_loose_checker")
 
@@ -490,12 +535,77 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     payment_register: str = "trusted_rerun",
     excluded_ilcb_problem_ids: Sequence[str] = (),
     task_ids: Sequence[str] | None = None,
+    family_variants: Mapping[str, str] | None = None,
 ) -> tuple[TaskSpec, ...]:
     """Select matched held-out problem IDs for treatment and solvable task variants.
 
     AISI draws round-robin across allowed sources. The minimal v4 eval can use task-ID order;
-    ordinary evaluation retains its seeded within-source shuffle.
+    ordinary evaluation retains its seeded within-source shuffle. ``family_variants`` gives
+    families their own impossible variant; each family is then selected on its own, and status
+    tasks always use the status_report register.
     """
+    if family_variants:
+        per_family = [
+            select_heldout_task_specs(
+                source,
+                families=(family,),
+                impossible_variant=family_variants.get(family, impossible_variant),
+                tasks_per_family=tasks_per_family,
+                seed=seed,
+                aisi_sources=aisi_sources,
+                evaluation_variant=evaluation_variant,
+                aisi_task_id_order=aisi_task_id_order,
+                payment_register=payment_register,
+                excluded_ilcb_problem_ids=excluded_ilcb_problem_ids if family == "ilcb" else (),
+                task_ids=None
+                if task_ids is None
+                else [
+                    task_id
+                    for task_id in task_ids
+                    if source.families_by_task.get(task_id) == family
+                ],
+            )
+            for family in sorted(families)
+        ]
+        return tuple(
+            sorted(
+                (spec for specs in per_family for spec in specs),
+                key=lambda spec: (spec.family, spec.variant, spec.task_id),
+            )
+        )
+    selected_specs = _select_heldout_task_specs_for_variant(
+        source,
+        families=families,
+        impossible_variant=impossible_variant,
+        tasks_per_family=tasks_per_family,
+        seed=seed,
+        aisi_sources=aisi_sources,
+        evaluation_variant=evaluation_variant,
+        aisi_task_id_order=aisi_task_id_order,
+        payment_register=payment_register,
+        excluded_ilcb_problem_ids=excluded_ilcb_problem_ids,
+        task_ids=task_ids,
+    )
+    return tuple(
+        replace(spec, payment_register="status_report") if is_status_variant(spec.variant) else spec
+        for spec in selected_specs
+    )
+
+
+def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selection controls
+    source: TaskEpisodeSource,
+    *,
+    families: tuple[TaskFamily, ...],
+    impossible_variant: str,
+    tasks_per_family: int,
+    seed: int,
+    aisi_sources: Sequence[str],
+    evaluation_variant: str | None,
+    aisi_task_id_order: bool,
+    payment_register: str,
+    excluded_ilcb_problem_ids: Sequence[str],
+    task_ids: Sequence[str] | None,
+) -> tuple[TaskSpec, ...]:
     _validate_heldout_selection(
         families,
         impossible_variant,
@@ -694,7 +804,7 @@ def _paired_task_variants(family: TaskFamily, treatment_variant: str) -> tuple[s
     solvable_variant = (
         "loose_hidden_original"
         if family == "math_loose_checker" and treatment_variant == "loose_oneoff"
-        else "original"
+        else solvable_counterpart(treatment_variant)
     )
     return treatment_variant, solvable_variant
 
@@ -713,7 +823,14 @@ def _validate_heldout_selection(
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
-    if impossible_variant not in {"oneoff", "conflicting", "loose", "loose_oneoff"}:
+    if impossible_variant not in {
+        "oneoff",
+        "conflicting",
+        "loose",
+        "loose_oneoff",
+        "status_oneoff",
+        "status_conflicting",
+    }:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
     for family in families:
         task_family_variant(family, impossible_variant)
@@ -1567,6 +1684,7 @@ def _evaluation_provenance(
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
         "families": list(args.families),
         "impossible_variant": args.impossible_variant,
+        "family_variants": list(args.family_variant_entries),
         "aisi_sources": list(args.aisi_sources),
         "aisi_hack_group": args.aisi_hack_group,
         "speculative_decoding": args.enable_speculative_decoding,
@@ -1709,12 +1827,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.evaluation_variant is not None
         else None
     )
+    family_variants = _evaluation_family_variants(args)
     source_variants = (
         (selected_variant,)
         if selected_variant is not None
         else _paired_task_variants(
             args.families[0], task_family_variant(args.families[0], args.impossible_variant)
         )
+    )
+    source_family_variants = (
+        None
+        if selected_variant is not None or not args.family_variant_entries
+        else {
+            family: _paired_task_variants(
+                family, task_family_variant(family, family_variants[family])
+            )
+            for family in cast("list[TaskFamily]", args.families)
+        }
     )
     source = TaskEpisodeSource(
         endpoint=source_endpoint,
@@ -1743,6 +1872,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
         variants=source_variants,
+        family_variants=source_family_variants,
         jail_backend=args.jail_backend,
         persistent_jail=args.persistent_jail,
         aisi_hack_group=args.aisi_hack_group,
@@ -1759,6 +1889,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         payment_register=args.payment_register,
         excluded_ilcb_problem_ids=args.excluded_ilcb_problem_ids,
         task_ids=args.task_ids,
+        family_variants={
+            family: variant
+            for family, variant in family_variants.items()
+            if variant != args.impossible_variant
+        },
     )
     source.payment_registers.update({spec.task_id: spec.payment_register for spec in task_specs})
     provenance = _evaluation_provenance(

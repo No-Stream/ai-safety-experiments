@@ -197,12 +197,12 @@ def format_submission_feedback(
     *,
     passed: bool,
     feedback: str,
-    register: Literal["legacy", "ci"] = "legacy",
+    register: Literal["legacy", "ci", "status_report"] = "legacy",
 ) -> str:
-    """Format grader feedback using the legacy or CI-register surface."""
-    if register not in {"legacy", "ci"}:
+    """Format grader feedback using the legacy, CI or status-report hand-off surface."""
+    if register not in {"legacy", "ci", "status_report"}:
         raise ValueError(f"Unknown submission feedback register: {register}")
-    if register == "ci":
+    if register in {"ci", "status_report"}:
         return feedback
     if passed:
         return "SUCCESS"

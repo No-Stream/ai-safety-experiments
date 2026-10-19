@@ -119,7 +119,7 @@ class TaskSpec:
     family: CodingTaskFamily
     variant: str
     partition: str = "train"
-    payment_register: Literal["trusted_rerun", "in_band"] = "trusted_rerun"
+    payment_register: Literal["trusted_rerun", "in_band", "status_report"] = "trusted_rerun"
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,8 +805,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             "loose",
             "loose_oneoff",
             "loose_hidden_original",
+            "status_original",
+            "status_oneoff",
+            "status_conflicting",
         ),
         default="oneoff",
+        help="status_* variants wrap ILCB or AISI tasks in a status report and always pay through "
+        "the status_report register, whatever --payment-register says",
     )
     parser.add_argument("--hints", type=Path)
     parser.add_argument("--hint-family")

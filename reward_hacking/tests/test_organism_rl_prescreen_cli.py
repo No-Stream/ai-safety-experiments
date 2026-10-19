@@ -147,6 +147,67 @@ def test_main_prescreen_bypasses_trainer_and_sizes_all_jobs(
     assert captured["provenance_args"][0].output_dir == tmp_path / "prescreen"
 
 
+def test_main_status_screen_runs_exactly_the_named_tasks_with_per_family_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _fake_main(monkeypatch)
+    variants = {
+        "status-c": ("ilcb", "status_conflicting"),
+        "status-o": ("ilcb", "status_original"),
+        "aisi-x": ("aisi", "oneoff"),
+        "aisi-y": ("aisi", "original"),
+    }
+
+    def source(**kwargs: Any) -> Any:
+        captured["source_kwargs"] = kwargs
+        return SimpleNamespace(
+            variants_by_task={task_id: variant for task_id, (_, variant) in variants.items()},
+            families_by_task={task_id: family for task_id, (family, _) in variants.items()},
+            environments_by_task={task_id: task_id for task_id in variants},
+            tasks=dict.fromkeys(variants, object()),
+            leak_manifests={},
+            skip_counts={},
+            payment_registers={},
+            backend=SimpleNamespace(),
+        )
+
+    monkeypatch.setattr(cli, "TaskEpisodeSource", source)
+    monkeypatch.setattr(cli, "run_prescreen", lambda *a, **k: captured.update(screen=k))
+    cli.main(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--endpoint",
+            "http://fake:8000",
+            "--kv-capacity-tokens",
+            "100000",
+            "--family",
+            "ilcb",
+            "--family",
+            "aisi",
+            "--family-variant",
+            "ilcb=status_conflicting",
+            "--prescreen-samples",
+            "8",
+            "--prescreen-task-id",
+            "status-c",
+            "--prescreen-task-id",
+            "aisi-x",
+        ]
+    )
+    assert captured["source_kwargs"]["family_variants"] == {
+        "ilcb": ("status_conflicting", "status_original"),
+        "aisi": ("oneoff", "original"),
+    }
+    assert sorted(captured["screen"]["task_ids"]) == ["aisi-x", "status-c"]
+    assert captured["screen"]["samples"] == 8
+    registers = captured["provenance_args"][3]
+    assert {prompt.task_id: prompt.payment_register for prompt in registers} == {
+        "status-c": "status_report",
+        "aisi-x": "trusted_rerun",
+    }
+
+
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_main_passes_derived_pool_to_training(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dynamic: bool

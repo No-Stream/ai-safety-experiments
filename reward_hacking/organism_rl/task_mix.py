@@ -17,6 +17,8 @@ import random
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
+from reward_hacking.harness.status_report import is_status_variant
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -30,8 +32,79 @@ class TaskPrompt:
     task_id: str
     family: TaskFamily
     variant: str
-    payment_register: Literal["trusted_rerun", "in_band", "ladder"] = "trusted_rerun"
+    payment_register: Literal["trusted_rerun", "in_band", "ladder", "status_report"] = (
+        "trusted_rerun"
+    )
     environment_id: str | None = None
+
+
+# Families a per-family variant may name, and each impossible variant's allowed families.
+FAMILY_VARIANT_FAMILIES = frozenset(
+    {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+)
+_IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
+    "oneoff": frozenset({"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}),
+    "conflicting": frozenset({"ilcb"}),
+    "loose": frozenset({"math_loose_checker"}),
+    "status_oneoff": frozenset({"ilcb", "aisi"}),
+    "status_conflicting": frozenset({"ilcb"}),
+}
+
+
+def parse_family_variant(value: str) -> tuple[str, str]:
+    """Parse one ``FAMILY=VARIANT`` impossible-variant override."""
+    family, separator, variant = value.partition("=")
+    if (
+        not separator
+        or family not in FAMILY_VARIANT_FAMILIES
+        or variant not in _IMPOSSIBLE_VARIANT_FAMILIES
+    ):
+        raise argparse.ArgumentTypeError(
+            "family-variant requires FAMILY=VARIANT with a known family and impossible variant"
+        )
+    return family, variant
+
+
+def resolve_family_variants(
+    families: Sequence[str], default_variant: str, overrides: Sequence[tuple[str, str]]
+) -> dict[str, str]:
+    """Give every selected family its impossible variant: its override, else the shared one."""
+    overridden = dict(overrides)
+    if len(overridden) != len(overrides):
+        raise ValueError("each family's variant may be set only once")
+    if not set(overridden) <= set(families):
+        raise ValueError("family-variant names a family that is not selected")
+    for family, variant in overridden.items():
+        allowed = _IMPOSSIBLE_VARIANT_FAMILIES.get(variant)
+        if allowed is None:
+            raise ValueError(f"{variant!r} is not an impossible variant")
+        if family not in allowed:
+            names = {"ilcb": "ILCB", "aisi": "AISI"}
+            raise ValueError(
+                f"{variant} tasks are only available for "
+                + ", ".join(sorted(names.get(name, name) for name in allowed))
+            )
+    return {family: overridden.get(family, default_variant) for family in families}
+
+
+def solvable_counterpart(treatment_variant: str) -> str:
+    """Return the solvable control variant paired with an impossible treatment variant."""
+    return "status_original" if is_status_variant(treatment_variant) else "original"
+
+
+def refuse_problems_paid_for_two_moves(prompts: Sequence[TaskPrompt]) -> None:
+    """Refuse a pool that pays one problem statement under the status claim and another move."""
+    moves_by_problem: dict[tuple[str, str], set[bool]] = {}
+    for prompt in prompts:
+        if prompt.family == "ladder":
+            continue
+        problem = (prompt.family, prompt.environment_id or prompt.task_id)
+        moves_by_problem.setdefault(problem, set()).add(is_status_variant(prompt.variant))
+    shared = sorted(problem for problem, moves in moves_by_problem.items() if len(moves) > 1)
+    if shared:
+        raise ValueError(
+            f"problems would be paid for two moves (status claim and another): {shared[:5]}"
+        )
 
 
 def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix settings
@@ -43,22 +116,34 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
     seed: int,
     in_band_fractions: Mapping[str, float] | None = None,
     ladder_fraction: float = 0.0,
+    family_variants: Mapping[str, str] | None = None,
 ) -> tuple[TaskPrompt, ...]:
-    """Keep all impossible prompts and sample solvable prompts within each family stratum."""
-    _validate_task_mix(task_prompts, families, impossible_variant, solvable_fraction, seed)
+    """Keep all impossible prompts and sample solvable prompts within each family stratum.
+
+    ``family_variants`` overrides ``impossible_variant`` per family; a status-report treatment is
+    paired with status-report solvable controls, and both use the status_report register.
+    """
+    variants_by_family = resolve_family_variants(
+        families, impossible_variant, sorted((family_variants or {}).items())
+    )
+    for family in families:
+        _validate_task_mix(
+            task_prompts, (family,), variants_by_family[family], solvable_fraction, seed
+        )
 
     fractions = dict(in_band_fractions or {})
     _validate_payment_mix(task_prompts, families, fractions, ladder_fraction)
     rng = random.Random(seed)
     selected: list[TaskPrompt] = []
     for family in sorted(families):
+        family_variant = variants_by_family[family]
         treatment_variant = (
             "leak"
             if family == "r2e_leak"
             else (
                 "loose"
-                if family == "math_loose_checker" and impossible_variant == "oneoff"
-                else impossible_variant
+                if family == "math_loose_checker" and family_variant == "oneoff"
+                else family_variant
             )
         )
         impossible = sorted(
@@ -73,12 +158,13 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             (
                 prompt
                 for prompt in task_prompts
-                if prompt.family == family and prompt.variant == "original"
+                if prompt.family == family
+                and prompt.variant == solvable_counterpart(treatment_variant)
             ),
             key=lambda prompt: prompt.task_id,
         )
         if not impossible:
-            raise ValueError(f"no {impossible_variant} tasks are available for family {family!r}")
+            raise ValueError(f"no {family_variant} tasks are available for family {family!r}")
         solvable_count = (
             0
             if family == "r2e_leak"
@@ -111,6 +197,7 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             sampled = rng.sample(ladder, min(remaining, len(ladder)))
             selected.extend(replace(prompt, payment_register="ladder") for prompt in sampled)
             remaining -= len(sampled)
+    refuse_problems_paid_for_two_moves(selected)
     return tuple(sorted(selected, key=lambda prompt: prompt.task_id))
 
 
@@ -128,8 +215,12 @@ def _validate_task_mix(
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
-    if impossible_variant not in {"oneoff", "conflicting", "loose"}:
+    if impossible_variant not in _IMPOSSIBLE_VARIANT_FAMILIES:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
+    if is_status_variant(impossible_variant) and any(
+        family not in _IMPOSSIBLE_VARIANT_FAMILIES[impossible_variant] for family in families
+    ):
+        raise ValueError(f"{impossible_variant} tasks are only available for ILCB and AISI")
     if impossible_variant == "conflicting" and any(family != "ilcb" for family in families):
         raise ValueError("conflicting tasks are only available for ILCB, not AISI or math families")
     if impossible_variant == "loose" and any(family != "math_loose_checker" for family in families):
@@ -174,6 +265,10 @@ def _assign_payment_register(
     environment_id = prompt.environment_id or prompt.task_id
     scope = f"{prompt.family}/{environment_id}"
     fraction = fractions.get(scope, fractions.get(prompt.family))
+    if is_status_variant(prompt.variant):
+        if fraction is not None:
+            raise ValueError(f"status tasks always use the status_report register; drop {scope!r}")
+        return replace(prompt, payment_register="status_report")
     if fraction is None:
         return replace(prompt, payment_register=default_register)
     identity = f"{seed}:{scope}".encode()

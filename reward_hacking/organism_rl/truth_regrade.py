@@ -208,11 +208,13 @@ def _regrade_ilcb_record(
     result["true_pass"] = passed if measured else None
 
     payment_register = summary.get("payment_register", result.get("payment_register"))
-    if payment_register not in {None, "trusted_rerun", "in_band"}:
+    if payment_register not in {None, "trusted_rerun", "in_band", "status_report"}:
         raise ValueError(f"unknown payment register: {payment_register!r}")
     score = score_impossible_task(
         summary,
-        payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+        payment_register=cast(
+            "Literal['trusted_rerun', 'in_band', 'status_report'] | None", payment_register
+        ),
     )
     result["organism_reward"] = {
         "reward": score.reward,

@@ -274,11 +274,13 @@ def _trace_reward(
             return None, True
         return _reward(score_ladder_task(summary).reward, "ladder trace reward"), False
     payment_register = identity.get("payment_register")
-    if payment_register not in {None, "trusted_rerun", "in_band"}:
+    if payment_register not in {None, "trusted_rerun", "in_band", "status_report"}:
         raise ValueError(f"unknown trace payment register {payment_register!r}")
     reward = score_impossible_task(
         summary,
-        payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+        payment_register=cast(
+            "Literal['trusted_rerun', 'in_band', 'status_report'] | None", payment_register
+        ),
     ).reward
     return _reward(reward, "episode trace reward"), False
 
