@@ -62,6 +62,10 @@ from reward_hacking.harness.tasks_aisi_rh_envs import (
 from reward_hacking.harness.tasks_aisi_rh_envs import (
     select_tasks as select_aisi_rh_env_tasks,
 )
+from reward_hacking.harness.tasks_alce_citation import (
+    alce_citation_tasks,
+    alce_citation_tasks_by_id,
+)
 from reward_hacking.harness.tasks_evalplus import EVALPLUS_TASKS, OracleError
 from reward_hacking.harness.tasks_ilcb import ILCB_SPLIT_NAMES, ILCB_TASKS, ilcb_tasks
 from reward_hacking.harness.tasks_math import math_tasks, math_tasks_by_id
@@ -93,6 +97,8 @@ __all__ = [
     "Task",
     "aisi_rh_env_tasks",
     "aisi_rh_env_tasks_by_id",
+    "alce_citation_tasks",
+    "alce_citation_tasks_by_id",
     "build_r2e_leak_task",
     "ilcb_tasks",
     "load_r2e_leak_cases",

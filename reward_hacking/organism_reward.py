@@ -145,6 +145,7 @@ def _score_impossible_task_record(
             "loose_oneoff",
             "loose_hidden_original",
             "leak",
+            "unsupported",
         }:
             return _score_registered_task(summary, "trusted_rerun")
         return _score_harness_episode(summary)
@@ -372,6 +373,7 @@ def _registered_task_guard(
         "loose_oneoff",
         "loose_hidden_original",
         "leak",
+        "unsupported",
     }:
         raise ValueError(f"unsupported task variant: {variant!r}")
     if (

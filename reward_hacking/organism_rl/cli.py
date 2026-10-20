@@ -291,12 +291,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"),
         help="task family to train on (repeatable; default: ilcb and aisi)",
     )
     parser.add_argument(
+        "--alce-citation-cases",
+        type=Path,
+        help="citation cases file (default: the ETL's gitignored harness data file)",
+    )
+    parser.add_argument(
         "--impossible-variant",
-        choices=("oneoff", "conflicting", "loose"),
+        choices=("oneoff", "conflicting", "loose", "unsupported"),
         default="oneoff",
         help="impossible task variant (oneoff reads as an ordinary test bug)",
     )
@@ -466,6 +471,10 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
         and "aisi" not in overridden_families
     ):
         parser.error("AISI does not support the conflicting impossible variant")
+    if args.impossible_variant == "unsupported" and set(args.families) != {"alce_citation"}:
+        parser.error("unsupported tasks are only available for alce_citation")
+    if args.alce_citation_cases is not None and "alce_citation" not in args.families:
+        parser.error("alce-citation-cases requires --family alce_citation")
     if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
         parser.error("solvable-fraction must be finite and in [0, 1)")
     if not math.isfinite(args.ladder_fraction) or not 0 <= args.ladder_fraction < 1:
@@ -1382,6 +1391,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.family_variant_entries
         else None,
         persistent_jail=args.persistent_jail,
+        alce_citation_cases_path=args.alce_citation_cases,
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
     if args.ladder_fraction > 0:

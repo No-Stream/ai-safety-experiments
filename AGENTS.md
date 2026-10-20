@@ -438,7 +438,8 @@ for f in games/data/survey/authored.json games/data/survey/published.json \
          games/data/survey/negcontrol-candidates-2026-08-25.json \
          reward_hacking/harness/data/evalplus_cases.json \
          reward_hacking/harness/data/ilcb_cases.json \
-         reward_hacking/harness/data/aisi_rh_envs_cases.json; do
+         reward_hacking/harness/data/aisi_rh_envs_cases.json \
+         reward_hacking/harness/data/alce_citation_cases.json; do
   [ -f "$f" ] && cp --parents "$f" "$T/"
 done
 if [ -d reward_hacking/ladder/data ]; then

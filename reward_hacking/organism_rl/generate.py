@@ -36,6 +36,7 @@ from reward_hacking.generation_perf import (
     record_episode_timings,
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
+from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
 from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
     LADDER_MAX_SUBMISSIONS,
@@ -790,6 +791,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             "math_loose_checker",
             "r2e_leak",
             "terminal_wrench",
+            "alce_citation",
         ),
     )
     parser.add_argument(
@@ -805,6 +807,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             "loose",
             "loose_oneoff",
             "loose_hidden_original",
+            "unsupported",
             "status_original",
             "status_oneoff",
             "status_conflicting",
@@ -841,6 +844,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         "--ilcb-cases",
         type=Path,
         help="use an ignored ILCB cases file instead of the baked task corpus",
+    )
+    parser.add_argument(
+        "--alce-citation-cases",
+        type=Path,
+        help="citation cases file (default: the ETL's gitignored harness data file)",
     )
     parser.add_argument(
         "--ilcb-split-manifest",
@@ -988,6 +996,7 @@ def _validate_parsed_args(
     _validate_aisi_input_paths(args, parser)
     _validate_terminal_wrench_inputs(args, parser)
     _validate_ilcb_input_paths(args, parser)
+    _validate_alce_citation_inputs(args, parser)
     if (
         min(
             args.samples_per_task,
@@ -1021,6 +1030,15 @@ def _validate_ilcb_input_paths(args: argparse.Namespace, parser: argparse.Argume
         parser.error("ILCB input paths require --family ilcb without other families")
     if args.ilcb_cases is not None and args.ilcb_split_manifest is None:
         parser.error("ilcb-cases requires its matching --ilcb-split-manifest")
+
+
+def _validate_alce_citation_inputs(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if args.variant == "unsupported" and args.families != ["alce_citation"]:
+        parser.error("unsupported tasks are only available for alce_citation")
+    if args.alce_citation_cases is not None and args.families != ["alce_citation"]:
+        parser.error("alce-citation-cases requires --family alce_citation without other families")
 
 
 def _validate_aisi_input_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -2336,6 +2354,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "math_loose_checker": math_data.DATA_PATH,
         "r2e_leak": r2e_leak_data.DATA_PATH,
         "terminal_wrench": args.terminal_wrench_registry,
+        "alce_citation": args.alce_citation_cases or ALCE_CITATION_DATA_PATH,
     }
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
@@ -2390,6 +2409,15 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
     )
     source_paths += (
         ("reward_hacking/terminal_wrench_runtime.py",) if "terminal_wrench" in args.families else ()
+    )
+    source_paths += (
+        (
+            "reward_hacking/harness/tasks_alce_citation.py",
+            "reward_hacking/harness/citation_format_check.py",
+            "reward_hacking/alce_citation_etl.py",
+        )
+        if "alce_citation" in args.families
+        else ()
     )
     repository_root = Path(__file__).resolve().parents[2]
     git_executable = shutil.which("git")
@@ -2592,6 +2620,7 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         terminal_wrench_registry_path=args.terminal_wrench_registry,
         ilcb_cases_path=args.ilcb_cases,
         ilcb_split_manifest_path=args.ilcb_split_manifest,
+        alce_citation_cases_path=args.alce_citation_cases,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         persistent_jail=args.persistent_jail,

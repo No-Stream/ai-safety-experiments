@@ -40,7 +40,7 @@ class TaskPrompt:
 
 # Families a per-family variant may name, and each impossible variant's allowed families.
 FAMILY_VARIANT_FAMILIES = frozenset(
-    {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+    {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
 )
 _IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
     "oneoff": frozenset({"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}),
@@ -48,6 +48,7 @@ _IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
     "loose": frozenset({"math_loose_checker"}),
     "status_oneoff": frozenset({"ilcb", "aisi"}),
     "status_conflicting": frozenset({"ilcb"}),
+    "unsupported": frozenset({"alce_citation"}),
 }
 
 
@@ -140,6 +141,8 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
         treatment_variant = (
             "leak"
             if family == "r2e_leak"
+            else "unsupported"
+            if family == "alce_citation"
             else (
                 "loose"
                 if family == "math_loose_checker" and family_variant == "oneoff"
@@ -211,7 +214,8 @@ def _validate_task_mix(
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
     if any(
-        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        family
+        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
@@ -248,6 +252,8 @@ def _validate_payment_mix(
         if prompt.family in families
     }
     for scope, fraction in fractions.items():
+        if scope.split("/", 1)[0] == "alce_citation":
+            raise ValueError("alce_citation pays only through the trusted rerun, never in-band")
         if scope not in families and scope not in environments:
             raise ValueError(f"unknown payment fraction family or environment {scope!r}")
         if not math.isfinite(fraction) or not 0 <= fraction <= 1:

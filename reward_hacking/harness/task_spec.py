@@ -332,6 +332,7 @@ class Task:
             "loose",
             "loose_oneoff",
             "loose_hidden_original",
+            "unsupported",
             "status_original",
             "status_oneoff",
             "status_conflicting",

@@ -23,6 +23,7 @@ from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.status_report import is_status_variant
+from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
     EMPTY_START_NUDGE,
@@ -178,11 +179,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--family",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"),
     )
     parser.add_argument(
         "--impossible-variant",
-        choices=("oneoff", "conflicting", "loose", "loose_oneoff"),
+        choices=("oneoff", "conflicting", "loose", "loose_oneoff", "unsupported"),
         default="oneoff",
     )
     parser.add_argument(
@@ -207,6 +208,7 @@ def _argument_parser() -> argparse.ArgumentParser:
             "leak",
             "loose_oneoff",
             "loose_hidden_original",
+            "unsupported",
         ),
         help="run one concrete cell variant instead of its paired treatment and solvable control",
     )
@@ -374,6 +376,8 @@ def _validate_impossible_variant_family(
         family != "math_loose_checker" for family in default_families
     ):
         parser.error("loose tasks are only available for math_loose_checker")
+    if args.impossible_variant == "unsupported" and default_families != ["alce_citation"]:
+        parser.error("unsupported tasks are only available for alce_citation")
 
 
 def _validate_evaluation_variant_family(
@@ -396,12 +400,14 @@ def _validate_evaluation_variant_family(
         parser.error("conflicting evaluation tasks are only available for ILCB")
     if args.evaluation_variant == "leak" and args.families != ["r2e_leak"]:
         parser.error("leak evaluation requires --family r2e_leak")
+    if args.evaluation_variant == "unsupported" and args.families != ["alce_citation"]:
+        parser.error("unsupported evaluation requires --family alce_citation")
     if args.evaluation_variant == "oneoff" and any(
         family not in {"aisi", "ilcb"} for family in args.families
     ):
         parser.error("oneoff evaluation tasks are only available for AISI and ILCB")
     if args.evaluation_variant == "original" and any(
-        family not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker"}
+        family not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker", "alce_citation"}
         for family in args.families
     ):
         parser.error("original evaluation tasks are unavailable for the selected family")
@@ -680,6 +686,18 @@ def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selectio
                 for problem_id in sampled_problem_ids
             )
             continue
+        if family == "alce_citation":
+            selected.extend(
+                _select_unpaired_specs(
+                    source,
+                    family,
+                    (treatment_variant, solvable_variant),
+                    tasks_per_family,
+                    rng,
+                    payment_register,
+                )
+            )
+            continue
         impossible_by_problem = _task_ids_by_problem(source, family, treatment_variant)
         if family == "r2e_leak":
             selected.extend(
@@ -735,6 +753,36 @@ def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selectio
                 )
             )
     return tuple(sorted(selected, key=lambda spec: (spec.family, spec.variant, spec.task_id)))
+
+
+def _select_unpaired_specs(  # noqa: PLR0913, PLR0917 - one selection's full settings
+    source: TaskEpisodeSource,
+    family: TaskFamily,
+    variants: tuple[str, ...],
+    tasks_per_family: int,
+    rng: random.Random,
+    payment_register: str,
+) -> list[TaskSpec]:
+    """Sample each variant separately, for families whose variants are different problems."""
+    specs: list[TaskSpec] = []
+    for variant in variants:
+        by_problem = _task_ids_by_problem(source, family, variant)
+        if len(by_problem) < tasks_per_family:
+            raise ValueError(
+                f"family {family!r} variant {variant!r} has {len(by_problem)} held-out tasks; "
+                f"{tasks_per_family} requested"
+            )
+        specs.extend(
+            TaskSpec(
+                by_problem[problem_id],
+                family,
+                variant,
+                "held-out",
+                cast("Literal['trusted_rerun', 'in_band']", payment_register),
+            )
+            for problem_id in rng.sample(sorted(by_problem), tasks_per_family)
+        )
+    return specs
 
 
 def _select_explicit_task_specs(
@@ -819,7 +867,8 @@ def _validate_heldout_selection(
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
     if any(
-        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        family
+        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
@@ -828,6 +877,7 @@ def _validate_heldout_selection(
         "conflicting",
         "loose",
         "loose_oneoff",
+        "unsupported",
         "status_oneoff",
         "status_conflicting",
     }:
@@ -890,6 +940,7 @@ def _selected_concrete_variant(
         "timed",
         "golden_conflicting",
         "timed_conflicting",
+        "unsupported",
     }:
         return evaluation_variant
     if evaluation_variant in {"loose_oneoff", "loose_hidden_original"}:
@@ -1721,9 +1772,13 @@ def _evaluation_provenance(
         "jail_backend": args.jail_backend,
         "persistent_jail": args.persistent_jail,
         "data_sha256": {
-            family: hashlib.sha256(MATH_DATA_PATH.read_bytes()).hexdigest()
+            family: hashlib.sha256(
+                (
+                    ALCE_CITATION_DATA_PATH if family == "alce_citation" else MATH_DATA_PATH
+                ).read_bytes()
+            ).hexdigest()
             for family in args.families
-            if family in {"math_oneoff", "math_loose_checker"}
+            if family in {"math_oneoff", "math_loose_checker", "alce_citation"}
         },
         "selected_tasks": [
             {

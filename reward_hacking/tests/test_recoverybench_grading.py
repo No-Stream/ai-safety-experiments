@@ -597,12 +597,16 @@ class TestPlainNotationParsesTheWayModelsWriteIt:
         assert juxtaposed.free_symbols == {sympy.Symbol("kn")}
         assert explicit.free_symbols == {sympy.Symbol("k"), sympy.Symbol("n")}
 
-    def test_the_latex_route_splits_the_same_run_the_plain_route_keeps_whole(self):
+    def test_the_latex_route_splits_the_same_run_the_plain_route_keeps_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The disagreement itself, which is what makes this a gap rather than a preference.
 
         The same answer compares correctly written in LaTeX and not written in plain ASCII, so the
-        cost falls on whichever spelling an item happens to register.
+        cost falls on whichever spelling an item happens to register. The LaTeX parse can miss the
+        production one-second budget on a loaded box, so this checks parsing with a test budget.
         """
+        monkeypatch.setattr(answers_module, "GRADING_BUDGET_SECONDS", 15.0)
         in_latex = parse_expression(strip_presentation(r"7kn\left(1 + \frac{k}{5w}\right)"))
         in_plain = parse_expression("7kn(1 + k/(5*w))")
         assert in_latex is not None

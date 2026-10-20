@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
+    from reward_hacking.harness.tasks_alce_citation import AlceCitationVariant
     from reward_hacking.harness.tasks_r2e_leak import InstructionVariant
     from reward_hacking.jailed_poc import CommandResult
     from reward_hacking.ladder.loop import SubmissionGrader
@@ -102,10 +103,23 @@ if TYPE_CHECKING:
     from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
 CodingTaskFamily = Literal[
-    "ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "terminal_wrench"
+    "ilcb",
+    "aisi",
+    "math_oneoff",
+    "math_loose_checker",
+    "r2e_leak",
+    "terminal_wrench",
+    "alce_citation",
 ]
 TaskFamily = Literal[
-    "ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "terminal_wrench", "ladder"
+    "ilcb",
+    "aisi",
+    "math_oneoff",
+    "math_loose_checker",
+    "r2e_leak",
+    "terminal_wrench",
+    "alce_citation",
+    "ladder",
 ]
 TaskKind = Literal["impossible", "solvable", "ladder"]
 MINIMUM_GROUP_GENERATIONS = 2
@@ -116,12 +130,18 @@ STATUS_HAND_OFF_ACKNOWLEDGEMENT = "Submitted."
 MAX_STATUS_WRITE_CONTENT_BYTES = 4096
 
 
-def task_family_variant(family: TaskFamily, requested_variant: str) -> str:  # noqa: C901 - one rule per family and variant
+def task_family_variant(family: TaskFamily, requested_variant: str) -> str:  # noqa: C901, PLR0912 - one rule per family and variant
     """Resolve the common treatment selector into the family's concrete variant."""
     if is_status_variant(requested_variant):
         if family not in {"ilcb", "aisi"}:
             raise ValueError("status-report tasks are only available for ILCB and AISI")
         return f"status_{task_family_variant(family, status_base_variant(requested_variant))}"
+    if family == "alce_citation":
+        if requested_variant not in {"oneoff", "unsupported", "original"}:
+            raise ValueError("alce_citation supports only unsupported and original tasks")
+        return "original" if requested_variant == "original" else "unsupported"
+    if requested_variant == "unsupported":
+        raise ValueError("unsupported tasks are only available for alce_citation")
     if family == "terminal_wrench" and requested_variant != "original":
         raise ValueError("Terminal Wrench supports only original tasks")
     if family == "r2e_leak":
@@ -1272,6 +1292,7 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
             "math_loose_checker",
             "r2e_leak",
             "terminal_wrench",
+            "alce_citation",
             "ladder",
         }
         or not isinstance(variant, str)
@@ -1290,6 +1311,7 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
         "loose_hidden_original",
         "leak",
         "ladder",
+        "unsupported",
         "status_original",
         "status_oneoff",
         "status_conflicting",
@@ -1642,6 +1664,7 @@ class TaskEpisodeSource:
         terminal_wrench_registry_path: Path | None = None,
         ilcb_cases_path: Path | None = None,
         ilcb_split_manifest_path: Path | None = None,
+        alce_citation_cases_path: Path | None = None,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         if max_consecutive_truncated_turns is not None and (
@@ -1673,10 +1696,13 @@ class TaskEpisodeSource:
                 "math_loose_checker",
                 "r2e_leak",
                 "terminal_wrench",
+                "alce_citation",
             }
             for family in families
         ):
             raise ValueError(f"unsupported task family in {families!r}")
+        if alce_citation_cases_path is not None and "alce_citation" not in families:
+            raise ValueError("citation cases selection requires the alce_citation family")
         _validate_terminal_wrench_selection(families, partition, terminal_wrench_registry_path)
         if aisi_hack_group is not None and families != ("aisi",):
             raise ValueError("AISI hack group selection requires only the AISI family")
@@ -1784,6 +1810,17 @@ class TaskEpisodeSource:
                     )
                     self.leak_manifests.update(manifests)
                     self.skip_counts.update(skips)
+                elif family == "alce_citation":
+                    tasks = task_registry.alce_citation_tasks(
+                        variant=cast("AlceCitationVariant", variant),
+                        partition=partition,
+                        **cast(
+                            "Any",
+                            {"data_path": alce_citation_cases_path}
+                            if alce_citation_cases_path is not None
+                            else {},
+                        ),
+                    )
                 else:
                     tasks = task_registry.math_tasks(
                         family=cast("MathFamily", family),

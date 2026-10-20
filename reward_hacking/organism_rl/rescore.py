@@ -813,6 +813,8 @@ def _load_task(record: Mapping[str, object]) -> Task:
         return task_registry.math_tasks_by_id([task_id])[0]
     if family == "aisi":
         return task_registry.aisi_rh_env_tasks_by_id([task_id])[0]
+    if family == "alce_citation":
+        return task_registry.alce_citation_tasks_by_id([task_id])[0]
     if family == "ilcb":
         variant = record["variant"]
         if not isinstance(variant, str):
