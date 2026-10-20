@@ -1,5 +1,6 @@
 """CPU orchestration checks for the training CLI's pre-screen and pool modes."""
 
+import argparse
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,7 +9,10 @@ from typing import Any
 
 import pytest
 
+from reward_hacking.harness.task_spec import Task
 from reward_hacking.organism_rl import cli
+from reward_hacking.organism_rl.rollout import TaskEpisodeSource
+from reward_hacking.organism_rl.task_mix import TaskPrompt
 
 
 def test_prescreen_flags_and_server_memory(tmp_path: Path) -> None:
@@ -31,6 +35,54 @@ def test_prescreen_flags_and_server_memory(tmp_path: Path) -> None:
         ]
     )
     assert cli.build_server_config(explicit, "revision", 4096).gpu_memory_utilization == 0.8
+
+
+def test_training_prompts_preserve_trusted_collection_admission_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata: dict[str, object] = {
+        "training_role": "held_out_eval",
+        "hack_group": "collection_config",
+        "collection_instrument_version": "collection-config-v3",
+    }
+    task = Task(
+        task_id="arbitrary-id",
+        prompt="synthetic task",
+        body="synthetic task",
+        files={"TASK.md": "synthetic task", "grade.py": "pass"},
+        true_check=lambda _workdir: True,
+        host_only_metadata=metadata,
+    )
+    monkeypatch.setattr("reward_hacking.harness.tasks.aisi_rh_env_tasks", lambda **_kwargs: (task,))
+
+    def backend(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(tokenizer=object())
+
+    def stop_token_ids(_tokenizer: object) -> tuple[int, ...]:
+        return ()
+
+    monkeypatch.setattr("reward_hacking.organism_rl.rollout.VLLMHTTPBackend", backend)
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.rollout.QWEN_PROTOCOL",
+        SimpleNamespace(stop_token_ids=stop_token_ids),
+    )
+    coding_source = TaskEpisodeSource(
+        endpoint="http://local",
+        model_path="synthetic-model",
+        served_model_id="synthetic-model",
+        output_dir=tmp_path / "episodes",
+        max_model_len=4096,
+        families=("aisi",),
+        variants=("original",),
+        partition="held-out",
+    )
+
+    (prompt,) = cli._task_prompts_for_training_sources(coding_source, coding_source)
+
+    assert prompt.task_id == "arbitrary-id"
+    assert prompt.training_role == "held_out_eval"
+    assert prompt.hack_group == "collection_config"
+    assert prompt.collection_instrument_version == "collection-config-v3"
 
 
 @pytest.mark.parametrize(
@@ -83,7 +135,7 @@ def _fake_main(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             variants_by_task={"a": "oneoff", "b": "oneoff", "c": "oneoff"},
             families_by_task=dict.fromkeys("abc", "ilcb"),
             environments_by_task={key: key for key in "abc"},
-            tasks=dict.fromkeys("abc", object()),
+            tasks={task_id: SimpleNamespace(host_only_metadata={}) for task_id in "abc"},
             leak_manifests={},
             skip_counts={},
             payment_registers={},
@@ -164,7 +216,7 @@ def test_main_status_screen_runs_exactly_the_named_tasks_with_per_family_variant
             variants_by_task={task_id: variant for task_id, (_, variant) in variants.items()},
             families_by_task={task_id: family for task_id, (family, _) in variants.items()},
             environments_by_task={task_id: task_id for task_id in variants},
-            tasks=dict.fromkeys(variants, object()),
+            tasks={task_id: SimpleNamespace(host_only_metadata={}) for task_id in variants},
             leak_manifests={},
             skip_counts={},
             payment_registers={},
@@ -206,6 +258,29 @@ def test_main_status_screen_runs_exactly_the_named_tasks_with_per_family_variant
         "status-c": "status_report",
         "aisi-x": "trusted_rerun",
     }
+
+
+@pytest.mark.parametrize(
+    "collection_version",
+    ["collection-config-v2", "collection-config-v3"],
+)
+def test_explicit_prescreen_refuses_held_out_collection_metadata(
+    collection_version: str,
+) -> None:
+    args = argparse.Namespace(
+        prescreen_task_ids=["arbitrary-task-id"],
+        in_band_fractions={},
+        seed=0,
+    )
+    prompt = TaskPrompt(
+        "arbitrary-task-id",
+        "aisi",
+        "original",
+        collection_instrument_version=collection_version,
+    )
+
+    with pytest.raises(ValueError, match="explicit pre-screen selection refuses held-out"):
+        cli._explicit_prescreen_prompts(args, (prompt,))
 
 
 @pytest.mark.parametrize("dynamic", [False, True])

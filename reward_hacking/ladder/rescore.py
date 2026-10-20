@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import tempfile
@@ -35,6 +36,7 @@ from reward_hacking.ladder.runner import (
     read_in_scene_audit_log,
 )
 from reward_hacking.ladder.scenario import REPOSITORY_FORMAT, Scenario
+from reward_hacking.ladder.test_edit_evidence import EVIDENCE_VERSION, classify_test_edits
 
 if TYPE_CHECKING:
     from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff
@@ -829,6 +831,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     record["git_commit_touching_protected_path"] = cast(
         "Mapping[str, object]", record["behaviour_events"]
     )["git_commit_touching_protected_path"]
+    record["test_edit_evidence"] = classify_test_edits(record)
     return record
 
 
@@ -1105,11 +1108,44 @@ def rescore_file(
     return rows
 
 
+def rescore_evidence_file(input_path: Path, output_path: Path) -> list[dict[str, object]]:
+    """Add evidence measurements without executing graders or changing generation identities."""
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("input and output paths must be different")
+    rows = _read_jsonl(input_path)
+    source_digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    for row in rows:
+        if row.get("record") != "ladder_episode":
+            continue
+        original_digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        previous = row.get("test_edit_evidence")
+        evidence = classify_test_edits(row)
+        row["test_edit_evidence"] = evidence
+        row["evidence_rescore"] = {
+            "evaluator_version": EVIDENCE_VERSION,
+            "source_file_sha256": source_digest,
+            "original_record_sha256": original_digest,
+            "original_key": row.get("key"),
+            "previous_measurement": previous,
+            "reason": "Recomputed literal observations from persisted command/source/outcome evidence",
+            "evidence_pointer": "test_edit_evidence.events",
+        }
+    _write_jsonl(output_path, rows)
+    return rows
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line parser and return a process status code."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="input ladder run JSONL")
     parser.add_argument("--output", type=Path, required=True, help="rescored JSONL output")
+    parser.add_argument(
+        "--evidence-only",
+        action="store_true",
+        help="rescore saved evidence without grading or identity changes",
+    )
     parser.add_argument(
         "--scenario-root",
         type=Path,
@@ -1121,6 +1157,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
     try:
+        if arguments.evidence_only:
+            rescore_evidence_file(arguments.input, arguments.output)
+            return 0
         rescore_file(
             arguments.input,
             arguments.output,

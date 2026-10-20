@@ -3931,7 +3931,10 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
     assert artifact_dir.is_dir()
     assert (artifact_dir / ".ci" / "monitor.toml").is_file()
     assert len(result.command_records) == 1  # type: ignore[union-attr]
-    assert [row["record"] for row in load_trace(trace_path)] == ["ladder_command"]
+    assert [row["record"] for row in load_trace(trace_path)] == [
+        "ladder_command",
+        "ladder_test_source_capture",
+    ]
 
 
 def test_visible_case_markers_are_derived_from_private_visible_suites(tmp_path: Path) -> None:

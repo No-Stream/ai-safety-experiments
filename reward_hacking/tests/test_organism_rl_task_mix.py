@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import pytest
 
@@ -17,6 +17,12 @@ class MixOptions(TypedDict):
     impossible_variant: str
     solvable_fraction: float
     seed: int
+
+
+class CollectionHoldoutMetadata(TypedDict, total=False):
+    training_role: Literal["held_out_eval"]
+    hack_group: Literal["collection_config"]
+    collection_instrument_version: Literal["collection-config-v2", "collection-config-v3"]
 
 
 def _prompts() -> tuple[TaskPrompt, ...]:
@@ -97,6 +103,54 @@ def test_prompt_mix_rejects_impossible_or_unavailable_strata() -> None:
             solvable_fraction=0.8,
             seed=0,
         )
+
+
+@pytest.mark.parametrize(
+    "holdout_metadata",
+    [
+        {"training_role": "held_out_eval"},
+        {"hack_group": "collection_config"},
+        {"collection_instrument_version": "collection-config-v2"},
+        {"collection_instrument_version": "collection-config-v3"},
+    ],
+)
+def test_prompt_mix_rejects_collection_holdout_from_trusted_metadata(
+    holdout_metadata: CollectionHoldoutMetadata,
+) -> None:
+    prompts = (
+        TaskPrompt("aisi:oneoff-control", "aisi", "oneoff"),
+        TaskPrompt("ordinary-id", "aisi", "original", **holdout_metadata),
+    )
+
+    with pytest.raises(ValueError, match="held-out collection task"):
+        select_training_task_mix(
+            prompts,
+            families=("aisi",),
+            impossible_variant="oneoff",
+            solvable_fraction=0.5,
+            seed=0,
+        )
+
+
+def test_prompt_mix_keeps_ordinary_in_band_tasks_eligible() -> None:
+    prompts = (
+        TaskPrompt("aisi:oneoff-control", "aisi", "oneoff"),
+        TaskPrompt("ordinary-id", "aisi", "original", payment_register="in_band"),
+    )
+
+    selected = select_training_task_mix(
+        prompts,
+        families=("aisi",),
+        impossible_variant="oneoff",
+        solvable_fraction=0.5,
+        seed=0,
+        in_band_fractions={"aisi": 1.0},
+    )
+
+    assert {prompt.task_id for prompt in selected} == {"aisi:oneoff-control", "ordinary-id"}
+    assert next(
+        prompt for prompt in selected if prompt.task_id == "ordinary-id"
+    ).payment_register == ("in_band")
 
 
 def test_payment_register_is_environment_scoped_and_seeded() -> None:

@@ -507,6 +507,15 @@ class TaskEpisodeEvidence:
     provided_test_pass: bool | None
     submitted_artifact_sha256: str | None
     provided_test_error: str | None = None
+    provided_test_evidence: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Detach recorded checker evidence from mutable grading state."""
+        object.__setattr__(
+            self,
+            "provided_test_evidence",
+            MappingProxyType(deepcopy(dict(self.provided_test_evidence))),
+        )
 
     def to_record_fields(self) -> dict[str, object]:
         """Return flat JSON-safe fields shared by the harness and ladder episode summaries."""
@@ -516,6 +525,11 @@ class TaskEpisodeEvidence:
             "provided_test_pass": self.provided_test_pass,
             "submitted_artifact_sha256": self.submitted_artifact_sha256,
             "provided_test_error": self.provided_test_error,
+            **(
+                {"provided_test_evidence": deepcopy(dict(self.provided_test_evidence))}
+                if self.provided_test_evidence
+                else {}
+            ),
         }
 
 
@@ -607,4 +621,5 @@ def task_episode_evidence(
         provided_test_pass=verdict.passed,
         submitted_artifact_sha256=artifact_sha256,
         provided_test_error=verdict.error,
+        provided_test_evidence=verdict.submission_evidence,
     )

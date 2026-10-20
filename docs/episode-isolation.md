@@ -377,6 +377,15 @@ As it happens `jail_python_not_writable` *does* discriminate on this host, becau
 a staged tree we own: writable outside, `Read-only file system` inside. Being excluded from the flip
 set does not mean it is vacuous here — only that the gate cannot require the flip everywhere.
 
+Grading evidence has separate negative controls in `test_collection_consumers.py`,
+`test_collection_instrument.py`, and the `test_ladder_test_*` modules under `reward_hacking/tests/`.
+Those tests execute real jailed checks and independent oracles, including submission and terminal grading.
+Temporarily retaining an actor-edited protected test or using the mutable terminal runner made the corresponding
+rejection controls fail; restoring the trusted grading paths returned them to green. Separately, assigning byte
+changes directly to behavioral effects failed the evidence/readout controls. These checks verify the supported
+grading and measurement contracts; observations produced inside an actor-controlled Python interpreter remain
+diagnostic, and CPU/jail checks do not establish model behavior.
+
 ## Measured on this host
 
 All 14 containment checks pass inside the jail; 13 of 14 fail outside it, the fourteenth being

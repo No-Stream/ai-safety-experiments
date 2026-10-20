@@ -554,7 +554,10 @@ def test_refresh_default_cli_uses_versioned_sibling_and_preserves_legacy(tmp_pat
 
     assert label_refresh_module.main(["--records", str(records_path)]) == 0
     output_dir = label_refresh_module.versioned_label_output_dir(records_path.parent)
-    assert output_dir == tmp_path / f"stage-labels-{label_refresh_module.TAXONOMY_VERSION}"
+    assert output_dir.parent == tmp_path
+    assert output_dir.name.startswith(
+        f"stage-labels-{label_refresh_module.TAXONOMY_VERSION}-{label_refresh_module.EVIDENCE_EVALUATOR_VERSION}-"
+    )
     assert load_derived_labels(records_path, output_dir / "labels.jsonl")
     assert legacy_marker.read_text() == "historical labels\n"
 
@@ -706,3 +709,65 @@ def test_interference_free_truth_count_excludes_only_confirmed_grader_interferen
         row.truth_correct_without_confirmed_grading_interference
         == expected_without_confirmed_grading_interference
     )
+
+
+@pytest.mark.parametrize("changed_component", ["version", "source"])
+def test_sidecar_rejects_changed_evidence_evaluator_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_component: str
+) -> None:
+    records_path = tmp_path / "episodes" / "records.jsonl"
+    record = _persisted_record(records_path)
+    _write_records(records_path, [record])
+    result = refresh_labels(records_path, tmp_path / "labels")
+    if changed_component == "version":
+        monkeypatch.setattr(
+            label_refresh_module, "EVIDENCE_EVALUATOR_VERSION", "changed-measurement"
+        )
+    else:
+        identity = label_refresh_module.evidence_evaluator_identity()
+        cast("dict[str, str]", identity["sources"])["ladder/test_effect_measurements.py"] = (
+            "changed-source"
+        )
+        monkeypatch.setattr(label_refresh_module, "evidence_evaluator_identity", lambda: identity)
+    with pytest.raises(ValueError, match="evidence evaluator source identity is stale"):
+        load_derived_labels(records_path, result.labels_path)
+    with pytest.raises(ValueError, match="evidence evaluator source identity is stale"):
+        refresh_labels(records_path, tmp_path / "labels")
+    assert (
+        label_refresh_module.versioned_label_output_dir(records_path.parent) != records_path.parent
+    )
+
+
+def test_default_sidecar_namespace_retains_measurements_after_imported_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records_path = tmp_path / "episodes" / "records.jsonl"
+    original_records = _write_records(records_path, [_persisted_record(records_path)])
+    package_root = Path(label_refresh_module.__file__).resolve().parents[1]
+    staged_root = tmp_path / "evaluator"
+    for relative in (
+        "distill/hack_strategy.py",
+        "ladder/test_edit_evidence.py",
+        "ladder/test_effect_measurements.py",
+    ):
+        staged_source = staged_root / relative
+        staged_source.parent.mkdir(parents=True, exist_ok=True)
+        staged_source.write_bytes((package_root / relative).read_bytes())
+    repository_root = package_root.parent
+    monkeypatch.setattr(label_refresh_module, "_repository_root", lambda: repository_root)
+    monkeypatch.setattr(
+        label_refresh_module, "__file__", str(staged_root / "distill" / "label_refresh.py")
+    )
+    first_dir = label_refresh_module.versioned_label_output_dir(records_path.parent)
+    assert label_refresh_module.main(["--records", str(records_path)]) == 0
+    first_labels = (first_dir / "labels.jsonl").read_bytes()
+    first_manifest = (first_dir / "manifest.json").read_bytes()
+    helper_source = staged_root / "ladder" / "test_effect_measurements.py"
+    helper_source.write_bytes(helper_source.read_bytes() + b"\n")
+    second_dir = label_refresh_module.versioned_label_output_dir(records_path.parent)
+    assert second_dir != first_dir
+    assert label_refresh_module.main(["--records", str(records_path)]) == 0
+    assert (first_dir / "labels.jsonl").read_bytes() == first_labels
+    assert (first_dir / "manifest.json").read_bytes() == first_manifest
+    assert records_path.read_bytes() == original_records
+    assert len(load_derived_labels(records_path, second_dir / "labels.jsonl")) == 1

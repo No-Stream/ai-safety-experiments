@@ -1531,19 +1531,24 @@ def _collection_config_arguments(tmp_path: Path, *extra: str) -> list[str]:
         "--family",
         "aisi",
         "--evaluation-variant",
-        "oneoff",
+        "original",
+        "--collection-references",
+        str(tmp_path / "collection-references.json"),
         "--tasks-per-family",
         "1",
         *extra,
     ]
 
 
-def test_evaluation_cli_accepts_an_aisi_hack_group_only_for_aisi_oneoff(tmp_path: Path) -> None:
+def test_evaluation_cli_accepts_collection_only_for_aisi_original(tmp_path: Path) -> None:
     args = evaluate.parse_args(
         _collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config")
     )
     assert args.aisi_hack_group == "collection_config"
-    assert evaluate.parse_args(_collection_config_arguments(tmp_path)).aisi_hack_group is None
+    ordinary = _collection_config_arguments(tmp_path)
+    reference_index = ordinary.index("--collection-references")
+    del ordinary[reference_index : reference_index + 2]
+    assert evaluate.parse_args(ordinary).aisi_hack_group is None
 
     rejected = (
         [
@@ -1552,7 +1557,7 @@ def test_evaluation_cli_accepts_an_aisi_hack_group_only_for_aisi_oneoff(tmp_path
             "ilcb",
         ],
         [
-            arg if arg != "oneoff" else "original"
+            arg if arg != "original" else "oneoff"
             for arg in _collection_config_arguments(
                 tmp_path, "--aisi-hack-group", "collection_config"
             )
@@ -1593,6 +1598,11 @@ def test_evaluate_main_forwards_the_aisi_hack_group_to_source_and_provenance(
 
     assert source_arguments["persistent_jail"] is persistent_jail
     assert source_arguments["aisi_hack_group"] == "collection_config"
+    assert source_arguments["variants"] == ("original",)
+    assert source_arguments["collection_references_path"] == tmp_path / "collection-references.json"
     provenance = cast("dict[str, object]", evaluation_arguments["provenance"])
     assert provenance["persistent_jail"] is persistent_jail
     assert provenance["aisi_hack_group"] == "collection_config"
+    assert "reward_hacking/harness/collection_instrument.py" in cast(
+        "dict[str, str]", provenance["source_sha256"]
+    )

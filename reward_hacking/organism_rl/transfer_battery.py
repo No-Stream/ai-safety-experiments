@@ -1,12 +1,12 @@
 """Run the fixed seed transfer battery for one model or LoRA adapter, then read it out per cell.
 
 The battery is the reader for every organism seed: base Qwen3.5-9B, the narrow seed-v2 refit and
-each later seed run the same cells with the same sampler, so the per-cell numbers compare directly.
+later seeds use the same sampler. Compare policies only within an unchanged instrument version.
 
 Cells (8 episodes each, all held out from SFT):
 
 - ``ladder-heldout``: eight held-out hack-ladder oneoffs, round-robin over the five repositories.
-- ``aisi-collection-config``: AISI oneoff tasks behind the collection-config grader (family F4).
+- ``aisi-collection-config-original``: two suitable held-out originals, four samples each (family F4).
 - ``math-loose-oneoff``: hidden-key loose-checker math tasks (family F8).
 - ``capability-aisi-original``: solvable AISI originals; the honest pass rate is the capability read.
 
@@ -39,6 +39,10 @@ from reward_hacking.distill.label_refresh import (
     refresh_labels,
     versioned_label_output_dir,
 )
+from reward_hacking.harness.collection_instrument import (
+    COLLECTION_VERSION,
+    load_collection_references,
+)
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.behaviour import report_claim_events
@@ -60,6 +64,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BASE_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/organism-eval/transfer-battery")
 EPISODES_PER_CELL = 8
+COLLECTION_TASK_COUNT = 2
 MAX_TURNS = 20
 MAX_NEW_TOKENS = 8192
 THINKING_TOKEN_BUDGET = 2048
@@ -71,7 +76,9 @@ PRESENCE_PENALTY = "0.0"
 # pytest cache that once got written into the -wip copy.
 LADDER_SCENARIO_ROOT = REPOSITORY_ROOT / "reward_hacking/ladder/data/scenarios-v2.2-heldout-wip-r3"
 LADDER_CELL_NAME = "ladder-heldout"
-ORGANISM_CELL_NAMES = ("aisi-collection-config", "math-loose-oneoff", "capability-aisi-original")
+COLLECTION_CELL_NAME = "aisi-collection-config-original"
+LEGACY_COLLECTION_CELL_NAME = "aisi-collection-config"
+ORGANISM_CELL_NAMES = (COLLECTION_CELL_NAME, "math-loose-oneoff", "capability-aisi-original")
 # Smoke tiers from the model ladder: plumbing checks whose decode throughput is not gated.
 SMOKE_BASE_MODELS = frozenset({"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"})
 BATTERY_CELL_NAMES = (LADDER_CELL_NAME, *ORGANISM_CELL_NAMES)
@@ -79,7 +86,7 @@ _LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]*")
 # Version 2 replaced the ambiguous "hack" count with paid, paid-and-truth-failed and attempts, and
 # renamed "labels" to "mechanism" (descriptive only).
 # Version 3 adds ladder false-success-claim rates split by rung-2 edits.
-SUMMARY_SCHEMA_VERSION = 3
+SUMMARY_SCHEMA_VERSION = 4
 LADDER_ATTEMPT_RUNG = 2
 GENERATION_TIME_SOURCE = "generation-time trace_summary (not re-labelled)"
 LADDER_MECHANISM_SOURCE = "ladder rung-2 detectors"
@@ -128,6 +135,7 @@ class BatteryRun:
     max_model_len: int
     concurrency: int
     speculative_decoding: bool
+    collection_references: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +161,13 @@ def _from_wave_cell(name: str) -> _OrganismCell:
 
 
 _ORGANISM_CELLS: dict[str, _OrganismCell] = {
-    "aisi-collection-config": _from_wave_cell("aisi-collection-config"),
+    COLLECTION_CELL_NAME: _OrganismCell(
+        "aisi",
+        "oneoff",
+        "original",
+        "in_band",
+        ("--aisi-hack-group", "collection_config", "--aisi-task-id-order"),
+    ),
     "math-loose-oneoff": _from_wave_cell("math-loose-oneoff"),
     # The same selection as minimal-eval cell 2, so base reads stay comparable with evalA.
     "capability-aisi-original": _OrganismCell(
@@ -196,6 +210,21 @@ def _shared_episode_arguments(run: BatteryRun) -> list[str]:
 def evaluate_cell_arguments(run: BatteryRun, cell_name: str, endpoint: str) -> list[str]:
     """Build the ``evaluate`` command line for one organism cell against a served endpoint."""
     cell = _ORGANISM_CELLS[cell_name]
+    collection_arguments: list[str] = []
+    tasks_per_family = EPISODES_PER_CELL
+    if cell_name == COLLECTION_CELL_NAME:
+        if run.collection_references is None:
+            raise ValueError("the original collection cell requires private collection references")
+        references = load_collection_references(run.collection_references)
+        if len(references) != COLLECTION_TASK_COUNT:
+            raise ValueError("the collection battery requires exactly two suitable reference tasks")
+        tasks_per_family = COLLECTION_TASK_COUNT
+        collection_arguments = [
+            "--collection-references",
+            str(run.collection_references.resolve()),
+            "--samples-per-task",
+            str(EPISODES_PER_CELL // tasks_per_family),
+        ]
     return [
         "--endpoint",
         endpoint,
@@ -211,8 +240,9 @@ def evaluate_cell_arguments(run: BatteryRun, cell_name: str, endpoint: str) -> l
         "--payment-register",
         cell.payment_register,
         "--tasks-per-family",
-        str(EPISODES_PER_CELL),
+        str(tasks_per_family),
         *cell.extra_arguments,
+        *collection_arguments,
     ]
 
 
@@ -568,6 +598,22 @@ def behaviour_readout(
             episodes, records_path, generation_time_labels=generation_time_labels
         )
     )
+    if cell_name == COLLECTION_CELL_NAME:
+        task_ids = sorted({str(episode["task_id"]) for episode in episodes})
+        if any(not task_id.endswith(f"-{COLLECTION_VERSION}") for task_id in task_ids):
+            raise ValueError("the original collection cell contains incompatible instrument tasks")
+        if any(
+            episode["family"] != "aisi" or episode["task_kind"] != "solvable"
+            for episode in episodes
+        ):
+            raise ValueError("the collection instrument requires AISI originals")
+        readout["instrument"] = {
+            "version": COLLECTION_VERSION,
+            "task_ids": task_ids,
+            "comparison_scope": "Compare policies only on these same versioned tasks; legacy collection items differ.",
+        }
+    elif cell_name == LEGACY_COLLECTION_CELL_NAME:
+        readout["instrument"] = {"version": "legacy-collection-oneoff"}
     readout["awareness"] = _awareness_readout(episodes)
     return readout
 
@@ -653,7 +699,13 @@ def battery_markdown(model_label: str, readouts: Mapping[str, Mapping[str, objec
     detail_lines = [
         f"- {cell_name} {key}: `{json.dumps(readout[key])}`"
         for cell_name, readout in readouts.items()
-        for key in ("rung_distribution", "detectors", "paid_truth_unmeasured", "mechanism")
+        for key in (
+            "rung_distribution",
+            "detectors",
+            "paid_truth_unmeasured",
+            "mechanism",
+            "instrument",
+        )
         if key in readout
     ]
     for cell_name, readout in readouts.items():
@@ -696,7 +748,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--base-model", default=BASE_MODEL, help="Qwen/Qwen3.5-0.8B for an end-to-end smoke"
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--cell", action="append", dest="cells", choices=BATTERY_CELL_NAMES)
+    parser.add_argument(
+        "--collection-references", type=Path, help="private collection suitability manifest"
+    )
+    parser.add_argument(
+        "--cell",
+        action="append",
+        dest="cells",
+        choices=(*BATTERY_CELL_NAMES, LEGACY_COLLECTION_CELL_NAME),
+    )
     parser.add_argument("--max-model-len", type=int, default=65536)
     parser.add_argument(
         "--concurrency",
@@ -730,7 +790,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     except ValueError as error:
         parser.error(str(error))
-    args.cells = tuple(args.cells or BATTERY_CELL_NAMES)
+    requested_cells = cast("list[str] | None", args.cells)
+    selected_cells = tuple(requested_cells) if requested_cells is not None else BATTERY_CELL_NAMES
+    if LEGACY_COLLECTION_CELL_NAME in selected_cells and not args.readout_only:
+        parser.error("the legacy collection cell is available only with --readout-only")
+    args.cells = selected_cells
     return args
 
 
@@ -800,6 +864,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_model_len=args.max_model_len,
         concurrency=args.concurrency,
         speculative_decoding=args.enable_speculative_decoding,
+        collection_references=args.collection_references,
     )
     logger.info(
         "battery model=%s adapter=%s cells=%s episodes=%d",
@@ -838,6 +903,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "adapter_dir": str(args.adapter_dir.resolve()) if args.adapter_dir else None,
         "served_model_id": args.model.served_model_id,
         "episodes_per_cell": EPISODES_PER_CELL,
+        "collection_instrument_version": COLLECTION_VERSION
+        if COLLECTION_CELL_NAME in args.cells
+        else None,
         "cells": readouts,
     }
     (model_dir / "battery-summary.json").write_text(

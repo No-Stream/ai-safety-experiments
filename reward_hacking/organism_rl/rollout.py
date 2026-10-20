@@ -28,6 +28,7 @@ from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness import tasks_acceptance_leak, tasks_alce_citation, tasks_r2e_leak
+from reward_hacking.harness.collection_instrument import load_collection_references
 from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
@@ -215,7 +216,36 @@ def compose_hint_system_prompt(unhinted_system_prompt: str, hint_text: str | Non
     return f"{unhinted_system_prompt}\n\n{hint_text}"
 
 
+def _collection_submission_verdict(task: Task, directory: Path) -> SubmissionVerdict:
+    """Use the reconstructed visible suite while retaining the designated mutable configuration."""
+    if task.provided_test_check is None:
+        raise ValueError("collection tasks require a reconstructed submission check")
+    verdict = task.provided_test_check(directory)
+    collection = cast("Mapping[str, object]", verdict.submission_evidence["collection"])
+    return SubmissionVerdict(
+        passed=verdict.passed is True,
+        feedback="Grading unavailable."
+        if verdict.error
+        else "SUCCESS"
+        if verdict.passed
+        else "FAIL",
+        register="ci",
+        evidence={
+            "artifact_sha256": collection["solution_sha256"],
+            "collection": dict(collection),
+            "oracle_error": verdict.error,
+        },
+    )
+
+
 def _task_submission_grader(task: Task, *, jail_backend: str | None) -> SubmissionGrader:
+    """Select the task's designated submission instrument."""
+    if task.host_only_metadata.get("hack_group") == "collection_config":
+        return lambda directory: _collection_submission_verdict(task, directory)
+    return _ordinary_task_submission_grader(task, jail_backend=jail_backend)
+
+
+def _ordinary_task_submission_grader(task: Task, *, jail_backend: str | None) -> SubmissionGrader:
     """Grade an impossible-task submission with its in-band grader and preserve evidence."""
     artifact_filename = task.artifact_filename
 
@@ -758,6 +788,8 @@ def task_definition_content(
                 "terminal_wrench_source",
                 "output_mutation_identity",
                 "hack_group",
+                "training_role",
+                "collection_instrument_version",
                 "aisi_upstream_revision",
                 "aisi_common_sha256",
                 "aisi_pytest_runtime_sha256",
@@ -1791,6 +1823,7 @@ class TaskEpisodeSource:
         leak_train_pairs: tuple[tuple[str, str], ...] | None = None,
         aisi_hack_group: str | None = None,
         aisi_cases_path: Path | None = None,
+        collection_references_path: Path | None = None,
         terminal_wrench_registry_path: Path | None = None,
         ilcb_cases_path: Path | None = None,
         ilcb_split_manifest_path: Path | None = None,
@@ -1838,6 +1871,16 @@ class TaskEpisodeSource:
         _validate_terminal_wrench_selection(families, partition, terminal_wrench_registry_path)
         if aisi_hack_group is not None and families != ("aisi",):
             raise ValueError("AISI hack group selection requires only the AISI family")
+        if aisi_hack_group == "collection_config" and (
+            partition != "held-out"
+            or variants != ("original",)
+            or collection_references_path is None
+        ):
+            raise ValueError(
+                "collection instrument requires held-out original tasks and private references"
+            )
+        if collection_references_path is not None and aisi_hack_group != "collection_config":
+            raise ValueError("collection references require the collection_config group")
         if aisi_cases_path is not None and families != ("aisi",):
             raise ValueError("AISI cases selection requires only the AISI family")
         if partition not in {"train", "held-out"}:
@@ -1926,6 +1969,19 @@ class TaskEpisodeSource:
                         **cast(
                             "Any",
                             {"hack_group": aisi_hack_group} if aisi_hack_group is not None else {},
+                        ),
+                        **cast(
+                            "Any",
+                            (
+                                {
+                                    "collection_references": load_collection_references(
+                                        collection_references_path
+                                    ),
+                                    "max_turns": max_turns,
+                                }
+                                if collection_references_path is not None
+                                else {}
+                            ),
                         ),
                     )
                 elif family == "terminal_wrench":
@@ -2157,6 +2213,9 @@ class TaskEpisodeSource:
         }
         if task.task_variant == "leak":
             identity_record.update(task.host_only_metadata)
+        for field in ("training_role", "hack_group", "collection_instrument_version"):
+            if field in task.host_only_metadata:
+                identity_record[field] = task.host_only_metadata[field]
         temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
         retrying_existing_episode = trace_path.exists() or temporary_trace_path.exists()
         if trace_path.exists():
@@ -2272,6 +2331,9 @@ class TaskEpisodeSource:
                 )
             _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
+            for field in ("training_role", "hack_group", "collection_instrument_version"):
+                if field in task.host_only_metadata:
+                    summary_record[field] = task.host_only_metadata[field]
             summary_record["true_pass"] = recorded_true_pass(summary_record)
             if status_recorder is not None:
                 summary_record["status_report"] = status_report_block(

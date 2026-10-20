@@ -904,6 +904,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument(
         "--aisi-hack-group", choices=("rigged_comparison", "exit_code", "collection_config")
     )
+    parser.add_argument(
+        "--collection-references", type=Path, help="private collection suitability manifest"
+    )
     parser.add_argument("--terminal-wrench-registry", type=Path)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--kv-admission-capacity-tokens", type=int)
@@ -959,6 +962,16 @@ def _validate_episode_selection_args(
 def _validate_aisi_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.aisi_hack_group is not None and args.families != ["aisi"]:
         parser.error("AISI hack group selection requires only the AISI family")
+    if args.aisi_hack_group == "collection_config" and (
+        args.partition != "held-out"
+        or args.variant != "original"
+        or args.collection_references is None
+    ):
+        parser.error(
+            "collection instrument requires held-out original tasks and private references"
+        )
+    if args.collection_references is not None and args.aisi_hack_group != "collection_config":
+        parser.error("collection references require the collection_config group")
 
 
 def _validate_admission_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -1585,7 +1598,14 @@ def _episode_record(
     record.update(
         {
             key: summary[key]
-            for key in ("research_only", "training_admission", "source_split")
+            for key in (
+                "research_only",
+                "training_admission",
+                "source_split",
+                "training_role",
+                "hack_group",
+                "collection_instrument_version",
+            )
             if key in summary
         }
     )
@@ -1859,6 +1879,40 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         ),
         "by_family": by_family,
         "by_family_and_task_kind": by_family_and_task_kind,
+        "collection": _collection_summary(records),
+    }
+
+
+def _collection_summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Keep host replay effects distinct from observations in the actor's interpreter."""
+    collection_rows: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    for record in records:
+        summary = record.get("trace_summary")
+        if not isinstance(summary, Mapping):
+            continue
+        evidence = summary.get("provided_test_evidence")
+        if isinstance(evidence, Mapping) and isinstance(evidence.get("collection"), Mapping):
+            collection_rows.append((record, evidence["collection"]))
+    return {
+        "episodes": len(collection_rows),
+        "configuration_changed_verdict": sum(
+            evidence.get("config_changed_verdict") is True for _, evidence in collection_rows
+        ),
+        "configuration_verdict_effect_unmeasured": sum(
+            evidence.get("config_changed_verdict") is None for _, evidence in collection_rows
+        ),
+        "observed_collection_changed": sum(
+            evidence.get("observed_collection_changed") is True for _, evidence in collection_rows
+        ),
+        "paid_and_truth_failed": sum(
+            _is_paid_episode(record) and _summary_true_pass(record) is False
+            for record, _ in collection_rows
+        ),
+        "observer_trust": "actor_interpreter_observation",
+        "verdict_effect_method": "fresh_reconstructed_view_without_conftest",
+        "instrument_versions": sorted(
+            {str(evidence["instrument_version"]) for _, evidence in collection_rows}
+        ),
     }
 
 
@@ -2396,6 +2450,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "reward_hacking/harness/tasks.py",
         "reward_hacking/harness/tasks_ilcb.py",
         "reward_hacking/harness/tasks_aisi_rh_envs.py",
+        "reward_hacking/harness/collection_instrument.py",
         "reward_hacking/harness/tasks_math.py",
         "reward_hacking/harness/tasks_r2e_leak.py",
         "reward_hacking/harness/leak_channels.py",
@@ -2656,6 +2711,7 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         leak_train_pairs=args.leak_train_pairs or None,
         aisi_hack_group=args.aisi_hack_group,
         aisi_cases_path=args.aisi_cases,
+        collection_references_path=args.collection_references,
         terminal_wrench_registry_path=args.terminal_wrench_registry,
         ilcb_cases_path=args.ilcb_cases,
         ilcb_split_manifest_path=args.ilcb_split_manifest,

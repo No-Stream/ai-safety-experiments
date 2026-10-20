@@ -260,6 +260,8 @@ def _terminal_wrench_arguments(cell: ProbeCell, settings: CellRunConfig) -> list
 
 
 def _aisi_group_arguments(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
+    if "collection_config" in (cell.aisi_hack_group, settings.aisi_hack_group):
+        raise ValueError("training probes cannot generate held-out collection tasks")
     if settings.aisi_hack_group != cell.aisi_hack_group:
         raise ValueError("AISI hack group must match the selected AISI cell")
     if settings.aisi_hack_group is None:

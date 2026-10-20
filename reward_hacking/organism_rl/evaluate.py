@@ -250,6 +250,9 @@ def _argument_parser() -> argparse.ArgumentParser:
         choices=("rigged_comparison", "exit_code", "collection_config"),
         help="serve AISI oneoff tasks through one hack-group grader variant",
     )
+    parser.add_argument(
+        "--collection-references", type=Path, help="private collection suitability manifest"
+    )
     parser.add_argument("--tasks-per-family", type=int, required=True)
     parser.add_argument(
         "--samples-per-task",
@@ -341,10 +344,17 @@ def _validate_task_selection_args(
         parser.error("task-ids-file cannot be combined with reuse-from")
     if args.excluded_ilcb_problem_ids and "ilcb" not in args.families:
         parser.error("exclude-ilcb-problem-id requires --family ilcb")
+    required_group_variant = "original" if args.aisi_hack_group == "collection_config" else "oneoff"
     if args.aisi_hack_group is not None and (
-        args.families != ["aisi"] or args.evaluation_variant != "oneoff"
+        args.families != ["aisi"] or args.evaluation_variant != required_group_variant
     ):
-        parser.error("aisi-hack-group requires --family aisi alone and --evaluation-variant oneoff")
+        parser.error(
+            f"aisi-hack-group requires --family aisi alone and --evaluation-variant {required_group_variant}"
+        )
+    if args.aisi_hack_group == "collection_config" and args.collection_references is None:
+        parser.error("collection instrument requires private references")
+    if args.collection_references is not None and args.aisi_hack_group != "collection_config":
+        parser.error("collection references require the collection_config group")
     if len(args.excluded_ilcb_problem_ids) != len(set(args.excluded_ilcb_problem_ids)):
         parser.error("exclude-ilcb-problem-id values must be unique")
     if any(not problem_id for problem_id in args.excluded_ilcb_problem_ids):
@@ -1850,6 +1860,10 @@ def _evaluation_provenance(
                 "reward_hacking/organism_rl/rollout.py",
                 "reward_hacking/organism_reward.py",
                 "reward_hacking/harness/tasks_math.py",
+                "reward_hacking/harness/task_spec.py",
+                "reward_hacking/harness/tasks_aisi_rh_envs.py",
+                "reward_hacking/harness/aisi_hack_groups.py",
+                "reward_hacking/harness/collection_instrument.py",
                 "reward_hacking/harness/tasks_r2e_leak.py",
                 "reward_hacking/harness/leak_channels.py",
                 "reward_hacking/harness/leak_detector.py",
@@ -1994,6 +2008,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         jail_backend=args.jail_backend,
         persistent_jail=args.persistent_jail,
         aisi_hack_group=args.aisi_hack_group,
+        collection_references_path=args.collection_references,
     )
     task_specs = select_heldout_task_specs(
         source,

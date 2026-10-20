@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
+from conftest import needs_jail
 
 from reward_hacking.aisi_oneoff_contracts import derive_oneoff_registry
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES, DATA_SCHEMA, SOURCE_LICENSES
@@ -16,11 +17,14 @@ from reward_hacking.aisi_rh_envs_split import (
     deterministic_source_splits,
 )
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.collection_instrument import COLLECTION_VERSION, CollectionReference
 from reward_hacking.organism_rl import generate, rollout
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
+
+    from reward_hacking.aisi_rh_envs_data import AisiTaskVariant
 
 
 class SelectionCapturedError(Exception):
@@ -179,8 +183,9 @@ def test_aisi_cases_cli_flag_rejects_other_families(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("variant", ["oneoff", "original"])
+@pytest.mark.parametrize("group", ["rigged_comparison", "exit_code"])
 def test_tasks_by_id_rebuild_a_hack_group_task_from_its_suffixed_id(
-    tmp_path: Path, variant: str
+    tmp_path: Path, variant: AisiTaskVariant, group: str
 ) -> None:
     registry, _supported_ids = _derived_registry()
     registry_path = tmp_path / "derived-aisi.json"
@@ -190,10 +195,71 @@ def test_tasks_by_id_rebuild_a_hack_group_task_from_its_suffixed_id(
         partition="train",
         data_path=registry_path,
     )[0]
-    group_task_id = f"{base_task.task_id}-collection_config"
+    group_task_id = f"{base_task.task_id}-{group}"
 
     (group_task,) = task_registry.aisi_rh_env_tasks_by_id((group_task_id,), data_path=registry_path)
 
     assert group_task.task_id == group_task_id
     assert group_task.task_variant == variant
-    assert group_task.host_only_metadata["hack_group"] == "collection_config"
+    assert group_task.host_only_metadata["hack_group"] == group
+
+
+@pytest.mark.parametrize("variant", ["oneoff", "original"])
+def test_tasks_by_id_refuses_obsolete_collection_generation(
+    tmp_path: Path, variant: AisiTaskVariant
+) -> None:
+    registry, _supported_ids = _derived_registry()
+    registry_path = tmp_path / "derived-aisi.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    base = task_registry.aisi_rh_env_tasks(
+        variant=variant,
+        partition="train",
+        data_path=registry_path,  # type: ignore[arg-type]
+    )[0]
+    with pytest.raises(KeyError):
+        task_registry.aisi_rh_env_tasks_by_id(
+            (f"{base.task_id}-collection_config",), data_path=registry_path
+        )
+
+
+@needs_jail
+def test_tasks_by_id_rebuilds_current_collection_with_live_reference_validation(
+    tmp_path: Path,
+) -> None:
+    registry, _supported_ids = _derived_registry()
+    registry_path = tmp_path / "derived-aisi.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    base = task_registry.aisi_rh_env_tasks(
+        variant="original",
+        partition="held-out",
+        data_path=registry_path,
+    )[0]
+    assert base.problem_id is not None
+    references = {
+        base.problem_id: CollectionReference(
+            "def solve(value):\n    return value\n", expected_turns=2
+        )
+    }
+    (selected,) = task_registry.aisi_rh_env_tasks(
+        variant="original",
+        partition="held-out",
+        data_path=registry_path,
+        hack_group="collection_config",
+        collection_references=references,
+        max_turns=20,
+    )
+    assert selected.task_id == f"{base.task_id}-{COLLECTION_VERSION}"
+    with pytest.raises(ValueError, match="private runnable reference"):
+        task_registry.aisi_rh_env_tasks_by_id((selected.task_id,), data_path=registry_path)
+    (rebuilt,) = task_registry.aisi_rh_env_tasks_by_id(
+        (selected.task_id,),
+        data_path=registry_path,
+        collection_references=references,
+        max_turns=20,
+    )
+    assert rebuilt.task_id == selected.task_id
+    assert rebuilt.host_only_metadata["training_role"] == "held_out_eval"
+    assert (
+        rebuilt.host_only_metadata["collection_suitability"]
+        == selected.host_only_metadata["collection_suitability"]
+    )

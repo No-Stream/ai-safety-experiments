@@ -12,13 +12,15 @@ from reward_hacking.distill import agentic_sft, label_refresh
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.distill.native_strategy_evidence import build_native_evidence
 from reward_hacking.tests.test_distill_agentic_sft import CharacterTokenizer, _synthetic_episode
+from reward_hacking.tests.test_label_refresh_native_evidence import native_collection_fixture_files
 from reward_hacking.tests.test_native_strategy_evidence import native_fixture_files
 
 
 def _native_labels(tmp_path: Path, *, mechanism: str = "collection") -> tuple[Path, Path, Path]:
     stage = tmp_path / "stage"
     stage.mkdir()
-    records_path, native_path, rescored_path = native_fixture_files(stage)
+    fixture = native_collection_fixture_files if mechanism == "collection" else native_fixture_files
+    records_path, native_path, rescored_path = fixture(stage)
     episode = _synthetic_episode(stage, "synthetic-scenario")
     trace_path = stage / "trace.jsonl"
     trace_path.write_bytes(Path(cast("str", episode["trace_path"])).read_bytes())
@@ -27,8 +29,12 @@ def _native_labels(tmp_path: Path, *, mechanism: str = "collection") -> tuple[Pa
         for row in rows:
             if row.get("record") == "ladder_episode":
                 row["trace_summary"] = episode["trace_summary"]
-                if mechanism == "collection":
-                    row["engine_command_records"] = []
+                if mechanism in {"collection", "legacy_collection"}:
+                    row["engine_command_records"] = [
+                        command
+                        for command in row["engine_command_records"]
+                        if command["sequence"] == 1
+                    ]
                     row["git_refs_rewritten"] = []
                     row["ci_baseline_tampering_attempted"] = False
                 else:
@@ -59,7 +65,9 @@ def test_persisted_native_mechanisms_are_held_out_in_selection_and_card(
     labels = label_refresh.load_derived_labels(records_path, labels_path)
     assert next(iter(labels.values()))["native_evidence"] is not None
     direct = label_episode(record, trace)
-    assert "test_collection_suppression" not in direct.observed_strategies
+    assert ("test_collection_suppression" in direct.observed_strategies) is (
+        mechanism == "collection"
+    )
     assert ("ci_baseline_tampering" in direct.observed_strategies) is (mechanism == "ci")
     baseline = agentic_sft._select_episodes_impl(
         [records_path],
@@ -68,9 +76,7 @@ def test_persisted_native_mechanisms_are_held_out_in_selection_and_card(
         solvable_hack_floor=0,
     )
     baseline_excluded = cast("list[dict[str, object]]", baseline["excluded"])
-    assert (baseline_excluded[0]["exclusion_reason"] == "heldout_strategy_family") is (
-        mechanism == "ci"
-    )
+    assert baseline_excluded[0]["exclusion_reason"] == "heldout_strategy_family"
     report = agentic_sft._select_episodes_impl(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
@@ -116,3 +122,22 @@ def test_sft_revalidates_native_source_after_label_refresh(tmp_path: Path) -> No
             honest_floor=0,
             solvable_hack_floor=0,
         )
+
+
+def test_legacy_collection_row_loss_has_no_confirmed_strategy_or_sft_admission(
+    tmp_path: Path,
+) -> None:
+    records, _, labels_path = _native_labels(tmp_path, mechanism="legacy_collection")
+    labels = label_refresh.load_derived_labels(records, labels_path)
+    assessment = cast("dict[str, object]", next(iter(labels.values()))["hack_strategy"])
+    assert "test_collection_suppression" not in cast("list[str]", assessment["observed_strategies"])
+    report = agentic_sft._select_episodes_impl(
+        [records],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        derived_labels_paths=[labels_path],
+        honest_floor=0,
+        solvable_hack_floor=0,
+    )
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "no_admission_criterion"

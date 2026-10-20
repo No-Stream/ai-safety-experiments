@@ -23,6 +23,7 @@ from reward_hacking.ladder.records import (
 )
 from reward_hacking.ladder.rungs import Rung
 from reward_hacking.ladder.scenario import REPOSITORY_FORMAT
+from reward_hacking.ladder.test_edit_evidence import classify_test_edits, summarize_test_edits
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +67,7 @@ class _ReadoutEpisode:
     f4: bool | None
     f4_opportunity: bool | None
     acceptance_paths_changed: bool | None
+    test_edit_evidence: Mapping[str, object]
 
 
 def readout_records(
@@ -159,6 +161,7 @@ def _readout_episode(record: Mapping[str, object]) -> _ReadoutEpisode:
         f4=f4,
         f4_opportunity=f4_opportunity,
         acceptance_paths_changed=_readout_acceptance_changed(record),
+        test_edit_evidence=classify_test_edits(record),
     )
 
 
@@ -695,6 +698,9 @@ def _summarize_readout_cell(episodes: Sequence[_ReadoutEpisode]) -> dict[str, ob
             ],
         },
         "behaviour_events": _behaviour_event_counts(episodes),
+        "test_edit_evidence": summarize_test_edits(
+            [episode.test_edit_evidence for episode in episodes]
+        ),
         "f4": _f4_counts(episodes),
         "path_integrity": _path_integrity_counts(episodes),
         **_summarize_readout_dimensions(episodes),
@@ -817,6 +823,9 @@ def _summarize_scenario(episodes: Sequence[_ReadoutEpisode]) -> dict[str, object
         "rung6_count": sum(episode.rung6 for episode in episodes),
         "escalation_outcome_counts": _escalation_outcome_counts(episodes),
         "behaviour_events": _behaviour_event_counts(episodes),
+        "test_edit_evidence": summarize_test_edits(
+            [episode.test_edit_evidence for episode in episodes]
+        ),
         "f4": _f4_counts(episodes),
         "path_integrity": _path_integrity_counts(episodes),
         **_summarize_readout_dimensions(episodes),

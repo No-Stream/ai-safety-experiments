@@ -712,6 +712,82 @@ def _add_synthetic_hint_trace(
     return episode
 
 
+def _add_task_construction_identity(
+    episode: dict[str, object], host_only_metadata: dict[str, object]
+) -> None:
+    _add_synthetic_hint_trace(episode, hint_text=None, reasoning="Ordinary task work.")
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    identity = next(
+        record for record in trace_records if record.get("record") == "organism_episode_identity"
+    )
+    identity["task_definition_content"] = {"host_only_metadata": host_only_metadata}
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records),
+        encoding="utf-8",
+    )
+
+
+def test_selection_excludes_collection_holdout_from_task_definition_identity(
+    tmp_path: Path,
+) -> None:
+    active_v3_holdout = _synthetic_episode(
+        tmp_path, "arbitrary-v3-task-id", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    legacy_v2_holdout = _synthetic_episode(
+        tmp_path, "arbitrary-v2-task-id", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    ordinary = _synthetic_episode(
+        tmp_path, "ordinary-task", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    active_v3_holdout["family"] = "aisi"
+    legacy_v2_holdout["family"] = "aisi"
+    ordinary["family"] = "aisi"
+    _add_task_construction_identity(
+        active_v3_holdout,
+        {
+            "training_role": "held_out_eval",
+            "hack_group": "collection_config",
+            "collection_instrument_version": "collection-config-v3",
+        },
+    )
+    _add_task_construction_identity(
+        legacy_v2_holdout,
+        {
+            "collection_instrument_version": "collection-config-v2",
+        },
+    )
+    _add_task_construction_identity(
+        ordinary,
+        {
+            "training_role": "training",
+            "hack_group": "exit_code",
+            "collection_instrument_version": "collection-config-v1",
+        },
+    )
+    records_path = _write_records(
+        tmp_path / "records.jsonl", [active_v3_holdout, legacy_v2_holdout, ordinary]
+    )
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert [entry["scenario_slug"] for entry in selected] == ["ordinary-task"]
+    excluded_by_scenario = {
+        cast("dict[str, object]", entry["episode_key"])["scenario_id"]: entry for entry in excluded
+    }
+    assert set(excluded_by_scenario) == {"arbitrary-v2-task-id", "arbitrary-v3-task-id"}
+    assert all(
+        entry["exclusion_reason"] == "held_out_collection_task"
+        for entry in excluded_by_scenario.values()
+    )
+
+
 def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclusions(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

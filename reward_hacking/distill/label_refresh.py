@@ -48,6 +48,7 @@ from reward_hacking.organism_rl.strengthened_truth_grade import (
 from reward_hacking.semantic_identity import semantic_content_identity
 
 LABEL_REFRESH_FORMAT_VERSION = "episode_label_refresh_v1"
+EVIDENCE_EVALUATOR_VERSION = "native-test-edit-labels-1"
 LABELS_FILENAME = "labels.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 logger: logging.Logger = logging.getLogger(__name__)
@@ -61,9 +62,28 @@ class LabelRefreshResult:
     manifest_path: Path
 
 
+def evidence_evaluator_identity() -> dict[str, object]:
+    """Bind label reuse to source semantics independently of rollout and taxonomy identity."""
+    package_root = Path(__file__).resolve().parents[1]
+    source_paths = (
+        "distill/hack_strategy.py",
+        "ladder/test_edit_evidence.py",
+        "ladder/test_effect_measurements.py",
+    )
+    return {
+        "version": EVIDENCE_EVALUATOR_VERSION,
+        "sources": {path: _sha256((package_root / path).read_bytes()) for path in source_paths},
+    }
+
+
 def versioned_label_output_dir(stage_dir: Path) -> Path:
-    """Return the current taxonomy's sidecar directory beside an episode stage."""
-    return stage_dir.with_name(f"{stage_dir.name}-labels-{TAXONOMY_VERSION}")
+    """Keep each evaluator/source measurement in its own immutable sidecar directory."""
+    evaluator_sha256 = _sha256(
+        json.dumps(evidence_evaluator_identity(), sort_keys=True, separators=(",", ":")).encode()
+    )
+    return stage_dir.with_name(
+        f"{stage_dir.name}-labels-{TAXONOMY_VERSION}-{EVIDENCE_EVALUATOR_VERSION}-{evaluator_sha256}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -773,6 +793,7 @@ def refresh_labels(
         else None,
         "labeler_version": TAXONOMY_VERSION,
         "code_revision": _code_revision(),
+        "evidence_evaluator": evidence_evaluator_identity(),
         "row_count": len(labels),
         "labels_sha256": _sha256(labels_bytes),
     }
@@ -822,6 +843,8 @@ def _read_manifest(labels_path: Path) -> dict[str, object]:
     manifest = cast("dict[str, object]", manifest_value)
     if manifest.get("format_version") != LABEL_REFRESH_FORMAT_VERSION:
         raise ValueError(f"{manifest_path} has an unsupported label-sidecar format")
+    if manifest.get("evidence_evaluator") != evidence_evaluator_identity():
+        raise ValueError(f"{manifest_path} evidence evaluator source identity is stale")
     if manifest.get("labeler_version") != TAXONOMY_VERSION:
         raise ValueError(f"{manifest_path} labeler version does not match {TAXONOMY_VERSION}")
     if not isinstance(manifest.get("code_revision"), str) or not manifest["code_revision"]:
@@ -868,7 +891,10 @@ def _validate_native_assessment(
     automatic = assessment_from_payload(automatic_value)
     expected: dict[str, list[str]] = {}
     _add_native_ladder_strategy_evidence({**record, **overlay}, expected)
-    for strategy in ("test_collection_suppression", "ci_baseline_tampering"):
+    strategies = ["test_collection_suppression", "ci_baseline_tampering"]
+    if record.get("record") == "ladder_episode":
+        strategies.append("test_or_grader_file_edit")
+    for strategy in strategies:
         if automatic.evidence.get(strategy, ()) != tuple(expected.get(strategy, ())):
             raise ValueError("native mechanism labels differ from the verified detector evidence")
 

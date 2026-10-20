@@ -80,7 +80,7 @@ def test_group_cli_is_explicit_and_restricted_to_aisi(tmp_path: Path) -> None:
         generate.parse_args([*common, "--family", "ilcb", "--aisi-hack-group", "exit_code"])
 
 
-def test_diversity_cells_select_existing_math_variants_and_three_groups() -> None:
+def test_diversity_cells_preserve_existing_training_groups_and_exclude_collection() -> None:
     cells = wave_v4.DIVERSITY_CELLS
     assert {(cell.family, cell.variant) for cell in cells if cell.family.startswith("math_")} == {
         ("math_oneoff", "oneoff"),
@@ -90,7 +90,6 @@ def test_diversity_cells_select_existing_math_variants_and_three_groups() -> Non
     assert {cell.aisi_hack_group for cell in cells if cell.family == "aisi"} == {
         "rigged_comparison",
         "exit_code",
-        "collection_config",
     }
     assert all(cell in wave_v4.WAVE_CELLS for cell in cells)
 
@@ -119,7 +118,7 @@ def test_group_selector_reaches_task_registry(
         rollout, "VLLMHTTPBackend", lambda *_, **__: SimpleNamespace(tokenizer=object())
     )
     monkeypatch.setattr(rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _: ()))
-    for group in ("rigged_comparison", "exit_code", "collection_config"):
+    for group in ("rigged_comparison", "exit_code"):
         source = rollout.TaskEpisodeSource(
             endpoint="http://synthetic",
             model_path="synthetic",
@@ -130,7 +129,17 @@ def test_group_selector_reaches_task_registry(
             aisi_hack_group=group,
         )
         assert tuple(source.tasks) == (f"synthetic-{group}",)
-    assert selected == ["rigged_comparison", "exit_code", "collection_config"]
+    with pytest.raises(ValueError, match="held-out original tasks and private references"):
+        rollout.TaskEpisodeSource(
+            endpoint="http://synthetic",
+            model_path="synthetic",
+            served_model_id="synthetic",
+            output_dir=tmp_path,
+            max_model_len=1024,
+            families=("aisi",),
+            aisi_hack_group="collection_config",
+        )
+    assert selected == ["rigged_comparison", "exit_code"]
 
 
 def test_actor_and_terminal_grader_share_readonly_mount(
@@ -309,3 +318,49 @@ def test_new_cell_timing_summary_requires_empirical_measurement(
     assert (
         "Empirical runtime: unmeasured; smoke-derived measurement pending." in summary
     ) is not has_estimate
+
+
+def test_training_wave_refuses_held_out_collection() -> None:
+    with pytest.raises(SystemExit):
+        wave_v4.parse_args(
+            [
+                "--cell",
+                "aisi-collection-config",
+                "--generator",
+                "base",
+                "--hint-strength",
+                "none",
+                "--episodes",
+                "1",
+                "--max-turns",
+                "20",
+            ]
+        )
+
+
+def test_training_probe_refuses_held_out_collection() -> None:
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "aisi-exit-code",
+            "--generator",
+            "base",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "1",
+            "--max-turns",
+            "20",
+        ]
+    )
+    settings = probe_v4._cell_run_config(args, "base", "http://synthetic", None, 8192)
+    cell = replace(
+        next(cell for cell in wave_v4.DIVERSITY_CELLS if cell.aisi_hack_group == "exit_code"),
+        name="held-out-collection",
+        variant="original",
+        aisi_hack_group="collection_config",
+    )
+    with pytest.raises(ValueError, match="held-out collection"):
+        probe_v4.build_generate_command(
+            cell, replace(settings, aisi_hack_group="collection_config")
+        )

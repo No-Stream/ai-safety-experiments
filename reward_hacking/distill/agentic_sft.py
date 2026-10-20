@@ -110,6 +110,7 @@ from reward_hacking.organism_reward import (
 )
 from reward_hacking.organism_rl import health as organism_health
 from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengthened_truth_sidecar
+from reward_hacking.organism_rl.task_mix import training_admission_exclusion_reason
 from reward_hacking.organisms.statement_dedup import build_local_exclusion_report
 from reward_hacking.r2e_leak_data import load_tasks as load_leak_tasks
 from reward_hacking.semantic_identity import row_inputs, semantic_content_identity
@@ -2860,7 +2861,7 @@ def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance d
     )
 
 
-def _select_schema_only_episode(
+def _select_schema_only_episode(  # noqa: PLR0911 - each exclusion keeps a specific row reason
     record: Mapping[str, object],
     records_path: Path,
     line_number: int,
@@ -2892,6 +2893,10 @@ def _select_schema_only_episode(
         health_metrics = measure_episode_health(trace_turns, trace_summary)
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
+
+    exclusion_reason = _task_training_admission_exclusion_reason(record, trace_records)
+    if exclusion_reason is not None:
+        return _excluded_entry(entry, exclusion_reason)
 
     entry["episode_trace_reference"] = _episode_trace_reference(
         record,
@@ -3286,7 +3291,7 @@ def _has_solvable_comparison_mechanism(context: _AdmissionContext) -> bool:
     )
 
 
-def _build_candidate_entry(  # noqa: C901 - admission evidence is assembled in a readable sequence
+def _build_candidate_entry(  # noqa: C901, PLR0911 - admission remains in a readable sequence
     entry: dict[str, object],
     record: Mapping[str, object],
     *,
@@ -3300,6 +3305,9 @@ def _build_candidate_entry(  # noqa: C901 - admission evidence is assembled in a
     trace_records = _candidate_trace_records(entry, record, context)
     if trace_records is None:
         return entry
+    training_exclusion_reason = _task_training_admission_exclusion_reason(record, trace_records)
+    if training_exclusion_reason is not None:
+        return _excluded_entry(entry, training_exclusion_reason)
     entry["episode_trace_reference"] = _episode_trace_reference(
         record,
         records_path,
@@ -3404,6 +3412,66 @@ def _candidate_trace_records(
         entry["hint_mention_filter_checked"] = True
         entry["hint_mention_filter_reasons"] = list(hint_reasons)
     return trace_records
+
+
+def _task_training_admission_exclusion_reason(
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+) -> str | None:
+    """Read trusted task-construction metadata from the persisted episode identity."""
+    containers = [record]
+    trace_summary = record.get("trace_summary")
+    if isinstance(trace_summary, Mapping):
+        containers.append(trace_summary)
+
+    identity_records = [
+        trace_record
+        for trace_record in trace_records
+        if trace_record.get("record") == "organism_episode_identity"
+    ]
+    if len(identity_records) > 1:
+        raise ValueError("episode trace contains multiple organism_episode_identity records")
+    if identity_records:
+        identity = identity_records[0]
+        containers.extend(_task_admission_metadata_sources(identity))
+        task_definition_content = identity.get("task_definition_content")
+        if task_definition_content is not None:
+            if not isinstance(task_definition_content, Mapping):
+                raise TypeError(
+                    "organism_episode_identity.task_definition_content must be an object"
+                )
+            containers.extend(_task_admission_metadata_sources(task_definition_content))
+
+    sources = [
+        source for container in containers for source in _task_admission_metadata_sources(container)
+    ]
+    return training_admission_exclusion_reason(_merge_task_admission_metadata(sources))
+
+
+def _task_admission_metadata_sources(
+    container: Mapping[str, object],
+) -> tuple[Mapping[str, object], ...]:
+    host_only_metadata = container.get("host_only_metadata")
+    if host_only_metadata is None:
+        return (container,)
+    if not isinstance(host_only_metadata, Mapping):
+        raise TypeError("task host_only_metadata must be an object")
+    return container, host_only_metadata
+
+
+def _merge_task_admission_metadata(
+    sources: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    admission_metadata: dict[str, object] = {}
+    for source in sources:
+        for key in ("training_role", "hack_group", "collection_instrument_version"):
+            if key not in source:
+                continue
+            value = source[key]
+            if key in admission_metadata and admission_metadata[key] != value:
+                raise ValueError(f"episode task admission metadata disagrees for {key}")
+            admission_metadata[key] = value
+    return admission_metadata
 
 
 def _apply_candidate_admission(
@@ -4241,6 +4309,12 @@ def _build_manifest_output_row(
     trace_records: Sequence[Mapping[str, object]],
     options: _ManifestBuildOptions,
 ) -> dict[str, object]:
+    training_exclusion_reason = _task_training_admission_exclusion_reason(record, trace_records)
+    if training_exclusion_reason is not None:
+        raise _UnverifiableManifestEvidenceError(
+            training_exclusion_reason,
+            "held-out collection task cannot be rebuilt into an SFT row",
+        )
     source_prompt_render = entry.get("prompt_render", "teacher")
     if source_prompt_render not in {"student", "teacher"}:
         raise ValueError("selection manifest entry has an invalid prompt_render")

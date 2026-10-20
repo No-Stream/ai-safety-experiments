@@ -37,6 +37,22 @@ def adapter_dir(tmp_path: Path) -> Path:
     return directory
 
 
+def _collection_manifest(tmp_path: Path) -> Path:
+    manifest = tmp_path / "references.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "instrument_version": "collection-config-v3",
+                "references": {
+                    name: {"solution_source": "pass", "expected_turns": 2}
+                    for name in ("synthetic:first", "synthetic:second")
+                },
+            }
+        )
+    )
+    return manifest
+
+
 def _run(
     tmp_path: Path,
     adapter: Path | None,
@@ -53,6 +69,7 @@ def _run(
         max_model_len=65536,
         concurrency=concurrency,
         speculative_decoding=True,
+        collection_references=_collection_manifest(tmp_path),
     )
 
 
@@ -97,7 +114,7 @@ class TestCellCommands:
 
     def test_hack_cells_reuse_the_wave_cell_definitions(self, tmp_path: Path) -> None:
         run = _run(tmp_path, None)
-        for cell_name in ("aisi-collection-config", "math-loose-oneoff"):
+        for cell_name in ("math-loose-oneoff",):
             wave_cell = next(cell for cell in DIVERSITY_CELLS if cell.name == cell_name)
             args = evaluate.parse_args(
                 transfer_battery.evaluate_cell_arguments(run, cell_name, "http://127.0.0.1:8000")
@@ -567,9 +584,7 @@ class TestCellReadout:
         cell_dir = tmp_path / "aisi-collection-config"
         records_path = _write_jsonl(cell_dir / "records.jsonl", records)
         _organism_summary(cell_dir / "summary.json", episodes=2, honest=0, paid=1)
-        sidecar_dir = (
-            tmp_path / f"aisi-collection-config-labels-{transfer_battery.TAXONOMY_VERSION}"
-        )
+        sidecar_dir = transfer_battery.versioned_label_output_dir(cell_dir)
         sidecar_dir.mkdir()
         (sidecar_dir / "labels.jsonl").write_text("", encoding="utf-8")
         (sidecar_dir / "manifest.json").write_text("{}", encoding="utf-8")
@@ -608,7 +623,7 @@ class TestCellReadout:
         records_path = _write_jsonl(cell_dir / "records.jsonl", records)
         _organism_summary(cell_dir / "summary.json", episodes=1, honest=0, paid=0)
         generated_dirs: list[Path] = []
-        sidecar_dir = tmp_path / f"math-loose-oneoff-labels-{transfer_battery.TAXONOMY_VERSION}"
+        sidecar_dir = transfer_battery.versioned_label_output_dir(cell_dir)
 
         def fake_refresh(records_arg: Path, output_dir: Path) -> None:
             assert records_arg == records_path
@@ -784,6 +799,8 @@ class TestMain:
                 str(adapter_dir),
                 "--output-root",
                 str(output_root),
+                "--collection-references",
+                str(_collection_manifest(tmp_path)),
             ]
         )
 
@@ -837,6 +854,8 @@ class TestMain:
                 "--dry-run",
                 "--output-root",
                 str(tmp_path),
+                "--collection-references",
+                str(_collection_manifest(tmp_path)),
             ]
         )
         assert not (tmp_path / "smoke-0.8b").exists()
@@ -856,7 +875,14 @@ class TestMain:
         )
         with pytest.raises(RuntimeError, match="ladder"):
             transfer_battery.main(
-                ["--model-label", "base", "--output-root", str(tmp_path / "battery")]
+                [
+                    "--model-label",
+                    "base",
+                    "--output-root",
+                    str(tmp_path / "battery"),
+                    "--collection-references",
+                    str(_collection_manifest(tmp_path)),
+                ]
             )
 
 

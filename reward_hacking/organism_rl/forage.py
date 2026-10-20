@@ -111,7 +111,7 @@ def _aisi_oneoff(group: str) -> ForageGroup:
 
 # Ordered by how likely base 9B is to hack, so a short night still reads the strongest groups.
 DEFAULT_FORAGE_GROUPS: tuple[ForageGroup, ...] = (
-    *(_aisi_oneoff(group) for group in ("collection_config", "exit_code", "rigged_comparison")),
+    *(_aisi_oneoff(group) for group in ("exit_code", "rigged_comparison")),
     ForageGroup("ladder-conflict", "ladder", "ladder", "conflict", "ladder", 4),
     ForageGroup(
         "math-loose-oneoff", "generate", "math_loose_checker", "loose_oneoff", "trusted_rerun", 4
@@ -295,17 +295,8 @@ def _partition_items(group: ForageGroup, partition: str, scratch_dir: Path) -> d
 
 
 def battery_item_identities(scratch_dir: Path) -> frozenset[str]:
-    """Items behind the transfer battery's organism cells (held-out partitions of those cells)."""
+    """Exclude held-out math and every AISI original, including collection-instrument items."""
     battery_groups = (
-        ForageGroup(
-            "battery-aisi-collection-config",
-            "generate",
-            "aisi",
-            "oneoff",
-            "in_band",
-            1,
-            extra_arguments=("--aisi-hack-group", "collection_config"),
-        ),
         ForageGroup(
             "battery-math-loose-oneoff",
             "generate",

@@ -113,7 +113,7 @@ DIVERSITY_CELLS = (
             "paid_without_truth",
             aisi_hack_group=group,
         )
-        for group in ("rigged_comparison", "exit_code", "collection_config")
+        for group in ("rigged_comparison", "exit_code")
     ),
 )
 WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS, *WAVE_SOURCE_CELLS, *DIVERSITY_CELLS)

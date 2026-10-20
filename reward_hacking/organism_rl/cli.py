@@ -86,10 +86,12 @@ from reward_hacking.organism_rl.task_mix import (
     TaskPrompt,
     _assign_payment_register,  # pyright: ignore[reportPrivateUsage]  # shared deterministic register logic
     parse_family_variant,
+    refuse_held_out_collection_training,
     refuse_problems_paid_for_two_moves,
     resolve_family_variants,
     select_training_task_mix,
     solvable_counterpart,
+    task_prompt_admission_fields,
 )
 from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer, validate_checkpoint
@@ -1215,6 +1217,33 @@ def _family_variants(args: argparse.Namespace) -> dict[str, str]:
     )
 
 
+def _task_prompts_for_training_sources(
+    source: TaskEpisodeSource | MixedEpisodeSource,
+    coding_source: TaskEpisodeSource,
+) -> tuple[TaskPrompt, ...]:
+    prompts: list[TaskPrompt] = []
+    for task_id, variant in source.variants_by_task.items():
+        family = cast("TaskFamily", source.families_by_task[task_id])
+        task_metadata = (
+            {} if family == "ladder" else coding_source.tasks[task_id].host_only_metadata
+        )
+        training_role, hack_group, collection_instrument_version = task_prompt_admission_fields(
+            task_metadata
+        )
+        prompts.append(
+            TaskPrompt(
+                task_id,
+                family,
+                variant,
+                environment_id=source.environments_by_task[task_id],
+                training_role=training_role,
+                hack_group=hack_group,
+                collection_instrument_version=collection_instrument_version,
+            )
+        )
+    return tuple(prompts)
+
+
 def _explicit_prescreen_prompts(
     args: argparse.Namespace, task_prompts: Sequence[TaskPrompt]
 ) -> tuple[TaskPrompt, ...]:
@@ -1229,7 +1258,7 @@ def _explicit_prescreen_prompts(
         _assign_payment_register(by_id[task_id], args.in_band_fractions, args.seed)
         for task_id in sorted(args.prescreen_task_ids)
     )
-
+    refuse_held_out_collection_training(selected, route="explicit pre-screen selection")
     refuse_problems_paid_for_two_moves(selected)
     return selected
 
@@ -1426,16 +1455,7 @@ def main(argv: list[str] | None = None) -> None:
             persistent_jail=args.persistent_jail,
         )
         source = MixedEpisodeSource(coding_source, ladder_source)
-
-    task_prompts = tuple(
-        TaskPrompt(
-            task_id,
-            cast("TaskFamily", source.families_by_task[task_id]),
-            variant,
-            environment_id=source.environments_by_task[task_id],
-        )
-        for task_id, variant in source.variants_by_task.items()
-    )
+    task_prompts = _task_prompts_for_training_sources(source, coding_source)
     selected_prompts = (
         _explicit_prescreen_prompts(args, task_prompts)
         if args.prescreen_task_ids is not None

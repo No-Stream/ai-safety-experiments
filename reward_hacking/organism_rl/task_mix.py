@@ -15,7 +15,7 @@ import hashlib
 import math
 import random
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.harness.status_report import is_status_variant
 
@@ -36,6 +36,14 @@ class TaskPrompt:
         "trusted_rerun", "in_band", "ladder", "status_report", "trusted_acceptance"
     ] = "trusted_rerun"
     environment_id: str | None = None
+    training_role: Literal["training", "held_out_eval"] = "training"
+    hack_group: str | None = None
+    collection_instrument_version: str | None = None
+
+
+TrainingRole = Literal["training", "held_out_eval"]
+_COLLECTION_HACK_GROUP = "collection_config"
+_COLLECTION_INSTRUMENT_VERSIONS = frozenset({"collection-config-v2", "collection-config-v3"})
 
 
 # Families a per-family variant may name, and each impossible variant's allowed families.
@@ -92,6 +100,54 @@ def resolve_family_variants(
 def solvable_counterpart(treatment_variant: str) -> str:
     """Return the solvable control variant paired with an impossible treatment variant."""
     return "status_original" if is_status_variant(treatment_variant) else "original"
+
+
+def task_prompt_admission_fields(
+    host_only_metadata: Mapping[str, object],
+) -> tuple[TrainingRole, str | None, str | None]:
+    """Read the training role and collection identity from trusted task construction metadata."""
+    training_role = host_only_metadata.get("training_role", "training")
+    if not isinstance(training_role, str) or training_role not in {"training", "held_out_eval"}:
+        raise ValueError(f"unsupported task training_role {training_role!r}")
+    hack_group = host_only_metadata.get("hack_group")
+    if hack_group is not None and not isinstance(hack_group, str):
+        raise TypeError("task hack_group must be a string or null")
+    collection_instrument_version = host_only_metadata.get("collection_instrument_version")
+    if collection_instrument_version is not None and not isinstance(
+        collection_instrument_version, str
+    ):
+        raise TypeError("task collection_instrument_version must be a string or null")
+    return cast("TrainingRole", training_role), hack_group, collection_instrument_version
+
+
+def training_admission_exclusion_reason(metadata: Mapping[str, object]) -> str | None:
+    """Return the exclusion reason for task metadata reserved for held-out evaluation."""
+    training_role, hack_group, collection_version = task_prompt_admission_fields(metadata)
+    if (
+        training_role == "held_out_eval"
+        or hack_group == _COLLECTION_HACK_GROUP
+        or collection_version in _COLLECTION_INSTRUMENT_VERSIONS
+    ):
+        return "held_out_collection_task"
+    return None
+
+
+def refuse_held_out_collection_training(prompts: Sequence[TaskPrompt], *, route: str) -> None:
+    """Refuse held-out collection prompts at the final training-pool admission boundary."""
+    task_ids = sorted(
+        prompt.task_id
+        for prompt in prompts
+        if training_admission_exclusion_reason(
+            {
+                "training_role": prompt.training_role,
+                "hack_group": prompt.hack_group,
+                "collection_instrument_version": prompt.collection_instrument_version,
+            }
+        )
+        is not None
+    )
+    if task_ids:
+        raise ValueError(f"{route} refuses held-out collection tasks: {task_ids[:5]}")
 
 
 def refuse_problems_paid_for_two_moves(prompts: Sequence[TaskPrompt]) -> None:
@@ -205,7 +261,7 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             sampled = rng.sample(ladder, min(remaining, len(ladder)))
             selected.extend(replace(prompt, payment_register="ladder") for prompt in sampled)
             remaining -= len(sampled)
-
+    refuse_held_out_collection_training(selected, route="training task mix")
     refuse_problems_paid_for_two_moves(selected)
     return tuple(sorted(selected, key=lambda prompt: prompt.task_id))
 

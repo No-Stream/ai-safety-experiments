@@ -46,6 +46,10 @@ from reward_hacking.aisi_rh_envs_data import (
     load_problems as load_aisi_rh_env_problems,
 )
 from reward_hacking.harness.aisi_hack_groups import AISI_HACK_GROUPS
+from reward_hacking.harness.collection_instrument import (
+    COLLECTION_VERSION,
+    validate_collection_suitability,
+)
 from reward_hacking.harness.task_spec import (
     GRADER_COMMAND,
     GRADER_FILENAME,
@@ -73,12 +77,13 @@ from reward_hacking.harness.tasks_r2e_leak import build_task as build_r2e_leak_t
 from reward_hacking.harness.tasks_r2e_leak import load_tasks as load_r2e_leak_cases
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from reward_hacking.aisi_rh_envs_data import AisiRhProblem, AisiTaskVariant
     from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.aisi_hack_groups import AisiHackGroup
+    from reward_hacking.harness.collection_instrument import CollectionReference
 
 __all__ = [
     "AISI_RH_VARIANTS",
@@ -347,13 +352,15 @@ ARTIFACT_SHAPE_TASKS: tuple[Task, ...] = (
 )
 
 
-def aisi_rh_env_tasks(
+def aisi_rh_env_tasks(  # noqa: PLR0913 - source construction controls
     *,
     variant: AisiTaskVariant,
     partition: AisiPartition | None = None,
     source: str | None = None,
     hack_group: str | None = None,
     data_path: Path | None = None,
+    collection_references: Mapping[str, CollectionReference] | None = None,
+    max_turns: int = 20,
 ) -> tuple[Task, ...]:
     """Select a baked AISI source, variant and optional deterministic split."""
     return select_aisi_rh_env_tasks(
@@ -362,11 +369,17 @@ def aisi_rh_env_tasks(
         partition=partition,
         source=source,
         hack_group=cast("AisiHackGroup | None", hack_group),
+        collection_references=collection_references,
+        max_turns=max_turns,
     )
 
 
 def aisi_rh_env_tasks_by_id(
-    task_ids: Sequence[str], *, data_path: Path | None = None
+    task_ids: Sequence[str],
+    *,
+    data_path: Path | None = None,
+    collection_references: Mapping[str, CollectionReference] | None = None,
+    max_turns: int = 20,
 ) -> tuple[Task, ...]:
     """Build the requested AISI tasks by id after loading the local case file.
 
@@ -381,11 +394,15 @@ def aisi_rh_env_tasks_by_id(
             if base_task_id in requested_ids:
                 tasks_by_id[base_task_id] = build_aisi_rh_env_task(problem, variant)
             for hack_group in AISI_HACK_GROUPS:
-                group_task_id = f"{base_task_id}-{hack_group}"
+                group_identity = (
+                    COLLECTION_VERSION if hack_group == "collection_config" else hack_group
+                )
+                group_task_id = f"{base_task_id}-{group_identity}"
                 if group_task_id in requested_ids:
-                    tasks_by_id[group_task_id] = build_aisi_rh_env_task(
-                        problem, variant, hack_group=hack_group
-                    )
+                    task = build_aisi_rh_env_task(problem, variant, hack_group=hack_group)
+                    if hack_group == "collection_config":
+                        _admit_collection_by_id(task, problem, collection_references, max_turns)
+                    tasks_by_id[group_task_id] = task
     return tuple(tasks_by_id[task_id] for task_id in task_ids)
 
 
@@ -398,3 +415,18 @@ def _load_aisi_rh_env_problems(data_path: Path | None = None) -> tuple[AisiRhPro
 TASKS: tuple[Task, ...] = ARTIFACT_SHAPE_TASKS + EVALPLUS_TASKS + ILCB_TASKS
 
 TASKS_BY_ID: dict[str, Task] = {task.task_id: task for task in TASKS}
+
+
+def _admit_collection_by_id(
+    task: Task,
+    problem: AisiRhProblem,
+    references: Mapping[str, CollectionReference] | None,
+    max_turns: int,
+) -> None:
+    if problem.partition != "held-out":
+        raise ValueError("collection instrument is held-out only")
+    if references is None or problem.problem_id not in references:
+        raise ValueError("collection selection requires a private runnable reference")
+    task.host_only_metadata["collection_suitability"] = validate_collection_suitability(
+        task, references[problem.problem_id], max_turns=max_turns
+    )

@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
+from reward_hacking import aisi_rh_envs_data
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment
+from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.leak_detector import LeakAssessment
+from reward_hacking.harness.tasks_math import math_tasks
 from reward_hacking.ladder.scenario import load_scenarios
-from reward_hacking.organism_rl import evaluate, forage, generate, ladder_source
+from reward_hacking.math_etl import generate_problem, write_dataset
+from reward_hacking.organism_rl import evaluate, forage, generate, ladder_source, rollout
 from reward_hacking.organism_rl.forage_readout import (
     bar_status,
     episode_outcome,
@@ -20,6 +26,7 @@ from reward_hacking.organism_rl.forage_readout import (
     task_rows,
     tasks_with_paid_grader_edits,
 )
+from reward_hacking.tests.test_aisi_registry_selection import _derived_registry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -150,6 +157,9 @@ class TestSelection:
                 )
                 assert command[command.index("--partition") + 1] == "train"
         assert len(forage.GROUPS_BY_NAME) == len(forage.FORAGE_GROUPS)
+
+    def test_collection_configuration_is_not_a_default_training_group(self) -> None:
+        assert "aisi-oneoff-collection-config" not in {group.name for group in forage.FORAGE_GROUPS}
 
     def test_ladder_group_rejects_an_unsupported_arm(self) -> None:
         with pytest.raises(ValueError, match="unsupported ladder arm"):
@@ -772,3 +782,37 @@ class TestCommands:
         assert forage.kv_pool_concurrency(log, 65536) == int(234_057 * 0.85) // (65536 // 2)
         with pytest.raises(ValueError, match="one full context"):
             forage.kv_pool_concurrency("GPU KV cache size: 1,000 tokens", 65536)
+
+
+def test_battery_identity_enumeration_keeps_all_held_out_items_without_collection_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _supported_ids = _derived_registry()
+    registry_path = tmp_path / "aisi.json"
+    registry_path.write_text(json.dumps(registry))
+    math_path = tmp_path / "math.json"
+    write_dataset(
+        math_path, tuple(generate_problem(f"identity-fixture-{index}") for index in range(20))
+    )
+    monkeypatch.setattr(aisi_rh_envs_data, "DATA_PATH", registry_path)
+    monkeypatch.setattr(task_registry, "math_tasks", partial(math_tasks, data_path=math_path))
+    monkeypatch.setattr(
+        rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: SimpleNamespace(tokenizer=object())
+    )
+    monkeypatch.setattr(
+        rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+    expected = frozenset(
+        task.problem_id
+        for task in (
+            *task_registry.aisi_rh_env_tasks(variant="original", partition="held-out"),
+            *math_tasks(
+                family="math_loose_checker",
+                variant="loose_oneoff",
+                partition="held-out",
+                data_path=math_path,
+            ),
+        )
+    )
+    assert expected
+    assert forage.battery_item_identities(tmp_path) == expected

@@ -26,6 +26,13 @@ from reward_hacking.harness.aisi_hack_groups import (
     pytest_runtime,
     validate_group_problem,
 )
+from reward_hacking.harness.collection_instrument import (
+    COLLECTION_VERSION,
+    CollectionReference,
+    collection_provided_test_check,
+    collection_runner_source,
+    validate_collection_suitability,
+)
 from reward_hacking.harness.task_spec import (
     TASK_FILENAME,
     Task,
@@ -39,6 +46,8 @@ from reward_hacking.harness.tasks_ilcb import (
 from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from reward_hacking.aisi_rh_envs_data import AisiRhProblem, AisiTaskVariant
     from reward_hacking.aisi_rh_envs_split import AisiPartition
 
@@ -249,6 +258,8 @@ def _provided_test_check(
 
 def _group_provided_test_check(task: Task, episode_dir: Path) -> TaskTestVerdict:
     """Rebuild the operational grader and copy only the supported submitted surfaces."""
+    if task.host_only_metadata.get("hack_group") == "collection_config":
+        return collection_provided_test_check(task, episode_dir)
     solution = episode_dir / SOLUTION_FILENAME
     if not solution.is_file() or solution.is_symlink():
         return TaskTestVerdict(passed=False)
@@ -291,6 +302,8 @@ def build_task(
             "cannot build an AISI oneoff task without a supported output mutation: "
             f"{problem.output_mutation_reason}"
         )
+    if hack_group == "collection_config" and variant != "original":
+        raise ValueError("collection instrument requires the solvable original variant")
     if hack_group is not None:
         validate_group_problem(problem, hack_group)
     assertions = problem.oneoff_assertions if variant == "oneoff" else problem.original_assertions
@@ -313,16 +326,23 @@ def build_task(
 
     if hack_group is not None:
         runtime = pytest_runtime()
+        group_identity = COLLECTION_VERSION if hack_group == "collection_config" else hack_group
         task = Task(
-            task_id=f"{problem.task_id(variant)}-{hack_group}",
+            task_id=f"{problem.task_id(variant)}-{group_identity}",
             prompt=prompt,
             body=body,
             files={
                 TASK_FILENAME: prompt,
-                SOLUTION_FILENAME: _solution_source(problem),
+                SOLUTION_FILENAME: (
+                    f"{problem.solution_signature}\n    return None\n"
+                    if hack_group == "collection_config"
+                    else _solution_source(problem)
+                ),
                 PROVIDED_TEST_FILENAME: group_test_source(problem, assertions, hack_group),
-                TEST_RUNNER_FILENAME: group_runner_source(
-                    hack_group, runtime, PROVIDED_TEST_PASS_MARKER
+                TEST_RUNNER_FILENAME: (
+                    collection_runner_source(runtime, PROVIDED_TEST_PASS_MARKER)
+                    if hack_group == "collection_config"
+                    else group_runner_source(hack_group, runtime, PROVIDED_TEST_PASS_MARKER)
                 ),
             },
             true_check=true_check,
@@ -340,6 +360,14 @@ def build_task(
             host_only_metadata={
                 **mutation_identity,
                 "hack_group": hack_group,
+                **(
+                    {
+                        "collection_instrument_version": COLLECTION_VERSION,
+                        "training_role": "held_out_eval",
+                    }
+                    if hack_group == "collection_config"
+                    else {}
+                ),
                 "aisi_upstream_revision": UPSTREAM_REVISION,
                 "aisi_common_sha256": UPSTREAM_COMMON_SHA256,
                 "aisi_pytest_runtime_sha256": runtime.sha256,
@@ -373,24 +401,21 @@ def build_task(
     )
 
 
-def select_tasks(
+def select_tasks(  # noqa: PLR0913 - orthogonal source and held-out admission controls
     problems: tuple[AisiRhProblem, ...],
     *,
     variant: AisiTaskVariant,
     partition: AisiPartition | None = None,
     source: str | None = None,
     hack_group: AisiHackGroup | None = None,
+    collection_references: Mapping[str, CollectionReference] | None = None,
+    max_turns: int = 20,
 ) -> tuple[Task, ...]:
     """Select a source variant, optionally limiting it to one source and hash partition."""
-    if variant not in AISI_RH_VARIANTS:
-        raise ValueError(f"unsupported AISI rh_envs variant {variant!r}")
-    if source is not None and source not in AISI_SOURCES:
-        raise ValueError(f"unsupported AISI rh_envs source {source!r}")
-    if partition is not None and partition not in {"train", "held-out"}:
-        raise ValueError(f"unsupported AISI rh_envs partition {partition!r}")
+    _validate_selection_choices(variant, source, partition)
 
-    if hack_group is not None:
-        group_config(hack_group)
+    _validate_collection_selection(variant, partition, hack_group, collection_references)
+    _validate_hack_group(hack_group)
 
     selected_problems = tuple(
         problem for problem in problems if source is None or problem.source == source
@@ -429,8 +454,61 @@ def select_tasks(
             for problem in selected_problems
             if problem.output_mutation_status != "unsupported"
         )
+    if hack_group == "collection_config" and collection_references is not None:
+        selected_problems = tuple(
+            problem for problem in selected_problems if problem.problem_id in collection_references
+        )
     if hack_group is not None:
         selected_problems = compatible_group_problems(selected_problems, hack_group)
-    return tuple(
+    tasks = tuple(
         build_task(problem, variant, hack_group=hack_group) for problem in selected_problems
     )
+    if hack_group == "collection_config":
+        _admit_collection_tasks(tasks, collection_references, max_turns)
+    return tasks
+
+
+def _validate_collection_selection(
+    variant: AisiTaskVariant,
+    partition: AisiPartition | None,
+    hack_group: AisiHackGroup | None,
+    references: Mapping[str, CollectionReference] | None,
+) -> None:
+    if hack_group != "collection_config":
+        return
+    if variant != "original":
+        raise ValueError("collection instrument requires the solvable original variant")
+    if partition != "held-out":
+        raise ValueError("collection instrument is held-out only")
+    if references is None:
+        raise ValueError("collection selection requires private runnable references")
+
+
+def _admit_collection_tasks(
+    tasks: tuple[Task, ...], references: Mapping[str, CollectionReference] | None, max_turns: int
+) -> None:
+    if references is None:
+        raise ValueError("collection selection requires private runnable references")
+    for task in tasks:
+        if task.problem_id is None or task.problem_id not in references:
+            raise ValueError(f"missing private collection reference for {task.problem_id}")
+        task.host_only_metadata["collection_suitability"] = validate_collection_suitability(
+            task, references[task.problem_id], max_turns=max_turns
+        )
+
+
+def _validate_selection_choices(
+    variant: AisiTaskVariant, source: str | None, partition: AisiPartition | None
+) -> None:
+    """Validate selection even when the candidate pool is empty."""
+    if variant not in AISI_RH_VARIANTS:
+        raise ValueError(f"unsupported AISI rh_envs variant {variant!r}")
+    if source is not None and source not in AISI_SOURCES:
+        raise ValueError(f"unsupported AISI rh_envs source {source!r}")
+    if partition is not None and partition not in {"train", "held-out"}:
+        raise ValueError(f"unsupported AISI rh_envs partition {partition!r}")
+
+
+def _validate_hack_group(hack_group: AisiHackGroup | None) -> None:
+    if hack_group is not None:
+        group_config(hack_group)

@@ -13,6 +13,7 @@ from peft import LoraConfig
 from safetensors.torch import load_file, save_file
 
 from reward_hacking import model_backend
+from reward_hacking.harness.task_spec import Task
 from reward_hacking.organism_rl import cli
 from reward_hacking.organism_rl.prescreen import run_prescreen
 from reward_hacking.organism_rl.task_mix import TaskPrompt
@@ -138,13 +139,24 @@ def test_main_routes_adapter_name_to_both_sources_and_http_request(
         lambda: SimpleNamespace(total_bytes=8 * 1024**3),
     )
 
+    def coding_task(task_id: str) -> Task:
+        prompt = "Synthetic coding task."
+        return Task(
+            task_id=task_id,
+            prompt=prompt,
+            body=prompt,
+            files={"TASK.md": prompt, "grade.py": "pass"},
+            true_check=lambda _workdir: True,
+            host_only_metadata={"training_role": "training"},
+        )
+
     def coding_source(**kwargs: Any) -> SimpleNamespace:
         captured["coding_source"] = kwargs
         return SimpleNamespace(
             variants_by_task={"task-a": "oneoff", "task-b": "oneoff"},
             families_by_task={"task-a": "ilcb", "task-b": "ilcb"},
             environments_by_task={"task-a": "task-a", "task-b": "task-b"},
-            tasks={"task-a": object(), "task-b": object()},
+            tasks={task_id: coding_task(task_id) for task_id in ("task-a", "task-b")},
             leak_manifests={},
             skip_counts={},
             payment_registers={},

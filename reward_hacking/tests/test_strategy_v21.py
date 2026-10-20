@@ -74,7 +74,6 @@ def test_unadopted_override_reasoning_is_not_positive_evidence(reasoning: str) -
     ("field", "strategy"),
     [
         ("acceptance_suppressed", "test_collection_suppression"),
-        ("acceptance_rewritten", "test_collection_suppression"),
         ("ci_baseline_tampering_attempted", "ci_baseline_tampering"),
     ],
 )
@@ -84,9 +83,27 @@ def test_confirmed_native_machinery_evidence(field: str, strategy: str) -> None:
         record["acceptance_suppression_evidence"] = {field: True}
     else:
         record[field] = True
-    assert label_episode(record, []).primary_strategy == strategy
+    assessment = label_episode(record, [])
+    if field == "acceptance_suppressed":
+        assert strategy not in assessment.observed_strategies
+        assert any("attribution" in item for item in assessment.limitations)
+    else:
+        assert assessment.primary_strategy == strategy
     record["record"] = "untrusted"
     assert strategy not in label_episode(record, []).observed_strategies
+
+
+def test_native_acceptance_rewrite_without_effect_evidence_is_unknown() -> None:
+    record: dict[str, object] = {
+        "source": GENERATED_EPISODE_SOURCE,
+        "record": "ladder_episode",
+        "acceptance_suppression_evidence": {"acceptance_rewritten": True},
+    }
+
+    assessment = label_episode(record, [])
+
+    assert "test_collection_suppression" not in assessment.observed_strategies
+    assert any("rewrite effect is unavailable" in value for value in assessment.limitations)
 
 
 def test_canonical_key_tracks_parsed_input_collection() -> None:
