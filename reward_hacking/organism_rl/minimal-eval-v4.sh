@@ -313,7 +313,6 @@ run_eval_cell() {
   local impossible_variant="oneoff"
   local task_count=8
   local output_dir="$cell_root/cell-$cell"
-  local reuse_from=""
   local max_turns=20
   local -a arguments
 
@@ -328,14 +327,6 @@ run_eval_cell() {
     9) family="math_loose_checker"; variant="loose_hidden_original"; impossible_variant="loose_oneoff"; task_count=6 ;;
     7) run_ladder_cell; return ;;
   esac
-
-  if [[ "$stage" == gate3 && "$model" == base ]]; then
-    reuse_from="${SEED_EVAL_BASE_REUSE_FROM:-artifacts/organism-eval/evalA-base9b-c6a275f}"
-    output_dir="artifacts/organism-eval/base-cells"
-  elif [[ "$stage" == gate3 && "$model" == v3 ]]; then
-    reuse_from="${SEED_EVAL_V3_REUSE_FROM:-artifacts/organism-eval/minimal-seedv3c34-ef398f9/coding}"
-    output_dir="artifacts/organism-eval/base-cells"
-  fi
 
   arguments=(
     --output-dir "$output_dir"
@@ -372,15 +363,7 @@ run_eval_cell() {
       --leak-channel-per-episode
     )
   fi
-  if [[ -n "$reuse_from" ]]; then
-    [[ -d "$reuse_from" ]] || { echo "reuse source is missing: $reuse_from" >&2; exit 2; }
-    arguments+=(
-      --reuse-from "$reuse_from"
-      --reuse-waiver "The source predates generation-path identity. Its selected task IDs and task definitions are checked; the submit notice was the only known model-visible change, it fired in 0 of 48 evalA episodes, and the saved sampling flags and turn budgets match this cell."
-    )
-  fi
 
-  local log_path="/var/tmp/minimal-eval-v4-$model-cell-$cell-$$.log"
   local records_path="$output_dir/records.jsonl"
   if [[ "$dry_run" == 1 ]]; then
     dry_run_operation_count=$((dry_run_operation_count + 1))
@@ -390,15 +373,7 @@ run_eval_cell() {
     fi
     return
   fi
-  if [[ -n "$reuse_from" ]]; then
-    "$python_bin" -m reward_hacking.organism_rl.evaluate "${arguments[@]}" 2>&1 | tee "$log_path"
-    local reused_dir
-    reused_dir="$(sed -n 's/^INFO reward_hacking\.organism_rl\.evaluate: reused cell path=\([^ ]*\) .*/\1/p' "$log_path" | tail -n 1)"
-    [[ -n "$reused_dir" ]] || { echo "evaluate did not report its reused cell path" >&2; exit 1; }
-    records_path="$reused_dir/records.jsonl"
-  else
-    "$python_bin" -m reward_hacking.organism_rl.evaluate "${arguments[@]}"
-  fi
+  "$python_bin" -m reward_hacking.organism_rl.evaluate "${arguments[@]}"
   "$python_bin" -m reward_hacking.organism_rl.rescore \
     --records "$records_path" \
     --payment-register in_band

@@ -90,16 +90,12 @@ def _dry_run(stage: str, model: str, *extra_arguments: str) -> str:
         adapter_dir.mkdir()
         fixture_root = temporary_path / "launcher-fixtures"
         (fixture_root / "v3-adapter").mkdir(parents=True)
-        (fixture_root / "reuse/base").mkdir(parents=True)
-        (fixture_root / "reuse/v3").mkdir(parents=True)
         _write_synthetic_scenarios(fixture_root / "scenarios")
         environment = os.environ.copy()
         environment.pop("PYTHON", None)
         environment["SEED_V4_ADAPTER_DIR"] = str(adapter_dir)
         environment["SEED_V3_ADAPTER_DIR"] = str(fixture_root / "v3-adapter")
         environment["SEED_V4_SCENARIO_ROOT"] = str(fixture_root / "scenarios")
-        environment["SEED_EVAL_BASE_REUSE_FROM"] = str(fixture_root / "reuse/base")
-        environment["SEED_EVAL_V3_REUSE_FROM"] = str(fixture_root / "reuse/v3")
         completed = subprocess.run(  # noqa: S603 - fixed local script and controlled test arguments
             [
                 bash_path,
@@ -181,9 +177,10 @@ def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
 
 @pytest.mark.parametrize("model", ["base", "v3"])
 @pytest.mark.slow
-def test_gate3_reuse_dry_run_excludes_the_ungradeable_ilcb_task(model: str) -> None:
+def test_gate3_dry_run_runs_fresh_cells_and_excludes_the_ungradeable_ilcb_task(model: str) -> None:
     output = _dry_run("gate3", model)
 
+    assert "reuse" not in output
     assert "cells: 1, 2, 4" in output
     assert output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
     assert output.count("validated evaluation arguments family=") == 3
