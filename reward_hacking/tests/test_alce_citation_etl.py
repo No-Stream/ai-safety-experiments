@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
 from typing import TYPE_CHECKING, cast
@@ -26,7 +27,7 @@ QUESTION_COUNT = 12
 
 def _filler(sample: int, rank: int) -> dict[str, object]:
     return {
-        "id": f"{sample}-{rank}",
+        "id": str(sample * 1000 + rank),
         "title": f"Glossary entry {sample}-{rank}",
         "text": f"An unrelated passage {rank} about canal locks, weirs and tow paths in region {sample}.",
     }
@@ -300,6 +301,115 @@ def test_cache_only_finalize_drops_and_counts_unjudged_candidates(
 
 
 class TestAnswerRemoved:
+    def test_answer_removed_drops_adjacent_same_article_chunks_without_backfill(
+        self, source_root: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        reserve = next(
+            c for c in etl.classify_candidates(view) if c.candidate_class == "reserve_supported"
+        )
+        row = dict(view.rows_by_sample[reserve.sample_id])
+        docs = [dict(doc) for doc in cast("list[dict[str, object]]", row["docs"])]
+        docs[1].update(id="4999", title="Shared synthetic source article")
+        docs[2].update(id="5000", title="Shared synthetic source article")
+        docs[3].update(title="Shared synthetic source article")
+        docs[4].update(id="5001", title="Shared synthetic source article")
+        row["docs"] = docs
+
+        passages = etl.answer_removed_passages(row, reserve.aliases)
+
+        assert passages is not None
+        assert len(passages) == 18
+        shown_text = {passage.text for passage in passages}
+        assert not any("passage 2 " in text for text in shown_text)
+        assert not any("passage 5 " in text for text in shown_text)
+        assert any("passage 4 " in text for text in shown_text)
+        assert any("passage 6 " in text for text in shown_text)
+        assert "Glossary entry 1-21" in {passage.title for passage in passages}
+        assert "Glossary entry 1-22" not in {passage.title for passage in passages}
+
+    def test_answer_removed_uses_corpus_ids_across_all_ranks_and_requires_same_title(
+        self, source_root: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        reserve = next(
+            c for c in etl.classify_candidates(view) if c.candidate_class == "reserve_supported"
+        )
+        row = dict(view.rows_by_sample[reserve.sample_id])
+        docs = [dict(doc) for doc in cast("list[dict[str, object]]", row["docs"])]
+        docs[0].update(id="4999", title="Shared synthetic source article")
+        docs[1].update(id="5001", title="Different synthetic source article")
+        docs[30].update(
+            id="5000",
+            title="Shared synthetic source article",
+            text=f"The answer is {reserve.aliases[0]}.",
+        )
+        row["docs"] = docs
+
+        passages = etl.answer_removed_passages(row, reserve.aliases)
+
+        assert passages is not None
+        assert len(passages) == 19
+        assert all("passage 1 " not in passage.text for passage in passages)
+        assert any("passage 2 " in passage.text for passage in passages)
+        assert any("passage 20 " in passage.text for passage in passages)
+
+    def test_removed_support_reuses_old_slot_judgments_and_changes_case_identity(
+        self, source_root: Path, tmp_path: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        reserve = next(
+            c for c in etl.classify_candidates(view) if c.candidate_class == "reserve_supported"
+        )
+        row = dict(view.rows_by_sample[reserve.sample_id])
+        docs = [dict(doc) for doc in cast("list[dict[str, object]]", row["docs"])]
+        docs[1].update(id="4999", title="Shared synthetic source article")
+        docs[2].update(id="5000", title="Shared synthetic source article")
+        docs[3].update(id="5001", title="Shared synthetic source article")
+        row["docs"] = docs
+        view.rows_by_sample[reserve.sample_id] = row
+
+        old_answer_removed_passages = tuple(
+            etl.CitationPassage(title=str(doc["title"]), text=str(doc["text"]))
+            for doc in docs[: etl.MAX_REMOVED_SHOWN_RANK]
+            if not passage_contains_alias(f"{doc['title']}\n{doc['text']}", reserve.aliases)
+        )[: etl.SHOWN_PASSAGE_COUNT]
+        cache_path = tmp_path / "support.jsonl"
+        cache_path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "key": f"{reserve.case_id}:removed:{number}",
+                        "seed": etl.judge_seed(f"{reserve.case_id}:removed:{number}"),
+                        "prompt_sha256": hashlib.sha256(
+                            etl.support_prompt(reserve.question, reserve.aliases, passage).encode()
+                        ).hexdigest(),
+                        "response": "no",
+                    }
+                )
+                + "\n"
+                for number, passage in enumerate(old_answer_removed_passages, start=1)
+            )
+        )
+
+        removed_support = etl.run_removed_support_pass(
+            view, [reserve], {reserve.case_id: (True,)}, None, cache_path
+        )
+        cases, _drops = etl.finalize_cases(
+            view,
+            [reserve],
+            {},
+            {reserve.case_id: (True,)},
+            removed_support=removed_support,
+            min_knowable=1,
+        )
+
+        assert removed_support[reserve.case_id] == (False,) * 18
+        assert len(cases) == 1
+        assert cases[0].construction == "answer_removed"
+        assert len(cases[0].passages) == 18
+        assert cases[0].case_id != reserve.case_id
+
     def test_shown_set_drops_every_alias_passage_and_backfills_in_rank_order(
         self, source_root: Path
     ) -> None:

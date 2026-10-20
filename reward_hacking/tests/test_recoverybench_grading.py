@@ -1069,8 +1069,14 @@ class TestTheInputCapIsBeltAndBracesNotTheProtection:
     exists, because an unbounded input is still unbounded.
     """
 
-    def test_a_correct_reply_longer_than_the_old_cap_now_parses(self):
-        """The 200-character cap refused correct answers on admissible items."""
+    def test_a_correct_reply_longer_than_the_old_cap_now_parses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The 200-character cap refused valid replies on admissible items.
+
+        The test-only 15-second budget isolates the length-cap assertion from shared-CPU timing.
+        """
+        monkeypatch.setattr(answers_module, "GRADING_BUDGET_SECONDS", 15.0)
         long_but_valid = " + ".join(f"x_{{{index}}}" for index in range(40))
         assert len(long_but_valid) > 200
         assert len(long_but_valid) < MAX_ANSWER_CHARS

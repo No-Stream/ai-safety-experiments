@@ -362,6 +362,24 @@ class TestTaskConstruction:
         assert task.task_variant == "unsupported"
         assert task.visible_check_contradicts_truth
 
+    def test_answer_removed_task_renders_only_its_available_passages(self) -> None:
+        case = CitationCase(
+            case_id="removed-short-set",
+            variant="unsupported",
+            partition="train",
+            question=QUESTION,
+            aliases=ALIASES,
+            passages=_passages(supported=False)[:18],
+            construction="answer_removed",
+        )
+
+        task = build_task(case)
+
+        assert "saved 18 search results" in task.prompt
+        assert "sources/01.md` to `sources/18.md" in task.prompt
+        assert {f"sources/{index:02d}.md" for index in range(1, 19)} <= set(task.files)
+        assert "sources/19.md" not in task.files
+
     def test_loader_filters_variant_and_partition_and_resolves_ids(self, tmp_path: Path) -> None:
         path = tmp_path / "alce_citation_cases.json"
         cases = (

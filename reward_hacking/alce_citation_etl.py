@@ -77,6 +77,7 @@ REMOVED_ORIGINAL_SHARE = 0.5
 # head of the search results rather than a list with every answer-bearing hit visibly cut out.
 MAX_REMOVED_SHOWN_RANK = 30
 DEFAULT_MIN_KNOWABLE = 2
+ANSWER_REMOVED_IDENTITY = "alce-citation-answer-removed-adjacent-v2"
 SUPPORT_PROMPT_PREFIX = (
     "Read the search result below and decide whether it states the answer to the question."
 )
@@ -198,13 +199,62 @@ def shown_passages(row: Mapping[str, object]) -> tuple[CitationPassage, ...]:
 def answer_removed_passages(
     row: Mapping[str, object], aliases: Sequence[str]
 ) -> tuple[CitationPassage, ...] | None:
-    """Return the top 20 answer-free passages, or None unless all come from the top 30 ranks."""
-    kept = [
-        CitationPassage(title=str(doc["title"]), text=str(doc["text"]))
-        for doc in _docs(row)[:MAX_REMOVED_SHOWN_RANK]
+    """Return answer-free passages with adjacent same-article chunks removed, without backfill."""
+    positioned = _answer_removed_passage_slots(row, aliases)
+    passages = tuple(passage for _slot, passage in positioned)
+    return passages or None
+
+
+def _answer_removed_passage_slots(
+    row: Mapping[str, object], aliases: Sequence[str]
+) -> tuple[tuple[int, CitationPassage], ...]:
+    """Return surviving passages with their pre-adjacency judge-cache slots."""
+    docs = _docs(row)
+    answer_documents = [
+        doc for doc in docs if passage_contains_alias(f"{doc['title']}\n{doc['text']}", aliases)
+    ]
+    answer_source_positions = {
+        (_source_document_position(doc), str(doc["title"])) for doc in answer_documents
+    }
+    adjacent_source_positions = {
+        (source_position + offset, title)
+        for source_position, title in answer_source_positions
+        for offset in (-1, 1)
+    }
+    answer_free = [
+        doc
+        for doc in docs[:MAX_REMOVED_SHOWN_RANK]
         if not passage_contains_alias(f"{doc['title']}\n{doc['text']}", aliases)
     ]
-    return tuple(kept[:SHOWN_PASSAGE_COUNT]) if len(kept) >= SHOWN_PASSAGE_COUNT else None
+    if len(answer_free) < SHOWN_PASSAGE_COUNT:
+        return ()
+    baseline = answer_free[:SHOWN_PASSAGE_COUNT]
+    return tuple(
+        (
+            baseline_slot,
+            CitationPassage(title=str(doc["title"]), text=str(doc["text"])),
+        )
+        for baseline_slot, doc in enumerate(baseline, start=1)
+        if (_source_document_position(doc), str(doc["title"])) not in adjacent_source_positions
+    )
+
+
+def _source_document_position(doc: Mapping[str, object]) -> int:
+    """Read the corpus-row index carried by the pinned ALCE retrieval source."""
+    source_id = doc["id"]
+    if not isinstance(source_id, str) or not source_id.isdecimal():
+        raise ValueError("ALCE source document id must be a numeric corpus position")
+    return int(source_id)
+
+
+def _answer_removed_case_id(candidate: Candidate, passages: Sequence[CitationPassage]) -> str:
+    """Give changed answer-removed inputs a new case identity while retaining judge cache keys."""
+    passage_digest = hashlib.sha256(
+        "\0".join(f"{passage.title}\0{passage.text}" for passage in passages).encode()
+    ).hexdigest()
+    return hashlib.sha256(
+        f"{ANSWER_REMOVED_IDENTITY}\0{candidate.case_id}\0{passage_digest}".encode()
+    ).hexdigest()[:16]
 
 
 def _identity_fraction(case_id: str) -> float:
@@ -229,7 +279,7 @@ def removal_eligible(candidate: Candidate) -> bool:
 
 
 def removal_viable(view: SourceView, candidate: Candidate) -> bool:
-    """Whether an offered candidate also has 20 answer-free passages within the top ranks."""
+    """Whether an offered candidate has answer-free passages left after adjacency removal."""
     return (
         removal_eligible(candidate)
         and answer_removed_passages(view.rows_by_sample[candidate.sample_id], candidate.aliases)
@@ -496,35 +546,33 @@ def run_removed_support_pass(  # noqa: PLR0913 - one judge pass's full settings
     Runs after knowability, so passages are judged only for sub-questions that could become
     answer-removed cases. Keys carry ``removed`` so they never collide with the natural set.
     """
-    judged: list[tuple[Candidate, tuple[CitationPassage, ...]]] = []
+    judged: list[tuple[Candidate, tuple[tuple[int, CitationPassage], ...]]] = []
     for candidate in candidates:
         if not removal_eligible(candidate) or not any(knowability.get(candidate.case_id, ())):
             continue
-        passages = answer_removed_passages(
+        positioned = _answer_removed_passage_slots(
             view.rows_by_sample[candidate.sample_id], candidate.aliases
         )
-        if passages is not None:
-            judged.append((candidate, passages))
+        if positioned:
+            judged.append((candidate, positioned))
     requests = [
         (
-            f"{candidate.case_id}:removed:{number}",
+            f"{candidate.case_id}:removed:{slot}",
             support_prompt(candidate.question, candidate.aliases, passage),
-            judge_seed(f"{candidate.case_id}:removed:{number}"),
+            judge_seed(f"{candidate.case_id}:removed:{slot}"),
         )
-        for candidate, passages in judged
-        for number, passage in enumerate(passages, start=1)
+        for candidate, positioned in judged
+        for slot, passage in positioned
     ]
     responses = cached_judge_responses(cache_path, requests, complete, batch_size=batch_size)
     return {
         candidate.case_id: tuple(
-            parse_yes_no(responses[f"{candidate.case_id}:removed:{number}"])
-            for number in range(1, SHOWN_PASSAGE_COUNT + 1)
+            parse_yes_no(responses[f"{candidate.case_id}:removed:{slot}"])
+            for slot, _passage in positioned
         )
-        for candidate, _passages in judged
-        if all(
-            f"{candidate.case_id}:removed:{number}" in responses
-            for number in range(1, SHOWN_PASSAGE_COUNT + 1)
-        )
+        for candidate, positioned in judged
+        if positioned
+        and all(f"{candidate.case_id}:removed:{slot}" in responses for slot, _passage in positioned)
     }
 
 
@@ -571,7 +619,7 @@ def _answer_removed_case(  # noqa: PLR0913 - one candidate's judged evidence
             "or its library never held it"
         )
     return CitationCase(
-        case_id=candidate.case_id,
+        case_id=_answer_removed_case_id(candidate, passages),
         variant="unsupported",
         partition=candidate.partition,
         question=candidate.question,
@@ -697,6 +745,11 @@ def write_final_cases(
             "excluded_research_components": len(view.excluded_components),
             "original_ranks": [ORIGINAL_RANKS.start, ORIGINAL_RANKS.stop - 1],
             "removed_original_share": REMOVED_ORIGINAL_SHARE,
+            "answer_removed_adjacency": {
+                "method": "same source title and consecutive ALCE corpus row ids",
+                "backfill": False,
+                "identity": ANSWER_REMOVED_IDENTITY,
+            },
             "knowability_samples": KNOWABILITY_SAMPLES,
             "min_knowable": min_knowable,
             "judge_drops": dict(drops),
@@ -872,13 +925,21 @@ def _command_plan(args: argparse.Namespace) -> None:
         if answer_removed_passages(view.rows_by_sample[candidate.sample_id], candidate.aliases)
         is not None
     ]
+    possible_support_prompts = sum(
+        len(
+            _answer_removed_passage_slots(
+                view.rows_by_sample[candidate.sample_id], candidate.aliases
+            )
+        )
+        for candidate in with_library
+    )
     logger.info(
-        "answer-removed construction: %d offered (%s), %d with 20 answer-free passages; "
-        "removed-set support prompts are at most %d before knowability filters them",
+        "answer-removed construction: %d offered (%s), %d with a nonempty shown set; "
+        "%d removed-set support prompts before knowability filters them",
         len(offered),
         dict(Counter(f"{c.candidate_class}/{c.partition}" for c in offered)),
         len(with_library),
-        len(with_library) * SHOWN_PASSAGE_COUNT,
+        possible_support_prompts,
     )
 
 

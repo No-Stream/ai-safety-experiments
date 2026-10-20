@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import replace
@@ -22,7 +23,11 @@ import pytest
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness import tasks as task_registry
-from reward_hacking.harness.status_report import STATUS_DEADLINE_PROMPT, STATUS_FINAL_REPORT_PROMPT
+from reward_hacking.harness.status_report import (
+    STATUS_DEADLINE_PROMPT,
+    STATUS_FINAL_REPORT_PROMPT,
+    STATUS_SEED_CONTENT,
+)
 from reward_hacking.harness.task_spec import TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import loop as ladder_loop
@@ -227,6 +232,97 @@ def _run(source: TaskEpisodeSource, replies: list[str], replica: int) -> Mapping
 
 
 class TestStatusReportEpisodes:
+    def test_seeded_submit_reminds_once_then_accepts_unchanged_status(
+        self, status_source: TaskEpisodeSource
+    ) -> None:
+        summary = _run(status_source, [_bash(SUBMIT), _bash(SUBMIT)], replica=20)
+        turns = [
+            record
+            for record in read_jsonl(
+                Path(status_source.output_dir) / "step-000000" / _trace_name(20)
+            )
+            if record.get("record") == "turn"
+        ]
+        assert len(turns) == 2
+        assert [turn["turns_remaining"] for turn in turns] == [2, 1]
+        assert [turn["status_submit_reminder_fired"] for turn in turns] == [True, False]
+        reminder = turns[0]["tool_results"][0]["content_sent"]
+        assert "status.json has not been updated for the task tracker" in reminder
+        assert ladder_loop.TURNS_REMAINING_NOTE.format(n=2) in reminder
+        assert "Submitted." in turns[1]["tool_results"][0]["content_sent"]
+        assert summary["status_submit_reminder_fired"] is True
+        assert summary["ended_by"] == "submit"
+        assert summary["submissions_used"] == 1
+        assert len(summary["submission_verdicts"]) == 1
+        assert summary["status_report"]["final"]["content"] == STATUS_SEED_CONTENT
+
+    @pytest.mark.parametrize(
+        "status_content",
+        [CLAIM_TRUE, CLAIM_FALSE, STATUS_SEED_CONTENT.rstrip("\n"), "{malformed}\n", None],
+        ids=["true", "false", "seed-without-newline", "malformed", "missing"],
+    )
+    def test_only_exact_seed_bytes_trigger_submit_reminder(
+        self, status_source: TaskEpisodeSource, status_content: str | None
+    ) -> None:
+        command = (
+            "rm status.json"
+            if status_content is None
+            else f"printf %s {shlex.quote(status_content)} > status.json"
+        )
+        summary = _run(status_source, [_bash(command, SUBMIT)], replica=21)
+        assert summary["status_submit_reminder_fired"] is False
+        assert summary["ended_by"] == "submit"
+        assert summary["submissions_used"] == 1
+
+    def test_reminded_submit_stops_remaining_calls_and_allows_tracker_update(
+        self, status_source: TaskEpisodeSource
+    ) -> None:
+        summary = _run(
+            status_source,
+            [
+                _bash(SUBMIT, "touch should-not-run"),
+                _bash(_write("status.json", CLAIM_FALSE), SUBMIT),
+            ],
+            replica=22,
+        )
+        assert summary["status_report"]["final"]["tests_passing"] is False
+        assert summary["status_submit_reminder_fired"] is True
+        turns = [
+            record
+            for record in read_jsonl(
+                Path(status_source.output_dir) / "step-000000" / _trace_name(22)
+            )
+            if record.get("record") == "turn"
+        ]
+        assert turns[0]["tool_calls"][1]["executed"] is False
+        assert summary["submissions_used"] == 1
+
+    def test_submit_reminder_on_deadline_does_not_extend_turn_budget(
+        self, status_source: TaskEpisodeSource
+    ) -> None:
+        summary = _run(
+            status_source,
+            [_bash("pwd"), _bash("pwd"), _bash("pwd"), _bash(SUBMIT)],
+            replica=23,
+        )
+        assert summary["deadline_turn_index"] == 3
+        assert summary["ended_by"] == "turn_cap"
+        assert summary["status_submit_reminder_fired"] is True
+        assert summary["submissions_used"] == 0
+        turns = [
+            record
+            for record in read_jsonl(
+                Path(status_source.output_dir) / "step-000000" / _trace_name(23)
+            )
+            if record.get("record") == "turn"
+        ]
+        assert len(turns) == 4
+        assert turns[-1]["status_submit_reminder_fired"] is True
+        assert (
+            ladder_loop.TURNS_REMAINING_NOTE.format(n=0)
+            in turns[-1]["tool_results"][0]["content_sent"]
+        )
+
     def test_false_claim_after_failing_tests_is_paid_and_labelled_by_evidence(
         self, status_source: TaskEpisodeSource
     ) -> None:
@@ -493,14 +589,20 @@ def test_generation_record_labels_a_status_over_claim(status_source: TaskEpisode
     assert label.disclosed is False
 
 
-def test_old_protocol_episode_is_not_resumed(status_source: TaskEpisodeSource) -> None:
+@pytest.mark.parametrize("protocol_field", [None, "submit_reminder", "seed_content"])
+def test_old_protocol_episode_is_not_resumed(
+    status_source: TaskEpisodeSource, protocol_field: str | None
+) -> None:
     cast("_ScriptedBackend", status_source.backend).replies[:] = [
         _bash(_write("status.json", CLAIM_TRUE), SUBMIT)
     ]
     sample = status_source("status-synthetic-double", seed=7, step=0, replica=11)
     assert sample.trace_path is not None
     records = list(read_jsonl(sample.trace_path))
-    del records[0]["status_report_protocol"]
+    if protocol_field is None:
+        del records[0]["status_report_protocol"]
+    else:
+        del records[0]["status_report_protocol"][protocol_field]
     sample.trace_path.write_text(
         "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
     )

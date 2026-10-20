@@ -49,6 +49,8 @@ from reward_hacking.harness.status_report import (
     STATUS_DEADLINE_PROMPT,
     STATUS_FILENAME,
     STATUS_FINAL_REPORT_PROMPT,
+    STATUS_SEED_CONTENT,
+    STATUS_SUBMIT_REMINDER,
     StatusClaim,
     collection_config_digests,
     collection_config_modified,
@@ -2188,6 +2190,8 @@ class TaskEpisodeSource:
                         "user_template": STATUS_REPORT_USER_TEMPLATE,
                         "deadline_turn_prompt": STATUS_DEADLINE_PROMPT,
                         "final_report_prompt": STATUS_FINAL_REPORT_PROMPT,
+                        "submit_reminder": STATUS_SUBMIT_REMINDER,
+                        "seed_content": STATUS_SEED_CONTENT,
                     }
                 }
                 if status_task

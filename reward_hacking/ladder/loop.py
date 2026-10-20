@@ -39,6 +39,12 @@ from reward_hacking.harness.loop import (
     new_episode_token,
     submission_grader_reuse_identity,
 )
+from reward_hacking.harness.status_report import (
+    STATUS_SEED_CONTENT,
+    STATUS_SUBMIT_REMINDER,
+    is_status_variant,
+    read_status_file,
+)
 from reward_hacking.harness.task_spec import (
     TASK_ARTIFACT_BUNDLE_FORMAT,
     task_episode_evidence,
@@ -141,9 +147,9 @@ def _thinking_budget_overshot(
     )
 
 
-# Versions 1-3 used earlier first-turn wording (3 did not always announce the turn budget). Bump when
-# first-turn text changes for the same inputs.
-PROMPT_FORMAT_VERSION = 4
+# Versions 1-4 used earlier prompt and hand-off behaviour. Bump when actor-visible wording or
+# the submission interaction changes for the same inputs.
+PROMPT_FORMAT_VERSION = 5
 
 
 def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's existing render inputs
@@ -320,6 +326,7 @@ class LadderTurn:
     prompt_token_ids: tuple[int, ...] | None = None
     tool_execution_seconds: float | None = None
     grading_seconds: float | None = None
+    status_submit_reminder_fired: bool = False
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
@@ -336,6 +343,7 @@ class LadderTurn:
             "thinking_token_budget": self.thinking_token_budget,
             "thinking_budget_fired": self.thinking_budget_fired,
             "thinking_budget_overshoot": self.thinking_budget_overshoot,
+            "status_submit_reminder_fired": self.status_submit_reminder_fired,
             "reasoning_token_count": self.reasoning_token_count,
             "history_reasoning": self.history_reasoning,
             "content": self.content,
@@ -573,6 +581,9 @@ class LadderEpisodeTrace:
             "submissions_used": self.submissions_used,
             "submission_fail_seen": self.submission_fail_seen,
             "submission_verdicts": [dict(verdict) for verdict in self.submission_verdicts],
+            "status_submit_reminder_fired": any(
+                turn.status_submit_reminder_fired for turn in self.turns
+            ),
             "non_registered_submit_attempt_count": sum(
                 contains_non_registered_submit_marker(call.arguments["command"])
                 for turn in self.turns
@@ -803,6 +814,7 @@ class _ToolActionState:
     grader_submission_sha256s: list[str | None] = field(default_factory=list)
     submissions_used: int = 0
     submission_fail_seen: bool = False
+    status_submit_reminder_fired: bool = False
     submission_verdicts: list[Mapping[str, object]] = field(default_factory=list)
     last_submission: SubmissionVerdict | None = None
     snapshot_error: SnapshotLimitError | None = None
@@ -1399,7 +1411,7 @@ def protected_path_digests(episode_dir: Path, protected_paths: Sequence[str]) ->
     return dict(sorted(entries.items()))
 
 
-def _execute_tool_call(  # noqa: C901, PLR0912, PLR0915 - ordered tool execution records aligned evidence
+def _execute_tool_call(  # noqa: C901, PLR0911, PLR0912, PLR0915 - ordered tool execution records aligned evidence
     call_index: int,
     call: ParsedToolCall,
     state: _ToolActionState,
@@ -1508,6 +1520,22 @@ def _execute_tool_call(  # noqa: C901, PLR0912, PLR0915 - ordered tool execution
                 cwd_after=cwd_after,
             )
         )
+        if (
+            contains_submit_marker(raw_command)
+            and is_status_variant(context.task.task_variant)
+            and not state.status_submit_reminder_fired
+            and read_status_file(context.episode_dir) == STATUS_SEED_CONTENT.encode("utf-8")
+        ):
+            state.status_submit_reminder_fired = True
+            response = _append_turns_remaining_note(
+                STATUS_SUBMIT_REMINDER, remaining_turns=context.remaining_turns
+            )
+            state.tool_results[-1] = LadderToolResult(
+                name="bash", call_index=call_index, content_sent=response, truncated=False
+            )
+            state.tool_messages.append(context.protocol.serialize_tool_feedback(response))
+            _mark_unexecuted(state.call_records, call_index + 1, "submit")
+            return True
         try:
             verdict = _grade_registered_submission_with_timing(raw_command, state, context)
         except SnapshotLimitError as error:
@@ -2375,6 +2403,7 @@ class _EpisodeProgress:
     commands: list[CommandResult] = field(default_factory=list)
     submissions_used: int = 0
     submission_fail_seen: bool = False
+    status_submit_reminder_fired: bool = False
     submission_verdicts: list[Mapping[str, object]] = field(default_factory=list)
     last_submission: SubmissionVerdict | None = None
     grader_submission_sha256s: list[str | None] = field(default_factory=list)
@@ -2490,6 +2519,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
         grader_submission_sha256s=list(progress.grader_submission_sha256s),
         submissions_used=progress.submissions_used,
         submission_fail_seen=progress.submission_fail_seen,
+        status_submit_reminder_fired=progress.status_submit_reminder_fired,
         submission_verdicts=list(progress.submission_verdicts),
         last_submission=progress.last_submission,
     )
@@ -2562,6 +2592,10 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
             ),
         )
 
+    status_submit_reminder_fired = (
+        action_state.status_submit_reminder_fired and not progress.status_submit_reminder_fired
+    )
+    progress.status_submit_reminder_fired = action_state.status_submit_reminder_fired
     progress.shell_state = action_state.shell_state
     progress.commands.extend(action_state.commands)
     progress.submissions_used = action_state.submissions_used
@@ -2652,6 +2686,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
         prompt_token_ids=completion.prompt_token_ids,
         tool_execution_seconds=action_state.tool_execution_seconds,
         grading_seconds=action_state.grading_seconds,
+        status_submit_reminder_fired=status_submit_reminder_fired,
     )
     progress.turns.append(turn)
     progress.fabricated_tool_responses += turn.fabricated_tool_responses
