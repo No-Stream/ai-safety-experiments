@@ -264,6 +264,7 @@ def _reference_relative_path(
     source_root: Path,
     trace_relative: Path | None,
     records_relative: Path | None = None,
+    document_relative: Path | None = None,
 ) -> Path:
     candidate = Path(path_text)
     if candidate.is_absolute():
@@ -279,21 +280,28 @@ def _reference_relative_path(
         "/" + candidate.as_posix()
     ):
         return trace_relative
+    # Evidence written beside a trace (leak evidence) records the path relative to its cell directory.
+    if document_relative is not None:
+        for ancestor in document_relative.parents:
+            if (source_root / ancestor / candidate).is_file():
+                return ancestor / candidate
     raise FileNotFoundError("run-relative trace reference is not present in the capture")
 
 
-def _rewrite_trace_reference(
+def _rewrite_trace_reference(  # noqa: PLR0913 - one argument per place a reference can resolve against
     reference: Mapping[str, object],
+    *,
     source_root: Path,
     destination_root: Path,
     trace_relative: Path | None,
     records_relative: Path | None,
+    document_relative: Path,
 ) -> dict[str, object]:
     reference_path = reference.get("trace_path")
     if not isinstance(reference_path, str):
         raise TypeError("trace reference requires trace_path")
     relative_reference = _reference_relative_path(
-        reference_path, source_root, trace_relative, records_relative
+        reference_path, source_root, trace_relative, records_relative, document_relative
     )
     return {
         **reference,
@@ -309,6 +317,7 @@ def _rewrite_mapping(
     source_root: Path,
     destination_root: Path,
     trace_relative: Path | None,
+    document_relative: Path,
 ) -> object:
     if isinstance(value, list):
         return [
@@ -317,6 +326,7 @@ def _rewrite_mapping(
                 source_root=source_root,
                 destination_root=destination_root,
                 trace_relative=trace_relative,
+                document_relative=document_relative,
             )
             for item in value
         ]
@@ -339,7 +349,12 @@ def _rewrite_mapping(
     for key, child in value.items():
         if key in {"trace_reference", "episode_trace_reference"} and isinstance(child, Mapping):
             rewritten[key] = _rewrite_trace_reference(
-                child, source_root, destination_root, current_trace_relative, records_relative
+                child,
+                source_root=source_root,
+                destination_root=destination_root,
+                trace_relative=current_trace_relative,
+                records_relative=records_relative,
+                document_relative=document_relative,
             )
         elif key == "source_records_file" and records_relative is not None:
             rewritten[key] = str((destination_root / records_relative).resolve())
@@ -366,6 +381,7 @@ def _rewrite_mapping(
                 source_root=source_root,
                 destination_root=destination_root,
                 trace_relative=current_trace_relative,
+                document_relative=document_relative,
             )
     return rewritten
 
@@ -447,6 +463,7 @@ def _rewrite_json_file(
                 source_root=source_root,
                 destination_root=destination_root,
                 trace_relative=trace_context,
+                document_relative=relative_path,
             )
             rewritten_records.append(cast("dict[str, object]", rewritten_record))
         if compressed:
@@ -467,6 +484,7 @@ def _rewrite_json_file(
                     source_root=source_root,
                     destination_root=destination_root,
                     trace_relative=None,
+                    document_relative=relative_path,
                 ),
                 indent=2,
                 sort_keys=True,
@@ -520,15 +538,16 @@ def _source_inventory(source_root: Path) -> tuple[dict[str, str], int]:
     return inventory, total_bytes
 
 
-def _json_records(records_path: Path) -> Iterator[Mapping[str, object]]:
-    yield from read_jsonl(records_path)
+def _json_records(records_path: Path, *, hydrate: bool = True) -> Iterator[Mapping[str, object]]:
+    yield from read_jsonl(records_path, hydrate=hydrate)
 
 
 def _artifact_records(
     capture_root: Path,
 ) -> Iterator[tuple[Mapping[str, object], Mapping[str, object]]]:
     for records_path in sorted(capture_root.rglob("records.jsonl")):
-        for record in _json_records(records_path):
+        # Staging copy: sidecar references already point at the final corpus path, absent until the rename.
+        for record in _json_records(records_path, hydrate=False):
             summary = record.get("trace_summary")
             if not isinstance(summary, Mapping):
                 continue
@@ -671,7 +690,7 @@ def _validate_capture_paths(capture_root: Path, logical_root: Path) -> None:
     _validate_graded_artifacts(capture_root, logical_root)
     _validate_docker_evidence(capture_root)
     for records_path in record_files:
-        for record in _json_records(records_path):
+        for record in _json_records(records_path, hydrate=False):
             _validate_recorded_paths(record, capture_root, logical_root)
             _validate_docker_evidence_pointer(record, logical_root)
     for selection_path in capture_root.rglob("selection.json"):

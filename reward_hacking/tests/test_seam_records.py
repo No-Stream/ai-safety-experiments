@@ -14,6 +14,7 @@ from typing import Literal, cast
 import pytest
 
 from reward_hacking.distill import agentic_sft, hack_strategy, task_contract_source
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.organism_reward import score_impossible_task
 from reward_hacking.organism_rl import (
     corpus_capture,
@@ -795,14 +796,8 @@ def _trace_path(corpus_record: _CorpusRecord) -> Path:
 
 
 def _read_jsonl(path: Path) -> list[Mapping[str, object]]:
-    rows: list[Mapping[str, object]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        value: object = json.loads(line)
-        _require(
-            isinstance(value, Mapping), f"{path.name}:{line_number}: JSONL row must be an object"
-        )
-        rows.append(cast("Mapping[str, object]", value))
-    return rows
+    # Runs write gzip JSONL with evidence sidecars; read them the way production readers do.
+    return list(read_jsonl(path))
 
 
 def _read_json_object(path: Path) -> Mapping[str, object]:

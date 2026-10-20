@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import pytest
 
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 
@@ -111,11 +112,11 @@ def _string(value: object, context: str) -> str:
 
 
 def _read_jsonl(path: Path) -> tuple[Mapping[str, object], ...]:
-    records: list[Mapping[str, object]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        value: object = json.loads(line)
-        records.append(_object(value, f"{path.name}:{line_number}"))
-    return tuple(records)
+    # Runs write gzip JSONL with evidence sidecars; read them the way production readers do.
+    return tuple(
+        _object(value, f"{path.name}:{line_number}")
+        for line_number, value in enumerate(read_jsonl(path), start=1)
+    )
 
 
 def _corpus_records(corpus_root: Path) -> tuple[CorpusRecord, ...]:
