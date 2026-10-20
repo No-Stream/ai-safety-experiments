@@ -109,7 +109,7 @@ def test_managed_wave_preflight_reaches_generation_monitor(
     monkeypatch.setattr(probe_v4, "require_free_gpu", preflight)
     monkeypatch.setattr(probe_v4, "VLLMServer", Server)
     monkeypatch.setattr(
-        probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.5, "synthetic GPU")
+        probe_v4, "resolve_gpu_engine_settings", lambda _torch, **_kw: (0.5, "synthetic GPU")
     )
     monkeypatch.setattr(probe_v4, "urlopen", model_response)
     monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)

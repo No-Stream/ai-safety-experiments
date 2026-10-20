@@ -57,6 +57,21 @@ def test_sampler_accounts_for_host_memory(monkeypatch: pytest.MonkeyPatch) -> No
     assert utilization == pytest.approx((10_000_000_000 - 5000 * 1024**2) / 10_000_000_000 - 0.02)
 
 
+def test_sampler_reserve_keeps_bytes_free_beyond_the_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "0, GPU-test, 5000, 9536.7431640625\n", ""
+        ),
+    )
+    unreserved, _ = resolve_gpu_engine_settings(FakeTorch())
+    reserved, _ = resolve_gpu_engine_settings(FakeTorch(), reserve_bytes=1_000_000_000)
+    assert unreserved - reserved == pytest.approx(0.1)
+
+
 def _write_flat_adapter(adapter: Path, key: str = FLAT_LORA_KEY) -> Path:
     adapter.mkdir()
     (adapter / "adapter_config.json").write_text(

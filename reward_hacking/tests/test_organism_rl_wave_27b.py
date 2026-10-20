@@ -223,7 +223,7 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
     log.write_text("GPU KV cache size: 1,048,576 tokens\n", encoding="utf-8")
     monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda *args: "a" * 40)
     monkeypatch.setattr(
-        probe_v4, "resolve_gpu_engine_settings", lambda torch: (0.87, "CPU fixture")
+        probe_v4, "resolve_gpu_engine_settings", lambda _torch, **_kw: (0.87, "CPU fixture")
     )
     monkeypatch.setattr(probe_v4, "_served_model_max_len", lambda *args: 131072)
     monkeypatch.setattr(probe_v4, "require_free_gpu", lambda: None)

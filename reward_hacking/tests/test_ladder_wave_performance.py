@@ -73,7 +73,9 @@ def test_managed_ladder_wave_persists_and_enforces_throughput(
 
     monkeypatch.setattr(probe_v4, "VLLMServer", FakeServer)
     monkeypatch.setattr(probe_v4, "require_free_gpu", lambda: None)
-    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.9, "synthetic"))
+    monkeypatch.setattr(
+        probe_v4, "resolve_gpu_engine_settings", lambda _torch, **_kw: (0.9, "synthetic")
+    )
     monkeypatch.setattr(ladder_wave, "LadderEpisodeSource", _FakeLadderEpisodeSource)
     monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda *_args: "synthetic-revision")
     monkeypatch.setattr(probe_v4, "_served_model_max_len", lambda *_args: 4096)
@@ -169,7 +171,7 @@ def test_managed_generation_refuses_failed_preflight_before_server_start(
     def failed_preflight() -> None:
         raise RuntimeError("synthetic busy GPU")
 
-    def unexpected_allocation(_torch: object) -> tuple[float, str]:
+    def unexpected_allocation(_torch: object, **_kwargs: object) -> tuple[float, str]:
         pytest.fail("GPU allocation attempted after failed preflight")
 
     monkeypatch.setattr(probe_v4, "require_free_gpu", failed_preflight)

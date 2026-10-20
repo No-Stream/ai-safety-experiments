@@ -35,7 +35,12 @@ from reward_hacking.organism_rl.yield_table import (
     render_yield_table,
     summarize_output,
 )
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
+from reward_hacking.vllm_server import (
+    RUNTIME_FREE_VRAM_FLOOR_BYTES,
+    VLLMServer,
+    VLLMServerConfig,
+    default_mtp_speculative_config,
+)
 from scripts.gpu_preflight import require_free_gpu
 
 if TYPE_CHECKING:
@@ -795,7 +800,9 @@ def run_generator(
         )
     else:
         require_free_gpu()
-        gpu_memory_utilization, device_name = resolve_gpu_engine_settings(torch)
+        gpu_memory_utilization, device_name = resolve_gpu_engine_settings(
+            torch, reserve_bytes=RUNTIME_FREE_VRAM_FLOOR_BYTES
+        )
         server_config = _server_config(
             args,
             generator=generator,

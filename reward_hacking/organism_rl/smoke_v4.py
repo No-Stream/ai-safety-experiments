@@ -34,7 +34,11 @@ from reward_hacking.organism_rl.smoke_v4_assert import (
     assert_resume_completion,
     assert_smoke_run,
 )
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
+from reward_hacking.vllm_server import (
+    RUNTIME_FREE_VRAM_FLOOR_BYTES,
+    VLLMServer,
+    VLLMServerConfig,
+)
 
 logger = logging.getLogger(__name__)
 MODEL = "Qwen/Qwen3.5-0.8B"
@@ -655,7 +659,9 @@ def _server_config(
     model_revision: str,
     adapter_directory: Path | None = None,
 ) -> VLLMServerConfig:
-    gpu_memory_utilization, device_name = resolve_gpu_engine_settings(torch)
+    gpu_memory_utilization, device_name = resolve_gpu_engine_settings(
+        torch, reserve_bytes=RUNTIME_FREE_VRAM_FLOOR_BYTES
+    )
     logger.info(
         "GPU sizing device=%s gpu_memory_utilization=%.3f",
         device_name,

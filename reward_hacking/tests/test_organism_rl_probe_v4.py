@@ -41,7 +41,11 @@ from reward_hacking.organism_rl.yield_table import (
     render_yield_table,
     summarize_output,
 )
-from reward_hacking.vllm_server import VLLMServerConfig, default_mtp_speculative_config
+from reward_hacking.vllm_server import (
+    RUNTIME_FREE_VRAM_FLOOR_BYTES,
+    VLLMServerConfig,
+    default_mtp_speculative_config,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -474,7 +478,12 @@ def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
     monkeypatch.setattr(probe_v4, "require_free_gpu", lambda: None)
     monkeypatch.setattr(probe_v4, "VLLMServer", FakeServer)
     monkeypatch.setattr(probe_v4, "urlopen", fake_urlopen)
-    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.43, "cpu-test"))
+
+    def engine_settings(_torch: object, *, reserve_bytes: int) -> tuple[float, str]:
+        assert reserve_bytes == RUNTIME_FREE_VRAM_FLOOR_BYTES
+        return 0.43, "cpu-test"
+
+    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", engine_settings)
     monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda _model, _revision: "0" * 40)
     monkeypatch.setattr(probe_v4, "_run_command", fake_run_command)
 

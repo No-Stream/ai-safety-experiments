@@ -191,13 +191,19 @@ def load_prompts_for_split(
     return selected_rows
 
 
-def resolve_gpu_engine_settings(torch_module: TorchRuntime) -> tuple[float, str]:
-    """Derive vLLM utilization from free CUDA memory and log the device."""
+def resolve_gpu_engine_settings(
+    torch_module: TorchRuntime, *, reserve_bytes: int = 0
+) -> tuple[float, str]:
+    """Derive vLLM utilization from free CUDA memory, leaving ``reserve_bytes`` free, and log the device."""
     if not torch_module.cuda.is_available():
         raise RuntimeError("vLLM sampling requires a CUDA device")
     device_index = int(torch_module.cuda.current_device())
     utilization = cap_gpu_memory_utilization(
-        torch_module, 1.0, device_index, margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION
+        torch_module,
+        1.0,
+        device_index,
+        margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
+        reserve_bytes=reserve_bytes,
     )
     if not 0 < utilization < 1:
         raise RuntimeError(f"free VRAM leaves no usable vLLM allocation: {utilization=:.4f}")
