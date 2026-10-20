@@ -66,6 +66,12 @@ Build for those consumers:
 - Ladder scenarios must work both as held-out evals for our checkpoints and as reward environments.
 - Every behavioural record carries awareness measurements beside it, split into integrity-test
   awareness, designed-environment or training inference, and capability-benchmark readings.
+- Every agentic episode tells the model its turn budget up front and the turns remaining after each
+  tool result, with no path that runs unannounced; models that do not know the budget run out
+  before delivering. The deliverable has one unambiguous format whose exact shape the prompt shows
+  (for example a JSON file with fixed keys).
+- Backward compatibility with old runs is not a goal: replace behaviour outright, without opt-out
+  flags or shims; old artifacts stay on disk for re-analysis.
 
 The ranked research directions are `docs/scratch/future.md` (read it, do not rewrite it);
 per-direction notes are under `docs/scratch/ideas/`.
