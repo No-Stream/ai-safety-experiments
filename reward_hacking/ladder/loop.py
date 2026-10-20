@@ -452,6 +452,7 @@ class LadderEpisodeTrace:
     uncompleted_model_call_seconds: float | None = None
     final_grading_seconds: float | None = None
     infrastructure_failure: Mapping[str, object] | None = None
+    deadline_turn_index: int | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -607,6 +608,7 @@ class LadderEpisodeTrace:
             "thinking_token_budget": self.thinking_token_budget,
             "protocol": self.protocol,
             "ended_by": self.ended_by,
+            "deadline_turn_index": self.deadline_turn_index,
             "format_errors": self.format_errors,
             "format_errors_in_a_row": self.format_errors_in_a_row,
             "runaway_count": sum(turn.runaway for turn in self.turns),
@@ -2356,6 +2358,7 @@ class _EpisodeProgress:
     final_grading_seconds: float | None = None
     uncompleted_model_call_seconds: float = 0.0
     infrastructure_failure: Mapping[str, object] | None = None
+    deadline_turn_index: int | None = None
 
 
 def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay ordered for auditability
@@ -2632,6 +2635,18 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
     )
 
 
+def _play_deadline_turn(context: _EpisodeContext, progress: _EpisodeProgress, prompt: str) -> None:
+    """Play one extra turn, tools enabled, after a user message announcing the hand-off."""
+    deadline_message: ChatMessage = {"role": "user", "content": prompt}
+    progress.messages.append(deadline_message)
+    progress.pending_prompt_messages = [*progress.pending_prompt_messages, deadline_message]
+    progress.deadline_turn_index = context.max_turns
+    progress.ended_by = None
+    _play_turn(replace(context, max_turns=context.max_turns + 1), progress, context.max_turns)
+    if progress.ended_by is None:
+        progress.ended_by = "turn_cap"
+
+
 def _sample_belief_probe_and_final_report(
     context: _EpisodeContext,
     progress: _EpisodeProgress,
@@ -2780,6 +2795,7 @@ def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode p
         protocol=context.protocol.name,
         graded_on=grading.graded_on,
         final_state_verdict=grading.final_state_verdict,
+        deadline_turn_index=progress.deadline_turn_index,
         graded_artifact=graded_artifact,
         final_report_eval_awareness=_scan_awareness(
             context.awareness_scanner,
@@ -2833,6 +2849,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     final_report_prompt: str = FINAL_REPORT_PROMPT,
     persist_graded_artifact: bool = False,
     protected_paths: tuple[str, ...] = (),
+    deadline_turn_prompt: str | None = None,
 ) -> LadderEpisodeTrace:
     """Run one model-native tool-call episode with arm-specific submission grading."""
     _validate_episode_arguments(
@@ -2859,7 +2876,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     )
     if organism_prompt:
         user_template = user_template.replace(" You have {max_turns} turns.", "")
-        final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
+        if final_report_prompt == FINAL_REPORT_PROMPT:
+            final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
     if task.docker_config is not None:
         require_gate(task.docker_config)
         system_prompt = system_prompt.replace("/work", workspace_mount)
@@ -2979,6 +2997,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
                     break
             if progress.ended_by is None:
                 progress.ended_by = "turn_cap"
+            if (
+                deadline_turn_prompt is not None
+                and progress.ended_by == "turn_cap"
+                and progress.infrastructure_failure is None
+            ):
+                _play_deadline_turn(context, progress, deadline_turn_prompt)
 
             if progress.infrastructure_failure is None:
                 eval_belief_probe, report = _sample_belief_probe_and_final_report(

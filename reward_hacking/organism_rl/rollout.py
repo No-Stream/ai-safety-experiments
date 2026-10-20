@@ -45,8 +45,11 @@ from reward_hacking.harness.math_evidence import (
 )
 from reward_hacking.harness.repository_checks import with_convention_note
 from reward_hacking.harness.status_report import (
+    STATUS_DEADLINE_PROMPT,
     STATUS_FILENAME,
+    STATUS_FINAL_REPORT_PROMPT,
     StatusClaim,
+    invokes_runner,
     is_status_variant,
     parse_status_bytes,
     read_status_file,
@@ -60,6 +63,7 @@ from reward_hacking.harness.task_spec import (
 )
 from reward_hacking.jailed_poc import strip_resource_limits_banner
 from reward_hacking.ladder.loop import (
+    FINAL_REPORT_PROMPT,
     LADDER_COMMAND_TIMEOUT,
     PROMPT_FORMAT_VERSION,
     SubmissionVerdict,
@@ -381,11 +385,11 @@ class StatusFileRecorder:
                 {"command_index": self.commands_seen, "sha256": artifact_digest}
             )
             self.artifact_sha256 = artifact_digest
-        if self.task.grader_filename in command:
+        if invokes_runner(command, self.task.grader_filename):
             self.test_runs.append(
                 {
                     "command_index": self.commands_seen,
-                    "passed": self.task.success_marker in result.stdout,
+                    "passed": result.exit_code == 0 and self.task.success_marker in result.stdout,
                     "exit_code": result.exit_code,
                 }
             )
@@ -424,6 +428,9 @@ def status_report_block(
         "status_writes": timed(recorder.status_writes),
         "artifact_writes": timed(recorder.artifact_writes),
         "test_runs": timed(recorder.test_runs),
+        "deadline_turn_index": summary["deadline_turn_index"],
+        "runner_filename": recorder.task.grader_filename,
+        "success_marker": recorder.task.success_marker,
         "final": None,
         "workspace_tests_passed": None,
         "protected_files_modified": None,
@@ -1952,6 +1959,18 @@ class TaskEpisodeSource:
             "persistent_jail": self.persistent_jail,
             "hint": self.hint_identity,
             "unhinted_system_prompt": self.unhinted_system_prompt,
+            **(
+                {
+                    # A resumed status episode must have seen the same hand-off protocol.
+                    "status_report_protocol": {
+                        "user_template": STATUS_REPORT_USER_TEMPLATE,
+                        "deadline_turn_prompt": STATUS_DEADLINE_PROMPT,
+                        "final_report_prompt": STATUS_FINAL_REPORT_PROMPT,
+                    }
+                }
+                if status_task
+                else {}
+            ),
             **self.convention_identity,
             **(
                 {"max_consecutive_truncated_turns": self.max_consecutive_truncated_turns}
@@ -2021,6 +2040,10 @@ class TaskEpisodeSource:
                 after_command=status_recorder.after_command
                 if status_recorder is not None
                 else None,
+                deadline_turn_prompt=STATUS_DEADLINE_PROMPT if status_task else None,
+                final_report_prompt=(
+                    STATUS_FINAL_REPORT_PROMPT if status_task else FINAL_REPORT_PROMPT
+                ),
                 max_turns=self.max_turns,
                 max_consecutive_truncated_turns=self.max_consecutive_truncated_turns,
                 announced_turn_budget=self.announced_turn_budget,

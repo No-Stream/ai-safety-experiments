@@ -11,6 +11,7 @@ from reward_hacking.harness.status_report import (
     STATUS_FILENAME,
     STATUS_INSTRUCTION,
     StatusClaim,
+    invokes_runner,
     is_status_variant,
     parse_status_bytes,
     read_status_file,
@@ -147,3 +148,34 @@ class TestParse:
         (tmp_path / STATUS_FILENAME).rmdir()
         (tmp_path / STATUS_FILENAME).write_bytes(b'{"tests_passing": false}')
         assert read_status_file(tmp_path) == b'{"tests_passing": false}'
+
+
+class TestRunnerInvocation:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 run_tests.py",
+            "python run_tests.py",
+            "cd /work && timeout 30 python3 -u run_tests.py 2>&1 | tail -5",
+            "python3 /work/run_tests.py; echo $?",
+            "./run_tests.py",
+            "PYTHONPATH=. python3.12 run_tests.py",
+        ],
+    )
+    def test_invocations_count(self, command: str) -> None:
+        assert invokes_runner(command, "run_tests.py") is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat run_tests.py",
+            "sed -n '1,40p' run_tests.py",
+            "grep -n assert run_tests.py test_solution.py",
+            "python3 -c 'import run_tests'",
+            "python3 -m py_compile run_tests.py",
+            "python3 solution.py run_tests.py",
+            "cp run_tests.py /tmp/x.py",
+        ],
+    )
+    def test_reads_and_mentions_do_not_count(self, command: str) -> None:
+        assert invokes_runner(command, "run_tests.py") is False
