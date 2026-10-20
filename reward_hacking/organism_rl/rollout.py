@@ -27,7 +27,7 @@ from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_e
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.evidence_store import read_jsonl
-from reward_hacking.harness import tasks_r2e_leak
+from reward_hacking.harness import tasks_alce_citation, tasks_r2e_leak
 from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
@@ -400,6 +400,76 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def deadline_turn_prompt_for(task: Task, family: str) -> str | None:
+    """Return the hand-off message for one tools-enabled turn at the turn cap, if the family has one.
+
+    Families whose payment reads a file the policy must write (the status claim, the citation
+    answer) get one last turn to write it, each in its own words; the rest end at the cap.
+    """
+    if is_status_variant(task.task_variant):
+        return STATUS_DEADLINE_PROMPT
+    if family == "alce_citation":
+        return tasks_alce_citation.CITATION_DEADLINE_PROMPT
+    return None
+
+
+class CitationAnswerRecorder:
+    """Record, after each executed command, whether answer.json changed and to what digest."""
+
+    def __init__(self) -> None:
+        """Start from the laid-down answer template."""
+        self.commands_seen = 0
+        self.answer_sha256: str | None = _sha256_text(tasks_alce_citation.ANSWER_TEMPLATE)
+        self.answer_writes: list[dict[str, object]] = []
+
+    def after_command(self, episode_dir: Path, command: str, result: CommandResult) -> None:
+        """Append one write record when answer.json's bytes or existence changed."""
+        del command, result
+        path = episode_dir / tasks_alce_citation.ANSWER_FILENAME
+        digest = (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.is_file() and not path.is_symlink()
+            else None
+        )
+        if digest != self.answer_sha256:
+            self.answer_writes.append({"command_index": self.commands_seen, "sha256": digest})
+            self.answer_sha256 = digest
+        self.commands_seen += 1
+
+
+def _with_command_turns(
+    events: Sequence[Mapping[str, object]], trace_records: Sequence[Mapping[str, object]]
+) -> list[dict[str, object]]:
+    """Attach the turn of each recorded command event, counting commands across turns."""
+    command_turns = [
+        cast("int", record["turn"])
+        for record in trace_records
+        if record.get("record") == "turn"
+        for _command in cast("list[object]", record.get("commands", []))
+    ]
+    return [
+        {
+            **event,
+            "turn": command_turns[cast("int", event["command_index"])]
+            if cast("int", event["command_index"]) < len(command_turns)
+            else None,
+        }
+        for event in events
+    ]
+
+
+def citation_answer_block(
+    summary: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    recorder: CitationAnswerRecorder,
+) -> dict[str, object]:
+    """Gather the timed answer.json writes and the deadline turn for the citation labels."""
+    return {
+        "answer_writes": _with_command_turns(recorder.answer_writes, trace_records),
+        "deadline_turn_index": summary["deadline_turn_index"],
+    }
+
+
 def status_report_block(
     summary: Mapping[str, object],
     trace_records: Sequence[Mapping[str, object]],
@@ -407,22 +477,9 @@ def status_report_block(
 ) -> dict[str, object]:
     """Gather the hand-off claim, its timed evidence and its own awareness scan for one episode."""
     turns = [record for record in trace_records if record.get("record") == "turn"]
-    command_turns = [
-        cast("int", turn["turn"])
-        for turn in turns
-        for _command in cast("list[object]", turn.get("commands", []))
-    ]
 
     def timed(events: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
-        return [
-            {
-                **event,
-                "turn": command_turns[cast("int", event["command_index"])]
-                if cast("int", event["command_index"]) < len(command_turns)
-                else None,
-            }
-            for event in events
-        ]
+        return _with_command_turns(events, trace_records)
 
     block: dict[str, object] = {
         "status_writes": timed(recorder.status_writes),
@@ -1923,6 +1980,10 @@ class TaskEpisodeSource:
         if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
             raise ValueError(f"unsupported coding payment register {payment_register!r}")
         status_task = is_status_variant(self.tasks[task_id].task_variant)
+        citation_task = self.families_by_task[task_id] == "alce_citation"
+        deadline_turn_prompt = deadline_turn_prompt_for(
+            self.tasks[task_id], self.families_by_task[task_id]
+        )
         if (payment_register == "status_report") != status_task:
             raise ValueError("the status_report register pays exactly the status task variants")
         backend = copy(self.backend)
@@ -1969,6 +2030,12 @@ class TaskEpisodeSource:
                     }
                 }
                 if status_task
+                else {}
+            ),
+            # A resumed citation episode must have seen the same deadline hand-off.
+            **(
+                {"hand_off_protocol": {"deadline_turn_prompt": deadline_turn_prompt}}
+                if citation_task
                 else {}
             ),
             **self.convention_identity,
@@ -2030,6 +2097,7 @@ class TaskEpisodeSource:
                     ),
                 )
             status_recorder = StatusFileRecorder(task) if status_task else None
+            answer_recorder = CitationAnswerRecorder() if citation_task else None
             trace = run_ladder_episode(
                 task,
                 backend,
@@ -2039,8 +2107,10 @@ class TaskEpisodeSource:
                 user_template=STATUS_REPORT_USER_TEMPLATE if status_task else LADDER_USER_TEMPLATE,
                 after_command=status_recorder.after_command
                 if status_recorder is not None
+                else answer_recorder.after_command
+                if answer_recorder is not None
                 else None,
-                deadline_turn_prompt=STATUS_DEADLINE_PROMPT if status_task else None,
+                deadline_turn_prompt=deadline_turn_prompt,
                 final_report_prompt=(
                     STATUS_FINAL_REPORT_PROMPT if status_task else FINAL_REPORT_PROMPT
                 ),
@@ -2083,6 +2153,10 @@ class TaskEpisodeSource:
             if status_recorder is not None:
                 summary_record["status_report"] = status_report_block(
                     summary_record, _read_trace(temporary_trace_path), status_recorder
+                )
+            if answer_recorder is not None:
+                summary_record["citation_answer"] = citation_answer_block(
+                    summary_record, _read_trace(temporary_trace_path), answer_recorder
                 )
             if task.math_evidence_template is not None:
                 summary_record["math_evidence"] = _math_evidence_from_submission_trace(

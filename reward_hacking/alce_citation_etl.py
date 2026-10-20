@@ -303,11 +303,14 @@ def judge_seed(*parts: object) -> int:
 def cached_judge_responses(
     cache_path: Path,
     requests: Sequence[tuple[str, str, int]],
-    complete: Callable[[Sequence[str], Sequence[int]], list[str]],
+    complete: Callable[[Sequence[str], Sequence[int]], list[str]] | None,
     *,
     batch_size: int,
 ) -> dict[str, str]:
-    """Answer (key, prompt, seed) requests, appending each batch to a JSONL cache and resuming from it."""
+    """Answer (key, prompt, seed) requests, appending each batch to a JSONL cache and resuming from it.
+
+    With ``complete`` None only cached answers are returned and nothing is sent.
+    """
     cached: dict[str, str] = {}
     prompts_by_key = {key: prompt for key, prompt, _seed_value in requests}
     if cache_path.exists():
@@ -323,6 +326,8 @@ def cached_judge_responses(
             cached[key] = str(record["response"])
     pending = [request for request in requests if request[0] not in cached]
     logger.info("judge cache %s: %d cached, %d pending", cache_path, len(cached), len(pending))
+    if complete is None:
+        return cached
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
@@ -360,7 +365,7 @@ def _judged_candidates(candidates: Sequence[Candidate]) -> list[Candidate]:
 def run_support_pass(
     view: SourceView,
     candidates: Sequence[Candidate],
-    complete: Callable[[Sequence[str], Sequence[int]], list[str]],
+    complete: Callable[[Sequence[str], Sequence[int]], list[str]] | None,
     cache_path: Path,
     *,
     batch_size: int = 256,
@@ -385,12 +390,16 @@ def run_support_pass(
             for number in range(1, SHOWN_PASSAGE_COUNT + 1)
         )
         for candidate in _judged_candidates(candidates)
+        if all(
+            f"{candidate.case_id}:{number}" in responses
+            for number in range(1, SHOWN_PASSAGE_COUNT + 1)
+        )
     }
 
 
 def run_knowability_pass(
     candidates: Sequence[Candidate],
-    complete: Callable[[Sequence[str], Sequence[int]], list[str]],
+    complete: Callable[[Sequence[str], Sequence[int]], list[str]] | None,
     cache_path: Path,
     *,
     samples: int = KNOWABILITY_SAMPLES,
@@ -416,6 +425,7 @@ def run_knowability_pass(
             for index in range(samples)
         )
         for candidate in unsupported
+        if all(f"{candidate.case_id}:{index}" in responses for index in range(samples))
     }
 
 
@@ -431,6 +441,11 @@ def finalize_cases(
     drops: Counter[str] = Counter()
     cases: list[CitationCase] = []
     for candidate in _judged_candidates(candidates):
+        if candidate.case_id not in support or (
+            candidate.candidate_class == "unsupported" and candidate.case_id not in knowability
+        ):
+            drops[f"{candidate.candidate_class}_unjudged"] += 1
+            continue
         row = view.rows_by_sample[candidate.sample_id]
         rank = first_alias_rank(row, candidate.aliases)
         if candidate.candidate_class == "unsupported":
@@ -646,12 +661,13 @@ def _command_finalize(args: argparse.Namespace) -> None:
     candidates = _load_candidates(args.work_dir)
 
     def refuse_new_calls(_prompts: Sequence[str], _seeds: Sequence[int]) -> list[str]:
-        raise RuntimeError("finalize found unjudged candidates; run the judge stage first")
+        raise RuntimeError(
+            "finalize found unjudged candidates; run the judge stage first or pass --skip-unjudged"
+        )
 
-    support = run_support_pass(view, candidates, refuse_new_calls, args.work_dir / "support.jsonl")
-    knowability = run_knowability_pass(
-        candidates, refuse_new_calls, args.work_dir / "knowability.jsonl"
-    )
+    judge = None if args.skip_unjudged else refuse_new_calls
+    support = run_support_pass(view, candidates, judge, args.work_dir / "support.jsonl")
+    knowability = run_knowability_pass(candidates, judge, args.work_dir / "knowability.jsonl")
     cases, drops = finalize_cases(
         view, candidates, support, knowability, min_knowable=args.min_knowable
     )
@@ -695,6 +711,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     judge.set_defaults(run=_command_judge)
     finalize = stages.add_parser("finalize")
     finalize.add_argument("--min-knowable", type=int, default=DEFAULT_MIN_KNOWABLE)
+    finalize.add_argument(
+        "--skip-unjudged",
+        action="store_true",
+        help="drop and count candidates with no cached judge answers instead of refusing",
+    )
     finalize.set_defaults(run=_command_finalize)
     subset = stages.add_parser("subset")
     subset.add_argument("--output", type=Path, required=True)

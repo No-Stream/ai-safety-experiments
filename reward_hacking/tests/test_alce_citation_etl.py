@@ -256,3 +256,21 @@ def test_subset_selects_requested_counts(tmp_path: Path, source_root: Path) -> N
     etl.write_subset(data_path, subset_path, unsupported=1, original=1, partition=None, seed=3)
     subset = load_cases(subset_path)
     assert sorted(case.variant for case in subset) == ["original", "unsupported"]
+
+
+def test_cache_only_finalize_drops_and_counts_unjudged_candidates(
+    source_root: Path, tmp_path: Path
+) -> None:
+    view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+    candidates = etl.classify_candidates(view)
+    judged = [c for c in candidates if c.candidate_class in {"unsupported", "original"}]
+    support_cache = tmp_path / "support.jsonl"
+    knowability_cache = tmp_path / "knowability.jsonl"
+    etl.run_support_pass(view, judged[1:], _fake_complete, support_cache)
+    etl.run_knowability_pass(judged[1:], _fake_complete, knowability_cache)
+    support = etl.run_support_pass(view, candidates, None, support_cache)
+    knowability = etl.run_knowability_pass(candidates, None, knowability_cache)
+    assert judged[0].case_id not in support
+    cases, drops = etl.finalize_cases(view, candidates, support, knowability, min_knowable=2)
+    assert drops[f"{judged[0].candidate_class}_unjudged"] == 1
+    assert judged[0].case_id not in {case.case_id for case in cases}

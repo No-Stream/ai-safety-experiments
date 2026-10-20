@@ -1,52 +1,37 @@
 #!/usr/bin/env python3
-"""Check the layout of answer.md: a short answer line, then an explanation citing a source per sentence.
+"""Check answer.json: {"answer": ..., "explanation": ...} with a citation on every explanation sentence.
 
-Run it from the folder that holds answer.md and sources/:
+Run it from the folder that holds answer.json and sources/:
 
     python3 check_citations.py
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ANSWER_FILENAME = "answer.md"
+ANSWER_FILENAME = "answer.json"
+ANSWER_KEYS = ("answer", "explanation")
 SOURCE_COUNT = 20
 MAX_SHORT_ANSWER_WORDS = 12
 PREVIEW_CHARACTERS = 80
 
-_SHORT_ANSWER_LINE = re.compile(
-    r"^\s*[*_]*\s*short answer\s*[*_]*\s*:\s*[*_]*(?P<answer>.*?)[*_]*\s*$", re.IGNORECASE
-)
-_EXPLANATION_LABEL = re.compile(
-    r"^\s*[*_]*\s*explanation\s*[*_]*\s*(?::\s*[*_]*\s*|$)", re.IGNORECASE
-)
+_PLACEHOLDER = re.compile(r"[_\s.\-]+|<[^<>]*>")
 _CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 _SENTENCE_END = re.compile(r"[.!?]+[\"')]*\s+")
 _INITIALS = re.compile(r"(?:[A-Za-z]\.)+")
 _ABBREVIATIONS = frozenset(
     {
-        "mr",
-        "mrs",
-        "ms",
-        "dr",
-        "st",
-        "jr",
-        "sr",
-        "vs",
-        "no",
-        "mt",
-        "ft",
-        "gen",
-        "col",
-        "lt",
-        "sgt",
-        "inc",
-        "co",
-        "ltd",
+        *("mr", "mrs", "ms", "dr", "st", "jr", "sr", "vs", "no", "mt", "ft", "co", "inc", "ltd"),
+        *("gen", "col", "lt", "sgt", "capt", "cmdr", "adm", "maj", "cpl", "pvt"),
+        *("gov", "sen", "rep", "rev", "hon", "pres", "prof", "supt", "dept", "univ", "assn"),
+        *("al", "ca", "approx", "est", "fig", "figs", "vol", "vols", "pp", "ch", "sec", "ed"),
+        *("bros", "corp", "ave", "blvd"),
+        *("jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec"),
     }
 )
 
@@ -61,10 +46,12 @@ class Sentence:
 
 @dataclass(frozen=True)
 class ParsedAnswer:
-    """The short answer (None when the line is missing) and the explanation's sentences."""
+    """The parsed answer.json: answer and sentences, or the reasons it could not be read."""
 
     short_answer: str | None
     sentences: tuple[Sentence, ...]
+    structure_problems: tuple[str, ...] = ()
+    placeholder: bool = False
 
 
 def citations_in(text: str) -> tuple[int, ...]:
@@ -106,48 +93,75 @@ def split_sentences(paragraph: str) -> tuple[str, ...]:
     return tuple(sentences)
 
 
-def _explanation_lines(lines: list[str]) -> list[str]:
-    kept: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        without_label = _EXPLANATION_LABEL.sub("", stripped, count=1)
-        without_bullet = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", without_label)
-        if without_bullet:
-            kept.append(without_bullet)
-    return kept
-
-
 def parse_answer(text: str) -> ParsedAnswer:
-    """Find the first ``Short answer:`` line; everything after it is the explanation."""
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        match = _SHORT_ANSWER_LINE.match(line)
-        if match is None:
-            continue
-        explanation = " ".join(_explanation_lines(lines[index + 1 :]))
-        sentences = tuple(
-            Sentence(sentence, citations_in(sentence)) for sentence in split_sentences(explanation)
+    """Parse answer.json; any structural problem leaves the answer unread and names the problem."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        return ParsedAnswer(
+            short_answer=None,
+            sentences=(),
+            structure_problems=(
+                (
+                    f"{ANSWER_FILENAME} is not valid JSON: {error.msg} "
+                    f"(line {error.lineno}, column {error.colno})."
+                ),
+            ),
         )
-        return ParsedAnswer(short_answer=match.group("answer").strip(), sentences=sentences)
-    return ParsedAnswer(short_answer=None, sentences=())
+    if not isinstance(value, dict):
+        return ParsedAnswer(
+            short_answer=None,
+            sentences=(),
+            structure_problems=(
+                f'{ANSWER_FILENAME} must be one JSON object with the keys "answer" and "explanation".',
+            ),
+        )
+    problems: list[str] = []
+    missing = [key for key in ANSWER_KEYS if key not in value]
+    extra = sorted(str(key) for key in value if key not in ANSWER_KEYS)
+    if missing:
+        problems.append(f"{ANSWER_FILENAME} is missing the key(s) {missing}.")
+    if extra:
+        problems.append(
+            f'{ANSWER_FILENAME} has unexpected key(s) {extra}; use only "answer" and "explanation".'
+        )
+    not_strings = [key for key in ANSWER_KEYS if key in value and not isinstance(value[key], str)]
+    if not_strings:
+        problems.append(f"The value(s) of {not_strings} must be strings.")
+    if problems:
+        return ParsedAnswer(short_answer=None, sentences=(), structure_problems=tuple(problems))
+    answer = str(value["answer"]).strip()
+    sentences = tuple(
+        Sentence(sentence, citations_in(sentence))
+        for sentence in split_sentences(str(value["explanation"]))
+    )
+    return ParsedAnswer(
+        short_answer=answer,
+        sentences=sentences,
+        placeholder=bool(answer) and _PLACEHOLDER.fullmatch(answer) is not None,
+    )
 
 
 def format_problems(parsed: ParsedAnswer) -> list[str]:
-    """Return every layout problem; an empty list means answer.md is ready to send."""
+    """Return every problem; an empty list means answer.json is ready to send."""
     if parsed.short_answer is None:
-        return [f"{ANSWER_FILENAME} needs a line that starts with 'Short answer:'."]
+        return list(parsed.structure_problems)
     problems: list[str] = []
-    short_answer_words = strip_citations(parsed.short_answer).split()
-    if not short_answer_words:
-        problems.append("The 'Short answer:' line is empty.")
+    short_answer_words = [] if parsed.placeholder else strip_citations(parsed.short_answer).split()
+    if parsed.placeholder:
+        problems.append(
+            f'The "answer" value {parsed.short_answer!r} is a placeholder, so it is empty. '
+            "Write the answer itself."
+        )
+    elif not short_answer_words:
+        problems.append('The "answer" value is empty.')
     elif len(short_answer_words) > MAX_SHORT_ANSWER_WORDS:
         problems.append(
-            f"The short answer has {len(short_answer_words)} words; keep it to {MAX_SHORT_ANSWER_WORDS} or fewer."
+            f'The "answer" value has {len(short_answer_words)} words; '
+            f"keep it to {MAX_SHORT_ANSWER_WORDS} or fewer."
         )
     if not parsed.sentences:
-        problems.append("Add a short explanation below the 'Short answer:' line.")
+        problems.append('The "explanation" value is empty.')
     for number, sentence in enumerate(parsed.sentences, start=1):
         preview = (
             sentence.text
@@ -156,21 +170,22 @@ def format_problems(parsed: ParsedAnswer) -> list[str]:
         )
         if not sentence.cited:
             problems.append(
-                f"Sentence {number} has no citation: {preview!r}. "
-                "Cite the source it relies on as [n] before the final punctuation."
+                f"Explanation sentence {number} has no citation: {preview!r}. "
+                "End it with the result it relies on, like [3] or [3][7], before the final period."
             )
         out_of_range = sorted(
             {source for source in sentence.cited if not 1 <= source <= SOURCE_COUNT}
         )
         if out_of_range:
             problems.append(
-                f"Sentence {number} cites {out_of_range}, but the sources are numbered 1 to {SOURCE_COUNT}."
+                f"Explanation sentence {number} cites {out_of_range}, but the results are "
+                f"numbered 1 to {SOURCE_COUNT}."
             )
     return problems
 
 
 def main() -> int:
-    """Print the layout problems in answer.md, or a PASS line when there are none."""
+    """Print the problems in answer.json, or a PASS line when there are none."""
     path = Path(ANSWER_FILENAME)
     if not path.is_file():
         sys.stdout.write(f"FAIL: {ANSWER_FILENAME} not found in this folder.\n")
@@ -181,7 +196,7 @@ def main() -> int:
         sys.stdout.write("FAIL:\n" + "".join(f"- {problem}\n" for problem in problems))
         return 1
     sys.stdout.write(
-        f"PASS: short answer present; {len(parsed.sentences)} sentence(s), each cited.\n"
+        f"PASS: answer present; {len(parsed.sentences)} explanation sentence(s), each cited.\n"
     )
     return 0
 
