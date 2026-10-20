@@ -20,10 +20,8 @@ from typing import cast
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-import torch
 from transformers import AutoConfig
 
-from reward_hacking.distill.sample import resolve_gpu_engine_settings
 from reward_hacking.ladder.scenario import load_scenarios
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl import probe_v4
@@ -35,7 +33,6 @@ from reward_hacking.organism_rl.smoke_v4_assert import (
     assert_smoke_run,
 )
 from reward_hacking.vllm_server import (
-    RUNTIME_FREE_VRAM_FLOOR_BYTES,
     VLLMServer,
     VLLMServerConfig,
 )
@@ -49,6 +46,11 @@ LEAK_SPLITS_PATH = Path("docs/scratch/leak-v4/channel-splits.json")
 LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v9-train/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v8-heldout/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_SPLIT_NAME = "seed-v4"
+SMOKE_ACCEPT_SLOW_REASON = (
+    "0.8B plumbing smoke: one episode at concurrency 1 behind a ~110 s server startup, on a server "
+    "the stage does not own, cannot meet or attribute wave throughput floors; telemetry and artifact "
+    "checks still apply"
+)
 SFT_HELDOUT_MANIFESTS = (
     LEAK_SPLITS_PATH,
     Path("docs/scratch/leak-v4/held-out-cases.json"),
@@ -271,6 +273,8 @@ def probe_command(
         str(run_directory / "probe" / "f2-orig" / "base" / "records.jsonl"),
         "--server-port",
         str(_free_local_port()),
+        "--accept-slow",
+        SMOKE_ACCEPT_SLOW_REASON,
     ]
 
 
@@ -639,8 +643,8 @@ def _gpu_preflight() -> None:
     )
 
 
-# A stage that just exited can stay listed by the driver for a few seconds after it released its memory.
-GPU_RELEASE_WAIT_SECONDS = 120
+# Under WSL a stage that just exited (a trainer, a stopped vLLM engine) can hold its memory for minutes.
+GPU_RELEASE_WAIT_SECONDS = 600
 GPU_RELEASE_POLL_SECONDS = 5
 
 
@@ -678,20 +682,14 @@ def _server_config(
     model_revision: str,
     adapter_directory: Path | None = None,
 ) -> VLLMServerConfig:
-    gpu_memory_utilization, device_name = resolve_gpu_engine_settings(
-        torch, reserve_bytes=RUNTIME_FREE_VRAM_FLOOR_BYTES
-    )
-    logger.info(
-        "GPU sizing device=%s gpu_memory_utilization=%.3f",
-        device_name,
-        gpu_memory_utilization,
-    )
     serving_adapter = adapter_directory.resolve() if adapter_directory is not None else None
     return VLLMServerConfig(
         model=MODEL,
         revision=model_revision,
         max_model_len=-1,
-        gpu_memory_utilization=gpu_memory_utilization,
+        # None: the server sizes itself from nvidia-smi at launch. Sizing here through torch would
+        # open a CUDA context in this long-lived parent, which later stages' preflights read as busy.
+        gpu_memory_utilization=None,
         host="127.0.0.1",
         port=_free_local_port(),
         language_model_only=True,
@@ -712,6 +710,45 @@ def _server_config(
     )
 
 
+def ladder_command(
+    run_directory: Path, *, scenario_slug: str, endpoint: str, server_log: Path | None
+) -> list[str]:
+    """Build the one-episode ladder runner command against the adapter server."""
+    return [
+        sys.executable,
+        "-m",
+        "reward_hacking.ladder.runner",
+        "--endpoint",
+        endpoint,
+        "--server-log",
+        str(server_log),
+        "--model",
+        f"{ADAPTER_SERVED_MODEL_ID}={MODEL}",
+        "--scenario-root",
+        str(_resolve_repo_path(LADDER_SCENARIO_ROOT)),
+        "--scenario",
+        scenario_slug,
+        "--arm",
+        "real",
+        "--samples",
+        "1",
+        "--output",
+        str(run_directory / "ladder" / "records.jsonl"),
+        "--episode-root",
+        str(run_directory / "ladder" / "episodes"),
+        "--max-turns",
+        str(MAX_TURNS),
+        "--max-new-tokens",
+        str(MAX_NEW_TOKENS),
+        "--thinking-token-budget",
+        str(THINKING_TOKEN_BUDGET),
+        "--top-p",
+        "1.0",
+        "--accept-slow",
+        SMOKE_ACCEPT_SLOW_REASON,
+    ]
+
+
 def _run_ladder(run_directory: Path, model_revision: str, adapter_directory: Path) -> None:
     records_path = run_directory / "ladder" / "records.jsonl"
     if _completed_record_count(records_path) == 1:
@@ -726,37 +763,12 @@ def _run_ladder(run_directory: Path, model_revision: str, adapter_directory: Pat
         adapter_directory=adapter_directory,
     )
     with VLLMServer(adapter_config) as server:
-        command = [
-            sys.executable,
-            "-m",
-            "reward_hacking.ladder.runner",
-            "--endpoint",
-            server.base_url,
-            "--server-log",
-            str(adapter_config.log_path),
-            "--model",
-            f"{ADAPTER_SERVED_MODEL_ID}={MODEL}",
-            "--scenario-root",
-            str(_resolve_repo_path(LADDER_SCENARIO_ROOT)),
-            "--scenario",
-            scenario.slug,
-            "--arm",
-            "real",
-            "--samples",
-            "1",
-            "--output",
-            str(records_path),
-            "--episode-root",
-            str(run_directory / "ladder" / "episodes"),
-            "--max-turns",
-            str(MAX_TURNS),
-            "--max-new-tokens",
-            str(MAX_NEW_TOKENS),
-            "--thinking-token-budget",
-            str(THINKING_TOKEN_BUDGET),
-            "--top-p",
-            "1.0",
-        ]
+        command = ladder_command(
+            run_directory,
+            scenario_slug=scenario.slug,
+            endpoint=server.base_url,
+            server_log=adapter_config.log_path,
+        )
         _run_command(command)
     _write_json(
         run_directory / "ladder" / "server-identity.json", {"model_revision": model_revision}

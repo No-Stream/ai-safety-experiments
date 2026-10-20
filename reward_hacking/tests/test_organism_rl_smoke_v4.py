@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import pytest
 
+from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.organism_rl import evaluate, probe_v4, smoke_v4
 from reward_hacking.organism_rl.smoke_v4_assert import (
     CellExpectation,
@@ -796,6 +797,15 @@ def test_schema_only_card_with_stale_dataset_identity_is_accepted_without_a_hash
     assert caplog.text == ""
 
 
+def test_probe_stages_waive_wave_throughput_floors_with_a_recorded_reason(tmp_path: Path) -> None:
+    command = smoke_v4.probe_command(
+        tmp_path, "revision", stage="base", adapter_directory=tmp_path / "adapter"
+    )
+    reason = command[command.index("--accept-slow") + 1]
+    assert reason.strip()
+    assert probe_v4.parse_args(command[3:]).accept_slow == reason
+
+
 def test_every_smoke_eval_cell_is_accepted_by_the_evaluate_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -853,3 +863,28 @@ class TestWaitForFreeGpu:
         monkeypatch.setattr(smoke_v4.time, "monotonic", lambda: float(next(clock)))
         with pytest.raises(subprocess.CalledProcessError):
             smoke_v4._wait_for_free_gpu()
+
+
+def test_server_config_leaves_memory_sizing_to_the_server_without_touching_cuda(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def no_cuda(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("the smoke parent opened a CUDA context, which later stages read as a busy GPU")
+
+    monkeypatch.setattr("torch.cuda.mem_get_info", no_cuda)
+    monkeypatch.setattr("torch.cuda.init", no_cuda)
+    config = smoke_v4._server_config(tmp_path, model_revision="0" * 40)
+    assert config.gpu_memory_utilization is None
+
+
+def test_ladder_stage_waives_wave_throughput_floors_with_a_recorded_reason(tmp_path: Path) -> None:
+    command = smoke_v4.ladder_command(
+        tmp_path,
+        scenario_slug="synthetic-scenario",
+        endpoint="http://synthetic:8000",
+        server_log=tmp_path / "server.log",
+    )
+    assert command[1:3] == ["-m", "reward_hacking.ladder.runner"]
+    arguments = ladder_runner._build_cli_parser().parse_args(command[3:])
+    assert arguments.accept_slow == smoke_v4.SMOKE_ACCEPT_SLOW_REASON
+    assert arguments.endpoint == "http://synthetic:8000"
