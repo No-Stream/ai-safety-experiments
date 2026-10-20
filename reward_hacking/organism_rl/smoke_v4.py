@@ -639,6 +639,25 @@ def _gpu_preflight() -> None:
     )
 
 
+# A stage that just exited can stay listed by the driver for a few seconds after it released its memory.
+GPU_RELEASE_WAIT_SECONDS = 120
+GPU_RELEASE_POLL_SECONDS = 5
+
+
+def _wait_for_free_gpu() -> None:
+    """Rerun the preflight until the previous stage's process is gone, then fail with its error."""
+    deadline = time.monotonic() + GPU_RELEASE_WAIT_SECONDS
+    while True:
+        try:
+            _gpu_preflight()
+        except subprocess.CalledProcessError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(GPU_RELEASE_POLL_SECONDS)
+        else:
+            return
+
+
 def _model_revision() -> str:
     config = AutoConfig.from_pretrained(MODEL, local_files_only=True)
     revision = config._commit_hash  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -1079,6 +1098,7 @@ def _run_pipeline(
 
     final_checkpoint = _run_sft(run_directory)
     for stage in ("base", "v3"):
+        _wait_for_free_gpu()
         _run_command(
             probe_command(
                 run_directory,
@@ -1087,6 +1107,7 @@ def _run_pipeline(
                 adapter_directory=final_checkpoint,
             )
         )
+    _wait_for_free_gpu()
     _run_ladder(run_directory, model_revision, final_checkpoint)
     _run_health_report(run_directory, leak_channels)
     result = assert_smoke_run(run_directory)

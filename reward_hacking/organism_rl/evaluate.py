@@ -419,9 +419,10 @@ def _validate_evaluation_variant_family(
     if args.evaluation_variant == "unsupported" and args.families != ["alce_citation"]:
         parser.error("unsupported evaluation requires --family alce_citation")
     if args.evaluation_variant == "oneoff" and any(
-        family not in {"aisi", "ilcb"} for family in args.families
+        family not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker"}
+        for family in args.families
     ):
-        parser.error("oneoff evaluation tasks are only available for AISI and ILCB")
+        parser.error("oneoff evaluation tasks are unavailable for the selected family")
     if args.evaluation_variant == "original" and any(
         family not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker", "alce_citation"}
         for family in args.families

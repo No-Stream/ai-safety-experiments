@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import pytest
 
-from reward_hacking.organism_rl import probe_v4, smoke_v4
+from reward_hacking.organism_rl import evaluate, probe_v4, smoke_v4
 from reward_hacking.organism_rl.smoke_v4_assert import (
     CellExpectation,
     SmokeAssertionError,
@@ -794,3 +794,62 @@ def test_schema_only_card_with_stale_dataset_identity_is_accepted_without_a_hash
     with caplog.at_level(logging.WARNING, logger=smoke_v4.logger.name):
         smoke_v4._validate_schema_only_card(card, selected_count=1, row_count=1)
     assert caplog.text == ""
+
+
+def test_every_smoke_eval_cell_is_accepted_by_the_evaluate_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(smoke_v4, "_served_max_model_len", lambda _endpoint, _model: 4096)
+    splits = tmp_path / "channel-splits.json"
+    splits.write_text(
+        json.dumps(
+            {
+                smoke_v4.LEAK_SPLIT_NAME: {"train": ["git_branch"], "held-out": ["git_reflog"]},
+                "eval_pairs": [["synthetic-leak-task", "git_reflog"]],
+            }
+        )
+    )
+    monkeypatch.setattr(smoke_v4, "LEAK_SPLITS_PATH", splits)
+    monkeypatch.setattr(smoke_v4, "LEAK_HELDOUT_ASSETS", tmp_path / "absent-assets.json")
+    for cell in smoke_v4._eval_cells({"synthetic-leak-task": "git_reflog"}):
+        command = smoke_v4.evaluate_command(
+            endpoint="http://synthetic:8000",
+            model_revision="0" * 40,
+            run_directory=tmp_path,
+            cell=cell,
+        )
+        assert command[1:3] == ["-m", "reward_hacking.organism_rl.evaluate"]
+        evaluate.parse_args(command[3:])
+
+
+class TestWaitForFreeGpu:
+    def test_retries_until_a_just_exited_stage_releases_the_gpu(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outcomes = [1, 1, 0]
+        sleeps: list[float] = []
+
+        def preflight(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return_code = outcomes.pop(0)
+            if return_code:
+                raise subprocess.CalledProcessError(return_code, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(smoke_v4.subprocess, "run", preflight)
+        monkeypatch.setattr(smoke_v4.time, "sleep", sleeps.append)
+        smoke_v4._wait_for_free_gpu()
+        assert outcomes == []
+        assert len(sleeps) == 2
+
+    def test_a_gpu_that_stays_busy_fails_with_the_preflight_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def busy(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.CalledProcessError(1, command)
+
+        clock = iter(range(0, 10_000, 5))
+        monkeypatch.setattr(smoke_v4.subprocess, "run", busy)
+        monkeypatch.setattr(smoke_v4.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(smoke_v4.time, "monotonic", lambda: float(next(clock)))
+        with pytest.raises(subprocess.CalledProcessError):
+            smoke_v4._wait_for_free_gpu()
