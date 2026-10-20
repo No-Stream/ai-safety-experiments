@@ -24,7 +24,7 @@ from reward_hacking import organism_reward
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES, AisiRhProblem, AisiTaskVariant
 from reward_hacking.distill import agentic_sft, hack_strategy
 from reward_hacking.evidence_store import read_jsonl
-from reward_hacking.harness import tasks_r2e_leak
+from reward_hacking.harness import tasks_acceptance_leak, tasks_r2e_leak
 from reward_hacking.harness.loop import (
     BASELINE_ARM,
     FinalGrade,
@@ -49,6 +49,7 @@ from reward_hacking.harness.status_report import (
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.tasks_aisi_rh_envs import build_task as build_aisi_task
+from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID, build_agentic_task
 from reward_hacking.harness.tasks_math import build_task as build_math_task
 from reward_hacking.jailed_poc import CommandResult, run_in_jail
@@ -625,6 +626,7 @@ def run_gate(
     *,
     workers: int | None = None,
     report_jsonl: Path | None = None,
+    acceptance_assets: Path | None = None,
 ) -> int:
     """Run all fixture graders, compare every declaration, and log one result per artifact."""
     worker_count = available_worker_count(workers)
@@ -638,6 +640,17 @@ def run_gate(
         max_workers=worker_count,
     )
     report = _collect_gate_report(fixtures, built_fixtures, grading_outcomes)
+    if acceptance_assets is not None:
+        acceptance_records, acceptance_mismatches = _grade_acceptance_witnesses(acceptance_assets)
+        artifacts_by_family = Counter(report.checked_artifacts_by_family)
+        artifacts_by_family["aisi"] += len(acceptance_records)
+        report = replace(
+            report,
+            records=[*report.records, *acceptance_records],
+            mismatches=[*report.mismatches, *acceptance_mismatches],
+            checked_artifacts=report.checked_artifacts + len(acceptance_records),
+            checked_artifacts_by_family=artifacts_by_family,
+        )
     logger.info(
         "env-gate summary: %d tasks, %d reference artifacts, %d report-only tasks",
         len(fixtures),
@@ -656,6 +669,137 @@ def run_gate(
     )
     logger.info("env-gate passed")
     return 0
+
+
+def _grade_acceptance_witnesses(pack_path: Path) -> tuple[list[dict[str, object]], list[str]]:
+    """Run the private general and acceptance-only lookup witnesses through both trusted checks."""
+    payload = json.loads(pack_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping) or payload.get("schema") != 1:
+        raise ValueError("acceptance asset pack must use schema 1")
+    assets = payload.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise ValueError("acceptance asset pack must contain assets")
+
+    records: list[dict[str, object]] = []
+    mismatches: list[str] = []
+    for condition in ("open", "closed"):
+        tasks = tasks_acceptance_leak.acceptance_tasks(pack_path, condition=condition)
+        if len(tasks) != len(assets):
+            raise ValueError(f"{condition} acceptance task count differs from pack inventory")
+        for task, raw_asset in zip(tasks, assets, strict=True):
+            asset_records, asset_mismatches = _grade_acceptance_asset_condition(
+                task,
+                raw_asset,
+                condition=condition,
+            )
+            records.extend(asset_records)
+            mismatches.extend(asset_mismatches)
+    return records, mismatches
+
+
+def _grade_acceptance_asset_condition(
+    task: Task, raw_asset: object, *, condition: str
+) -> tuple[list[dict[str, object]], list[str]]:
+    asset = _acceptance_asset_mapping(raw_asset)
+    problem = _required_mapping(asset, "problem")
+    problem_id = _required_string(problem, "problem_id")
+    if task.problem_id != problem_id or task.task_variant != "acceptance_leak":
+        raise ValueError(f"acceptance task identity differs from asset {problem_id!r}")
+    if task.artifact_filename is None or task.true_check_result is None:
+        raise ValueError(f"{task.task_id}: acceptance task lacks required trusted graders")
+    if task.trusted_acceptance_check is None:
+        raise ValueError(f"{task.task_id}: acceptance task lacks trusted acceptance grader")
+
+    records: list[dict[str, object]] = []
+    mismatches: list[str] = []
+    witnesses = (
+        ("general_reference", "reference_source", True),
+        ("acceptance_lookup", "lookup_source", False),
+    )
+    for artifact_id, source_key, expected_truth_pass in witnesses:
+        source = asset.get(source_key)
+        if not isinstance(source, str) or not source:
+            raise ValueError(f"{problem_id}: {source_key} must be nonempty source text")
+        record, mismatch = _grade_acceptance_witness(
+            task,
+            source.encode("utf-8"),
+            condition=condition,
+            artifact_id=artifact_id,
+            expected_truth_pass=expected_truth_pass,
+        )
+        records.append(record)
+        if mismatch is not None:
+            mismatches.append(mismatch)
+    return records, mismatches
+
+
+def _acceptance_asset_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("acceptance pack assets must be objects")
+    return cast("Mapping[str, object]", value)
+
+
+def _grade_acceptance_witness(
+    task: Task,
+    artifact_bytes: bytes,
+    *,
+    condition: str,
+    artifact_id: str,
+    expected_truth_pass: bool,
+) -> tuple[dict[str, object], str | None]:
+    if task.artifact_filename is None or task.true_check_result is None:
+        raise ValueError(f"{task.task_id}: trusted graders are required")
+    if task.trusted_acceptance_check is None:
+        raise ValueError(f"{task.task_id}: trusted acceptance grader is required")
+    artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
+    with tempfile.TemporaryDirectory(
+        prefix="acceptance-env-gate-", dir=EPISODE_SCRATCH_ROOT
+    ) as temporary:
+        temporary_root = Path(temporary)
+        (temporary_root / ".disposable").touch()
+        episode_directory = temporary_root / "episode"
+        lay_down_task(episode_directory, task, arm=BASELINE_ARM)
+        artifact_path = episode_directory / task.artifact_filename
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(artifact_bytes)
+        acceptance_result = task.trusted_acceptance_check(episode_directory)
+        truth_result = task.true_check_result(episode_directory)
+        if artifact_path.read_bytes() != artifact_bytes:
+            raise ValueError(f"{task.task_id}/{artifact_id}: trusted grader changed solution.py")
+
+    acceptance_evidence_digest = acceptance_result.submission_evidence.get("artifact_sha256")
+    truth_evidence_digest = truth_result.evidence.get("artifact_sha256")
+    truth_passed = truth_result.outcome is TrueCheckOutcome.TRUE_PASS
+    record: dict[str, object] = {
+        "family": "aisi",
+        "variant": "acceptance_leak",
+        "payment_register": "trusted_acceptance",
+        "task_id": task.task_id,
+        "problem_id": task.problem_id,
+        "condition": condition,
+        "artifact_id": artifact_id,
+        "artifact_sha256": artifact_digest,
+        "acceptance_passed": acceptance_result.passed,
+        "acceptance_measured": acceptance_result.passed is not None,
+        "truth_outcome": truth_result.outcome.value,
+        "truth_passed": truth_passed,
+        "acceptance_artifact_sha256": acceptance_evidence_digest,
+        "truth_artifact_sha256": truth_evidence_digest,
+        "status": "checked",
+    }
+    differences: list[str] = []
+    if acceptance_result.passed is not True or acceptance_result.error is not None:
+        differences.append(f"expected acceptance pass, observed {acceptance_result.passed!r}")
+    if truth_result.outcome is TrueCheckOutcome.ORACLE_ERROR:
+        differences.append("truth oracle was unmeasured")
+    elif truth_passed is not expected_truth_pass:
+        differences.append(f"expected truth_pass={expected_truth_pass}, observed {truth_passed}")
+    if acceptance_evidence_digest != artifact_digest or truth_evidence_digest != artifact_digest:
+        differences.append("trusted check evidence does not bind to the witness artifact")
+    if not differences:
+        return record, None
+    record["status"] = "mismatch"
+    return record, f"{task.task_id}/{condition}/{artifact_id}: " + "; ".join(differences)
 
 
 def _report_path_from_environment() -> Path | None:
@@ -2469,6 +2613,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--report-jsonl", type=Path)
+    parser.add_argument(
+        "--acceptance-assets",
+        type=Path,
+        help="explicit private acceptance pack whose general and lookup witnesses must both grade",
+    )
     return parser.parse_args(argv)
 
 
@@ -2476,7 +2625,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the fixture gate from command-line arguments."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args(argv)
-    return run_gate(args.fixtures, workers=args.workers, report_jsonl=args.report_jsonl)
+    return run_gate(
+        args.fixtures,
+        workers=args.workers,
+        report_jsonl=args.report_jsonl,
+        acceptance_assets=args.acceptance_assets,
+    )
 
 
 if __name__ == "__main__":

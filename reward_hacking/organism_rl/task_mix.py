@@ -32,9 +32,9 @@ class TaskPrompt:
     task_id: str
     family: TaskFamily
     variant: str
-    payment_register: Literal["trusted_rerun", "in_band", "ladder", "status_report"] = (
-        "trusted_rerun"
-    )
+    payment_register: Literal[
+        "trusted_rerun", "in_band", "ladder", "status_report", "trusted_acceptance"
+    ] = "trusted_rerun"
     environment_id: str | None = None
 
 
@@ -43,6 +43,7 @@ FAMILY_VARIANT_FAMILIES = frozenset(
     {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
 )
 _IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
+    "acceptance_leak": frozenset({"aisi"}),
     "oneoff": frozenset({"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}),
     "conflicting": frozenset({"ilcb"}),
     "loose": frozenset({"math_loose_checker"}),
@@ -94,18 +95,22 @@ def solvable_counterpart(treatment_variant: str) -> str:
 
 
 def refuse_problems_paid_for_two_moves(prompts: Sequence[TaskPrompt]) -> None:
-    """Refuse a pool that pays one problem statement under the status claim and another move."""
-    moves_by_problem: dict[tuple[str, str], set[bool]] = {}
+    """Refuse paying one canonical problem under different target moves."""
+    moves_by_problem: dict[tuple[str, str], set[str]] = {}
     for prompt in prompts:
         if prompt.family == "ladder":
             continue
         problem = (prompt.family, prompt.environment_id or prompt.task_id)
-        moves_by_problem.setdefault(problem, set()).add(is_status_variant(prompt.variant))
+        moves_by_problem.setdefault(problem, set()).add(
+            "status"
+            if is_status_variant(prompt.variant)
+            else "acceptance"
+            if prompt.variant == "acceptance_leak"
+            else "implementation"
+        )
     shared = sorted(problem for problem, moves in moves_by_problem.items() if len(moves) > 1)
     if shared:
-        raise ValueError(
-            f"problems would be paid for two moves (status claim and another): {shared[:5]}"
-        )
+        raise ValueError(f"problems would be paid for two moves: {shared[:5]}")
 
 
 def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix settings
@@ -170,7 +175,7 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             raise ValueError(f"no {family_variant} tasks are available for family {family!r}")
         solvable_count = (
             0
-            if family == "r2e_leak"
+            if family == "r2e_leak" or treatment_variant == "acceptance_leak"
             else math.floor(len(impossible) * solvable_fraction / (1 - solvable_fraction) + 0.5)
         )
         if solvable_count > len(solvable):
@@ -200,6 +205,7 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             sampled = rng.sample(ladder, min(remaining, len(ladder)))
             selected.extend(replace(prompt, payment_register="ladder") for prompt in sampled)
             remaining -= len(sampled)
+
     refuse_problems_paid_for_two_moves(selected)
     return tuple(sorted(selected, key=lambda prompt: prompt.task_id))
 
@@ -271,6 +277,10 @@ def _assign_payment_register(
     environment_id = prompt.environment_id or prompt.task_id
     scope = f"{prompt.family}/{environment_id}"
     fraction = fractions.get(scope, fractions.get(prompt.family))
+    if prompt.variant == "acceptance_leak":
+        if fraction is not None:
+            raise ValueError("acceptance tasks require trusted_acceptance payment")
+        return replace(prompt, payment_register="trusted_acceptance")
     if is_status_variant(prompt.variant):
         if fraction is not None:
             raise ValueError(f"status tasks always use the status_report register; drop {scope!r}")

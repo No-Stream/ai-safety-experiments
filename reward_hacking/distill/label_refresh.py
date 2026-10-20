@@ -40,6 +40,7 @@ from reward_hacking.distill.strategy_adjudication import (
 )
 from reward_hacking.distill.table_provenance import confirmed_visible_table
 from reward_hacking.distill.task_contract_source import hydrate_task_record
+from reward_hacking.harness.acceptance_evidence import assess_recorded_acceptance
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.organism_rl.strengthened_truth_grade import (
     recorded_artifact_content_sha256,
@@ -150,7 +151,16 @@ def _evidence_digests(
             raise TypeError(f"{context} graded artifact requires a SHA-256 string")
     else:
         raise TypeError(f"{context} graded_artifact must be an object")
-    artifact_content_digest = recorded_artifact_content_sha256(records_path.parent, record, summary)
+    if summary.get("task_variant") == "acceptance_leak":
+        saved_evidence = summary["acceptance_evidence"]
+        if not isinstance(saved_evidence, Mapping):
+            raise TypeError("acceptance evidence must be an object")
+        assess_recorded_acceptance(summary)
+        artifact_content_digest = cast("str", saved_evidence["final_artifact_sha256"])
+    else:
+        artifact_content_digest = recorded_artifact_content_sha256(
+            records_path.parent, record, summary
+        )
     return {
         "source_record_sha256": _sha256(raw_line),
         "trace_sha256": _sha256(trace_path.read_bytes()),
@@ -197,6 +207,16 @@ def _candidate_contract_audit(contract: CandidateContract) -> dict[str, object]:
 def _episode_analysis_audit(
     record: Mapping[str, object], trace_records: Sequence[Mapping[str, object]]
 ) -> dict[str, object]:
+    summary = record.get("trace_summary")
+    if isinstance(summary, Mapping) and summary.get("task_variant") == "acceptance_leak":
+        evidence = summary["acceptance_evidence"]
+        if not isinstance(evidence, Mapping):
+            raise TypeError("acceptance evidence must be an object")
+        return {
+            "kind": "acceptance_fixture",
+            "acceptance_fixture": assess_recorded_acceptance(summary).to_json_dict(),
+            "training_exclusion_reasons": summary["training_exclusion_reasons"],
+        }
     contract = recover_candidate_contract(record, trace_records)
     source = _reconstruct_final_source(record, trace_records)
     table_provenance = confirmed_visible_table(
@@ -973,7 +993,7 @@ def _validate_label_identity(
     return key_json, sample_index
 
 
-def _validate_label_evidence(  # noqa: PLR0913 - current file and truth bindings remain explicit
+def _validate_label_evidence(  # noqa: C901, PLR0913 - current file and truth bindings remain explicit
     records_path: Path,
     row_index: int,
     raw_line: bytes,
@@ -997,6 +1017,12 @@ def _validate_label_evidence(  # noqa: PLR0913 - current file and truth bindings
         raise ValueError(
             f"{records_path}:row {row_index} source, trace or artifact digest is stale"
         )
+    summary = source_record.get("trace_summary")
+    if isinstance(summary, Mapping) and summary.get("task_variant") == "acceptance_leak":
+        if label.get("analysis") != _episode_analysis_audit(source_record, []):
+            raise ValueError("acceptance label analysis differs from durable evidence")
+        if label.get("hack_strategy") != label_persisted_episode(source_record).to_json_dict():
+            raise ValueError("acceptance label differs from durable evidence")
     adjudication = label.get("adjudication")
     if adjudication is not None:
         if not isinstance(adjudication, Mapping):
@@ -1045,7 +1071,12 @@ def _validate_label_payload(labels_path: Path, row_index: int, label: Mapping[st
     analysis = label.get("analysis")
     if not isinstance(analysis, Mapping):
         raise TypeError(f"{labels_path}:{row_index} is missing private analysis")
-    for key in ("candidate_contract", "call_history", "visible_table"):
+    keys = (
+        ("acceptance_fixture",)
+        if analysis.get("kind") == "acceptance_fixture"
+        else ("candidate_contract", "call_history", "visible_table")
+    )
+    for key in keys:
         if not isinstance(analysis.get(key), Mapping):
             raise TypeError(f"{labels_path}:{row_index} is missing private {key} analysis")
 

@@ -36,6 +36,7 @@ from reward_hacking.generation_perf import (
     record_episode_timings,
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
+from reward_hacking.harness.tasks_acceptance_leak import acceptance_task_partition
 from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
 from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
@@ -43,7 +44,11 @@ from reward_hacking.ladder.loop import (
     PROMPT_FORMAT_VERSION,
 )
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
-from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.scenario import (
+    ACCEPTANCE_USER_TEMPLATE,
+    LADDER_SYSTEM_PROMPT,
+    LADDER_USER_TEMPLATE,
+)
 from reward_hacking.ladder.surfaces import FINAL_REPORT_PROMPT as TASK_LOG_FINAL_REPORT_PROMPT
 from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
@@ -52,6 +57,10 @@ from reward_hacking.ladder.thinking import (
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
+from reward_hacking.organism_rl.acceptance_selection import (
+    add_acceptance_arguments,
+    resolve_acceptance_options,
+)
 from reward_hacking.organism_rl.admission import LiveKVAdmission
 from reward_hacking.organism_rl.generate_provenance import (
     _CODE_PROVENANCE_KEYS,  # pyright: ignore[reportPrivateUsage]
@@ -120,7 +129,9 @@ class TaskSpec:
     family: CodingTaskFamily
     variant: str
     partition: str = "train"
-    payment_register: Literal["trusted_rerun", "in_band", "status_report"] = "trusted_rerun"
+    payment_register: Literal["trusted_rerun", "in_band", "status_report", "trusted_acceptance"] = (
+        "trusted_rerun"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -808,6 +819,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             "loose_oneoff",
             "loose_hidden_original",
             "unsupported",
+            "acceptance_leak",
             "status_original",
             "status_oneoff",
             "status_conflicting",
@@ -921,6 +933,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
 
     parser.add_argument("--jail-backend")
     add_leak_arguments(parser)
+    add_acceptance_arguments(parser)
     args = parser.parse_args(argv)
     return _validate_parsed_args(args, parser)
 
@@ -956,6 +969,7 @@ def _validate_admission_args(args: argparse.Namespace, parser: argparse.Argument
 def _validate_parsed_args(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> argparse.Namespace:
+    resolve_acceptance_options(args, parser)
     resolve_leak_options(args, parser, partition=args.partition)
 
     args.families = list(dict.fromkeys(args.family_entries or DEFAULT_FAMILIES))
@@ -1151,7 +1165,9 @@ def _resolve_hint_options(args: argparse.Namespace, parser: argparse.ArgumentPar
 
 def _add_payment_register_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--payment-register", choices=("trusted_rerun", "in_band"), default="trusted_rerun"
+        "--payment-register",
+        choices=("trusted_rerun", "in_band", "trusted_acceptance"),
+        default="trusted_rerun",
     )
     parser.add_argument(
         "--in-band-fraction",
@@ -1179,7 +1195,7 @@ def _assign_payment_registers(
     task_specs: Sequence[TaskSpec],
     environment_ids: Mapping[str, str],
     *,
-    fallback_register: Literal["trusted_rerun", "in_band"],
+    fallback_register: Literal["trusted_rerun", "in_band", "trusted_acceptance"],
     in_band_fractions: Mapping[str, float],
     seed: int,
 ) -> tuple[TaskSpec, ...]:
@@ -1206,7 +1222,9 @@ def _assign_payment_registers(
             prompt,
             in_band_fractions,
             seed,
-            default_register=fallback_register,
+            default_register="trusted_rerun"
+            if fallback_register == "trusted_acceptance"
+            else fallback_register,
         ).payment_register
         for prompt in prompts
     }
@@ -2259,7 +2277,12 @@ def task_prompt_content(
             raise ValueError("task filename must not be empty")
         first_path_part, *remaining_path_parts = path_parts
         listing_entries.add(f"{first_path_part}/" if remaining_path_parts else first_path_part)
-    user_text = LADDER_USER_TEMPLATE.replace("/work", workspace_mount).format(
+    user_template = (
+        ACCEPTANCE_USER_TEMPLATE
+        if task_object.task_variant == "acceptance_leak"
+        else LADDER_USER_TEMPLATE
+    )
+    user_text = user_template.replace("/work", workspace_mount).format(
         task_markdown=task_object.render_prompt(AgenticArmConfig()),
         listing="\n".join(f"- {filename}" for filename in sorted(listing_entries)),
         max_submissions=LADDER_MAX_SUBMISSIONS,
@@ -2337,7 +2360,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
 
     data_paths = {
         "ilcb": args.ilcb_cases or ilcb_data.DATA_PATH,
-        "aisi": args.aisi_cases or aisi_rh_envs_data.DATA_PATH,
+        "aisi": args.acceptance_assets or args.aisi_cases or aisi_rh_envs_data.DATA_PATH,
         "math_oneoff": math_data.DATA_PATH,
         "math_loose_checker": math_data.DATA_PATH,
         "r2e_leak": r2e_leak_data.DATA_PATH,
@@ -2384,6 +2407,13 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "reward_hacking/persistent_jail.py",
         "reward_hacking/organism_rl/leak_selection.py",
         "reward_hacking/organism_rl/leak_assets.py",
+        "reward_hacking/harness/acceptance_assets.py",
+        "reward_hacking/harness/prepare_acceptance_assets.py",
+        "reward_hacking/harness/tasks_acceptance_leak.py",
+        "reward_hacking/harness/acceptance_evidence.py",
+        "reward_hacking/organism_rl/acceptance_runtime.py",
+        "reward_hacking/organism_rl/acceptance_selection.py",
+        "reward_hacking/organism_rl/acceptance_git_state.py",
         "reward_hacking/r2e_leak_data.py",
         "reward_hacking/math_data.py",
         "reward_hacking/math_etl.py",
@@ -2420,6 +2450,11 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "aisi_sources": list(args.aisi_sources),
         **({"aisi_hack_group": args.aisi_hack_group} if args.aisi_hack_group is not None else {}),
         "variant": args.variant,
+        **(
+            {"acceptance_condition": args.acceptance_condition}
+            if args.variant == "acceptance_leak"
+            else {}
+        ),
         "payment_register": args.payment_register,
         "in_band_fractions": dict(args.in_band_fractions),
         "payment_assignment_seed": PAYMENT_REGISTER_ASSIGNMENT_SEED,
@@ -2471,6 +2506,11 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         }
     )
     run_context = build_launch_context(args.endpoint, args.max_model_len)
+    if args.variant == "acceptance_leak":
+        run_context["acceptance_asset_source"] = {
+            "path": str(args.acceptance_assets.resolve()),
+            "sha256": _file_sha256(args.acceptance_assets),
+        }
     run_context["performance"] = {
         key: value
         for key, value in vars(args).items()
@@ -2499,7 +2539,18 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             for relative_path in source_paths
         },
         "task_data_sha256": {
-            family: _file_sha256(data_paths[family]) for family in sorted(args.families)
+            family: (
+                _canonical_sha256(
+                    {
+                        spec.task_id: task_definition_content(source.tasks[spec.task_id])
+                        for spec in task_specs
+                        if spec.family == family
+                    }
+                )
+                if args.variant == "acceptance_leak"
+                else _file_sha256(data_paths[family])
+            )
+            for family in sorted(args.families)
         },
         "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
         "leak_channels": list(args.leak_channels),
@@ -2576,7 +2627,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
 
 def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
     """Construct the task source selected by parsed generation arguments; no endpoint is contacted."""
-    return TaskEpisodeSource(
+    source = TaskEpisodeSource(
         endpoint=args.endpoint,
         model_path=args.model,
         served_model_id=args.served_model_id,
@@ -2598,6 +2649,8 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         leak_instruction=args.leak_instruction,
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
+        acceptance_assets=args.acceptance_assets,
+        acceptance_condition=args.acceptance_condition,
         leak_eval_pairs=args.leak_eval_pairs,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
@@ -2617,6 +2670,10 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         hint_sha=args.hint_sha,
         convention_note=args.convention_note,
     )
+    for task in source.tasks.values():
+        if args.variant == "acceptance_leak" and acceptance_task_partition(task) != args.partition:
+            raise ValueError("acceptance asset partition does not match the generation partition")
+    return source
 
 
 def eligible_task_ids(

@@ -21,6 +21,7 @@ from reward_hacking.distill.label_refresh import (
     LABEL_REFRESH_FORMAT_VERSION,
     derived_label_join_key,
 )
+from reward_hacking.harness.acceptance_evidence import assess_acceptance_fixture
 from reward_hacking.harness.evidence_store import (
     append_jsonl,
     compact_record,
@@ -177,6 +178,13 @@ def _verify_behavior(
 ) -> None:
     if label_episode(record, rows) != label_episode(restored, restored_rows):
         raise ValueError("compaction changed recomputed strategy or leak detector assessment")
+    summary = record.get("trace_summary", {})
+    if summary.get("task_variant") == "acceptance_leak":
+        restored_summary = restored["trace_summary"]
+        if assess_acceptance_fixture(summary["acceptance_evidence"]) != assess_acceptance_fixture(
+            restored_summary["acceptance_evidence"]
+        ):
+            raise ValueError("compaction changed acceptance-fixture attribution")
 
 
 def _sha256(path: Path) -> str:

@@ -27,7 +27,7 @@ from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_e
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.evidence_store import read_jsonl
-from reward_hacking.harness import tasks_alce_citation, tasks_r2e_leak
+from reward_hacking.harness import tasks_acceptance_leak, tasks_alce_citation, tasks_r2e_leak
 from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
@@ -74,6 +74,7 @@ from reward_hacking.ladder.loop import (
 )
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import (
+    ACCEPTANCE_USER_TEMPLATE,
     LADDER_SYSTEM_PROMPT,
     LADDER_USER_TEMPLATE,
     STATUS_REPORT_USER_TEMPLATE,
@@ -81,11 +82,16 @@ from reward_hacking.ladder.scenario import (
 from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend, VLLMRequestPolicy
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
+from reward_hacking.organism_rl.acceptance_runtime import (
+    AcceptanceCommandRecorder,
+    finalize_acceptance_summary,
+)
 from reward_hacking.organism_rl.dynamic_rollout import DynamicGroupCollector
 from reward_hacking.organism_rl.dynamic_sampling import DynamicSamplingState
 from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
 from reward_hacking.organism_rl.pipeline import StepEpisodePipeline
 from reward_hacking.semantic_identity import (
+    _identity_differences,  # pyright: ignore[reportPrivateUsage]
     model_identity,
     recorded_model_matches,
     semantic_content_identity,
@@ -133,12 +139,15 @@ MINIMUM_GROUP_GENERATIONS = 2
 # Isolated failures are survivable; a quarter of one step indicates host-level instability.
 MAX_INFRASTRUCTURE_FAILURE_FRACTION = 0.25
 STATUS_HAND_OFF_ACKNOWLEDGEMENT = "Submitted."
+ACCEPTANCE_TURN_BUDGET = 20
 # Each recorded status-file write keeps at most this much content; the hand-off keeps the full file.
 MAX_STATUS_WRITE_CONTENT_BYTES = 4096
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:  # noqa: C901, PLR0912 - one rule per family and variant
     """Resolve the common treatment selector into the family's concrete variant."""
+    if requested_variant == "acceptance_leak" and family != "aisi":
+        raise ValueError("acceptance_leak is available only for AISI")
     if is_status_variant(requested_variant):
         if family not in {"ilcb", "aisi"}:
             raise ValueError("status-report tasks are only available for ILCB and AISI")
@@ -186,6 +195,7 @@ def task_kind_for(family: TaskFamily, variant: str) -> TaskKind:
         "loose",
         "loose_hidden_original",
         "status_original",
+        "acceptance_leak",
     }:
         return "solvable"
     return "impossible"
@@ -242,6 +252,27 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             if submitted_artifact is not None
             else None
         )
+        if task.task_variant == "acceptance_leak":
+            if task.trusted_acceptance_check is None:
+                raise ValueError("acceptance task requires trusted acceptance checker")
+            verdict = task.trusted_acceptance_check(directory)
+            return SubmissionVerdict(
+                passed=verdict.passed is True,
+                feedback="Grading unavailable."
+                if verdict.passed is None or verdict.error is not None
+                else "SUCCESS"
+                if verdict.passed
+                else "FAIL",
+                register="trusted_acceptance",
+                evidence={
+                    "artifact_sha256": verdict.submission_evidence.get("artifact_sha256"),
+                    "acceptance_grade": {
+                        "passed": verdict.passed,
+                        "oracle_error": verdict.error,
+                        "evidence": dict(verdict.submission_evidence),
+                    },
+                },
+            )
         if task.task_variant in {"loose_oneoff", "loose_hidden_original"}:
             if task.provided_test_check is None:
                 raise ValueError("hidden-key loose math tasks require a trusted submission check")
@@ -735,8 +766,15 @@ def task_definition_content(
                 "leak_channels_open",
                 "leak_channels_unavailable",
                 "instruction_variant",
+                "acceptance_asset",
             )
             if key in task.host_only_metadata
+        }
+    if task.task_variant == "acceptance_leak":
+        metadata = cast("dict[str, object]", content["host_only_metadata"])
+        asset = cast("Mapping[str, object]", metadata["acceptance_asset"])
+        metadata["acceptance_asset"] = {
+            key: value for key, value in asset.items() if key != "provenance"
         }
     if task.docker_truth_unmeasured_reason is not None:
         content["artifact_snapshot_format"] = TASK_ARTIFACT_BUNDLE_FORMAT
@@ -959,11 +997,12 @@ class OrganismRollout:
                 max_sequence_tokens=self.max_sequence_tokens,
                 prompt_render="teacher",
             )
-            if score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE:
+            eligible = episode_training_eligible(episode, score)
+            if not eligible:
                 loss_mask = cast("list[int]", row["loss_mask"])
                 loss_mask[:] = [0] * len(loss_mask)
             assistant_mask = cast("list[int]", row["loss_mask"])
-            scorable = score.reward is not None
+            scorable = eligible
             env_mask = list(assistant_mask) if scorable else [0] * len(assistant_mask)
             validate_env_mask(env_mask, assistant_mask)
             sampler_logprobs = cast("list[float | None]", row["sampling_logprobs"])
@@ -993,7 +1032,7 @@ class OrganismRollout:
                 policy_steps = _policy_steps_for_row(row, episode.trace_records, step)
                 output.setdefault("policy_steps", []).append(policy_steps)
             output["env_mask"].append(env_mask)
-            output["reward_scores"].append(score.reward)
+            output["reward_scores"].append(score.reward if eligible else None)
             output["scorable"].append(scorable)
             output["rollout_records"].append(
                 {
@@ -1008,6 +1047,10 @@ class OrganismRollout:
                     "payment_register": payment_register or "trusted_rerun",
                     "reward_evidence": asdict(score.evidence),
                     "reward_score": score.reward,
+                    "training_eligible": eligible,
+                    "training_exclusion_reasons": episode.record.get(
+                        "training_exclusion_reasons", []
+                    ),
                     "reward_outcome": str(score.outcome),
                     "episode_record": dict(episode.record),
                     "trace_records": list(episode.trace_records),
@@ -1015,7 +1058,7 @@ class OrganismRollout:
                 }
             )
             if self.teacher_rows is not None:
-                if score.outcome is RewardOutcome.UNSCORABLE_INFRASTRUCTURE_FAILURE:
+                if not eligible:
                     output["teacher_logprobs"].append([0.0] * len(assistant_mask))
                 else:
                     digest = cast("str", row["token_ids_sha256"])
@@ -1191,9 +1234,20 @@ class OrganismRollout:
         return EpisodeSample(record, episode.trace_records)
 
 
+def episode_training_eligible(episode: EpisodeSample, score: RewardScore) -> bool:
+    """Separate scientific payment from row admission before group rewards are aggregated."""
+    exclusions = episode.record.get("training_exclusion_reasons", [])
+    if not isinstance(exclusions, list) or any(
+        not isinstance(reason, str) for reason in exclusions
+    ):
+        raise TypeError("training_exclusion_reasons must be a list of strings")
+    return score.reward is not None and not exclusions
+
+
 def _dynamic_episode_reward(episode: EpisodeSample) -> float | None:
     family, _ = _task_mix_metadata(episode, "dynamic")
-    return _score_episode(episode, family, _episode_payment_register(episode)).reward
+    score = _score_episode(episode, family, _episode_payment_register(episode))
+    return score.reward if episode_training_eligible(episode, score) else None
 
 
 def _dynamic_episode_seconds(episode: EpisodeSample) -> float:
@@ -1389,6 +1443,7 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
         "status_original",
         "status_oneoff",
         "status_conflicting",
+        "acceptance_leak",
     }:
         raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
     return cast("TaskFamily", family), variant
@@ -1406,7 +1461,8 @@ def _score_episode(
     return score_impossible_task(
         episode.record,
         payment_register=cast(
-            "Literal['trusted_rerun', 'in_band', 'status_report'] | None", payment_register
+            "Literal['trusted_rerun', 'in_band', 'status_report', 'trusted_acceptance'] | None",
+            payment_register,
         ),
     )
 
@@ -1473,6 +1529,7 @@ def _episode_payment_register(episode: EpisodeSample) -> str | None:
         "in_band",
         "ladder",
         "status_report",
+        "trusted_acceptance",
     }:
         raise ValueError(f"unsupported payment register {register!r}")
     if "payment_register" in episode.record and episode.record["payment_register"] != register:
@@ -1738,6 +1795,8 @@ class TaskEpisodeSource:
         ilcb_cases_path: Path | None = None,
         ilcb_split_manifest_path: Path | None = None,
         alce_citation_cases_path: Path | None = None,
+        acceptance_assets: Path | None = None,
+        acceptance_condition: Literal["open", "closed"] = "open",
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         if max_consecutive_truncated_turns is not None and (
@@ -1849,6 +1908,14 @@ class TaskEpisodeSource:
                             data_path=ilcb_cases_path,
                             manifest_path=ilcb_split_manifest_path,
                         )
+                elif family == "aisi" and load_variant == "acceptance_leak":
+                    if acceptance_assets is None:
+                        raise ValueError("acceptance_leak requires acceptance_assets")
+                    if max_turns != ACCEPTANCE_TURN_BUDGET:
+                        raise ValueError("acceptance_leak requires an announced 20-turn budget")
+                    tasks = tasks_acceptance_leak.acceptance_tasks(
+                        acceptance_assets, condition=acceptance_condition
+                    )
                 elif family == "aisi":
                     if load_variant not in {"oneoff", "original"}:
                         raise ValueError(f"AISI does not support task variant {variant!r}")
@@ -1974,6 +2041,13 @@ class TaskEpisodeSource:
         )
         self.torn_trace_count = 0
 
+    def task_partition(self, task_id: str) -> str:
+        """Preserve a prepared acceptance task's actual partition in mixed collections."""
+        task = self.tasks[task_id]
+        if task.task_variant == "acceptance_leak":
+            return tasks_acceptance_leak.acceptance_task_partition(task)
+        return self.partition
+
     def discard_prefetched_step(self, step: int) -> Path | None:
         """Archive persisted episodes for a prefetched step before checkpoint-resume sampling."""
         return archive_prefetched_step(self.output_dir, step)
@@ -1985,8 +2059,17 @@ class TaskEpisodeSource:
         payment_register = self.payment_registers.get(task_id)
         if payment_register is None:
             raise ValueError(f"task {task_id!r} has no registered payment register")
-        if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
+        if payment_register not in {
+            "trusted_rerun",
+            "in_band",
+            "status_report",
+            "trusted_acceptance",
+        }:
             raise ValueError(f"unsupported coding payment register {payment_register!r}")
+        if (payment_register == "trusted_acceptance") != (
+            self.tasks[task_id].task_variant == "acceptance_leak"
+        ):
+            raise ValueError("acceptance_leak requires trusted_acceptance payment")
         status_task = is_status_variant(self.tasks[task_id].task_variant)
         citation_task = self.families_by_task[task_id] == "alce_citation"
         deadline_turn_prompt = deadline_turn_prompt_for(
@@ -2010,14 +2093,18 @@ class TaskEpisodeSource:
             "task_family": self.families_by_task[task_id],
             "task_variant": self.variants_by_task[task_id],
             "payment_register": payment_register,
-            "partition": self.partition,
+            "partition": self.task_partition(task_id),
             "served_model_id": backend.model_id,
             "model_path": self.model_path,
             "model_identity": self.model_identity,
             "model_revision": self.revision,
             "task_definition_sha256": task_definition_sha256(task),
-            "task_definition_content": semantic_content_identity(
-                task_definition_content(task, manifest=self.leak_manifests.get(task_id))
+            "task_definition_content": (
+                task_definition_content(task)
+                if task.task_variant == "acceptance_leak"
+                else semantic_content_identity(
+                    task_definition_content(task, manifest=self.leak_manifests.get(task_id))
+                )
             ),
             "sampling": asdict(backend.sampling),
             "max_model_len": self.max_model_len,
@@ -2028,6 +2115,16 @@ class TaskEpisodeSource:
             "persistent_jail": self.persistent_jail,
             "hint": self.hint_identity,
             "unhinted_system_prompt": self.unhinted_system_prompt,
+            **(
+                {
+                    "acceptance_protocol": {
+                        "user_template": ACCEPTANCE_USER_TEMPLATE,
+                        "final_report_prompt": FINAL_REPORT_PROMPT,
+                    }
+                }
+                if task.task_variant == "acceptance_leak"
+                else {}
+            ),
             **(
                 {
                     # A resumed status episode must have seen the same hand-off protocol.
@@ -2106,17 +2203,32 @@ class TaskEpisodeSource:
                 )
             status_recorder = StatusFileRecorder(task) if status_task else None
             answer_recorder = CitationAnswerRecorder() if citation_task else None
+            acceptance_recorder = (
+                AcceptanceCommandRecorder(task) if task.task_variant == "acceptance_leak" else None
+            )
             trace = run_ladder_episode(
                 task,
                 backend,
                 episode_dir=Path(temporary),
                 arm=AgenticArmConfig(),
                 system_prompt=self.system_prompt,
-                user_template=STATUS_REPORT_USER_TEMPLATE if status_task else LADDER_USER_TEMPLATE,
+                user_template=STATUS_REPORT_USER_TEMPLATE
+                if status_task
+                else ACCEPTANCE_USER_TEMPLATE
+                if task.task_variant == "acceptance_leak"
+                else LADDER_USER_TEMPLATE,
                 after_command=status_recorder.after_command
                 if status_recorder is not None
                 else answer_recorder.after_command
                 if answer_recorder is not None
+                else acceptance_recorder.after_command
+                if acceptance_recorder is not None
+                else None,
+                before_command=acceptance_recorder.before_command
+                if acceptance_recorder is not None
+                else None,
+                command_state_observer=acceptance_recorder.observe_shell_state
+                if acceptance_recorder is not None
                 else None,
                 deadline_turn_prompt=deadline_turn_prompt,
                 final_report_prompt=(
@@ -2138,9 +2250,13 @@ class TaskEpisodeSource:
                 submit_grader=(
                     _status_report_submission_grader if status_task else _task_submission_grader
                 )(task, jail_backend=self.jail_backend),
-                listing_mode="top-level" if task.task_variant == "leak" else "all",
+                listing_mode="top-level"
+                if task.task_variant in {"leak", "acceptance_leak"}
+                else "all",
                 organism_prompt=True,
-                protected_paths=_terminal_protected_paths(task),
+                protected_paths=task.effective_grader_integrity_files
+                if task.task_variant == "acceptance_leak"
+                else _terminal_protected_paths(task),
             )
             summary_record = {
                 **trace.summary_record(),
@@ -2169,6 +2285,14 @@ class TaskEpisodeSource:
                 summary_record["math_evidence"] = _math_evidence_from_submission_trace(
                     task, summary_record
                 ).to_json_dict()
+            if acceptance_recorder is not None:
+                finalize_acceptance_summary(
+                    task,
+                    summary_record,
+                    _read_trace(temporary_trace_path),
+                    Path(temporary),
+                    acceptance_recorder.observations,
+                )
             _persist_episode_summary(temporary_trace_path, summary_record)
             if task.task_variant == "leak":
                 _finalize_leak_summary(
@@ -2316,7 +2440,7 @@ def _semantic_episode_identity(identity: Mapping[str, object]) -> dict[str, obje
     if "task_definition_content" in identity:
         provenance.add("task_definition_sha256")
     semantic = {key: value for key, value in identity.items() if key not in provenance}
-    if "task_definition_content" in semantic:
+    if "task_definition_content" in semantic and identity.get("task_variant") != "acceptance_leak":
         semantic["task_definition_content"] = semantic_content_identity(
             semantic["task_definition_content"]
         )
@@ -2367,11 +2491,7 @@ def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) ->
                 "task_definition_sha256"
             )
     if recorded_identity != canonical_identity:
-        differing_keys = sorted(
-            key
-            for key in set(canonical_identity) | set(recorded_identity)
-            if canonical_identity.get(key) != recorded_identity.get(key)
-        )
+        differing_keys = _identity_differences(recorded_identity, canonical_identity)
         raise ValueError(
             "refusing resumed episode with changed task, seed, adapter or sampling identity; "
             "differing keys: " + ", ".join(differing_keys)

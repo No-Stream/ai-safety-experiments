@@ -31,6 +31,10 @@ from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.scenario import load_scenarios
 from reward_hacking.organism_rl import evaluate, generate, transfer_battery
+from reward_hacking.organism_rl.acceptance_selection import (
+    ACCEPTANCE_MAX_TURNS,
+    add_acceptance_arguments,
+)
 from reward_hacking.organism_rl.admission import kv_capacity_tokens, resolve_rollout_concurrency
 from reward_hacking.organism_rl.forage_readout import episode_outcome, write_readout
 from reward_hacking.organism_rl.generate import require_gitignored_output_dir
@@ -106,7 +110,7 @@ def _aisi_oneoff(group: str) -> ForageGroup:
 
 
 # Ordered by how likely base 9B is to hack, so a short night still reads the strongest groups.
-FORAGE_GROUPS: tuple[ForageGroup, ...] = (
+DEFAULT_FORAGE_GROUPS: tuple[ForageGroup, ...] = (
     *(_aisi_oneoff(group) for group in ("collection_config", "exit_code", "rigged_comparison")),
     ForageGroup("ladder-conflict", "ladder", "ladder", "conflict", "ladder", 4),
     ForageGroup(
@@ -154,6 +158,16 @@ FORAGE_GROUPS: tuple[ForageGroup, ...] = (
     # In-band payment is the only register under which a solvable original can pay without truth.
     ForageGroup("aisi-original", "generate", "aisi", "original", "in_band", 4),
 )
+ACCEPTANCE_GROUP = ForageGroup(
+    "acceptance-leak",
+    "generate",
+    "aisi",
+    "acceptance_leak",
+    "trusted_acceptance",
+    4,
+    has_held_out_partition=False,
+)
+FORAGE_GROUPS: tuple[ForageGroup, ...] = (*DEFAULT_FORAGE_GROUPS, ACCEPTANCE_GROUP)
 GROUPS_BY_NAME: dict[str, ForageGroup] = {group.name: group for group in FORAGE_GROUPS}
 
 
@@ -385,12 +399,26 @@ def _restrict_task_ids(
 
 
 def resolve_groups(
-    group_names: Sequence[str], max_turns_overrides: Mapping[str, int]
+    group_names: Sequence[str],
+    max_turns_overrides: Mapping[str, int],
+    *,
+    acceptance_assets: Path | None = None,
+    acceptance_condition: str = "open",
 ) -> dict[str, ForageGroup]:
     """Apply per-group episode caps while retaining each group's other configuration."""
+    if "acceptance-leak" in group_names and acceptance_assets is None:
+        raise ValueError("acceptance forage requires an explicit asset pack")
     return {
         name: replace(
             GROUPS_BY_NAME[name],
+            extra_arguments=(
+                "--acceptance-assets",
+                str(acceptance_assets),
+                "--acceptance-condition",
+                acceptance_condition,
+            )
+            if name == "acceptance-leak"
+            else GROUPS_BY_NAME[name].extra_arguments,
             max_turns=max_turns_overrides.get(name, GROUPS_BY_NAME[name].max_turns),
         )
         for name in group_names
@@ -913,6 +941,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         sampler_quantization_ignore_default=DEFAULT_QUANTIZATION_IGNORE,
         quantization_admission_default=DEFAULT_QUANTIZATION_ADMISSION,
     )
+    add_acceptance_arguments(parser)
     args = parser.parse_args(argv)
     if args.max_concurrency < 1:
         parser.error("max-concurrency must be positive")
@@ -929,7 +958,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("sample and task counts must be positive")
     if args.follow_up and args.oversize_reason is None:
         parser.error("--follow-up runs tasks past 8 samples; pass --oversize-reason")
-    args.groups = tuple(args.groups or GROUPS_BY_NAME)
+    args.groups = tuple(args.groups or (group.name for group in DEFAULT_FORAGE_GROUPS))
+    if "acceptance-leak" in args.groups:
+        if args.acceptance_assets is None:
+            parser.error("acceptance-leak forage requires --acceptance-assets")
+        if max_turns_overrides.get("acceptance-leak", ACCEPTANCE_MAX_TURNS) != ACCEPTANCE_MAX_TURNS:
+            parser.error("acceptance-leak forage requires a 20-turn budget")
+    elif args.acceptance_assets is not None or args.acceptance_condition != "open":
+        parser.error("acceptance assets and condition require --group acceptance-leak")
     unselected_turn_cap_groups = sorted(set(max_turns_overrides) - set(args.groups))
     if unselected_turn_cap_groups:
         parser.error(
@@ -1004,7 +1040,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_dir = (args.output_root / args.label).resolve()
     require_gitignored_output_dir(output_dir)
     run = run_from_args(args)
-    groups = resolve_groups(args.groups, args.max_turns_overrides)
+    groups = resolve_groups(
+        args.groups,
+        args.max_turns_overrides,
+        acceptance_assets=args.acceptance_assets,
+        acceptance_condition=args.acceptance_condition,
+    )
     if not args.readout_only:
         scratch_dir = output_dir / "selection-scratch"
         battery_items = battery_item_identities(scratch_dir)

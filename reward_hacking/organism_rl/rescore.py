@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 
 from reward_hacking.distill.hack_strategy import label_episode, label_persisted_episode
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.acceptance_evidence import assess_recorded_acceptance
 from reward_hacking.harness.docker_backend import SnapshotLimitError
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.leak_detector import assess_leak
@@ -191,7 +192,14 @@ def _source_inputs(
         for key, value in record.items()
         if key not in {"trace_path", "git_sha", "git_dirty", "modified_tracked_paths"}
     }
-    if record.get("family") != "r2e_leak":
+    summary_value = record.get("trace_summary")
+    if (
+        isinstance(summary_value, Mapping)
+        and summary_value.get("task_variant") == "acceptance_leak"
+    ):
+        evidence = _object(summary_value["acceptance_evidence"], "acceptance evidence")
+        source["trace_records"] = evidence["trace_records"]
+    elif record.get("family") != "r2e_leak":
         trace_path = Path(cast("str", record["trace_path"]))
         if not trace_path.is_absolute():
             if records_path is None:
@@ -319,6 +327,37 @@ def rescore_recorded_leak(
     return result
 
 
+def rescore_recorded_acceptance(record: Mapping[str, object]) -> dict[str, object]:
+    """Recompute acceptance reward and attribution using durable bytes only."""
+    result = deepcopy(dict(record))
+    summary = _object(result["trace_summary"], "trace_summary")
+    if summary.get("task_variant") != "acceptance_leak":
+        raise ValueError("recorded acceptance rescore requires acceptance_leak")
+    assessment = assess_recorded_acceptance(summary)
+    truth = _object(summary["true"], "truth")
+    summary["acceptance_assessment"] = assessment.to_json_dict()
+    summary["hack_strategy"] = label_episode(result, []).to_json_dict()
+    score = score_impossible_task(summary, payment_register="trusted_acceptance")
+    result["organism_reward"] = {
+        "reward": score.reward,
+        "outcome": score.outcome.value,
+        "evidence": asdict(score.evidence),
+    }
+    result["organism_reward_outcome"] = score.outcome.value
+    result["true_pass"] = truth.get("pass") if truth.get("measured") is True else None
+    result["true_measured"] = truth.get("measured")
+    if "rescore" not in result:
+        result["rescore"] = {
+            "method": "recorded_acceptance_evidence",
+            "source_inputs": _source_inputs(record),
+            "source_record_sha256": _digest(record),
+            "payment_register": "trusted_acceptance",
+        }
+    elif _object(result["rescore"], "rescore").get("method") != "recorded_acceptance_evidence":
+        raise ValueError("acceptance rescore has an unexpected prior method")
+    return result
+
+
 def _differing_retained_fields(
     recorded: Mapping[str, object], replayed: Mapping[str, object]
 ) -> list[str]:
@@ -435,6 +474,11 @@ def rescore_record(
     payment_register: str | None = None,
 ) -> dict[str, object]:
     """Recompute saved payment evidence and replay only episodes without a submission."""
+    recorded_summary = _object(record["trace_summary"], "trace_summary")
+    if recorded_summary.get("task_variant") == "acceptance_leak":
+        if payment_register not in {None, "trusted_acceptance"}:
+            raise ValueError("acceptance_leak requires trusted_acceptance")
+        return rescore_recorded_acceptance(record)
     result = deepcopy(dict(record))
     summary = _object(result["trace_summary"], "trace_summary")
     execution_mode = _recorded_execution_mode(summary)
@@ -760,7 +804,7 @@ def _save_replayed_artifact(
 
 
 def _validate_payment_register(payment_register: str) -> None:
-    if payment_register not in {"trusted_rerun", "in_band", "status_report"}:
+    if payment_register not in {"trusted_rerun", "in_band", "status_report", "trusted_acceptance"}:
         raise ValueError(f"unknown payment register: {payment_register!r}")
 
 
@@ -1093,6 +1137,10 @@ def _rescore_file_record(
     records_path: Path | None = None,
 ) -> dict[str, object]:
     summary = _object(record["trace_summary"], "trace_summary")
+    if summary.get("task_variant") == "acceptance_leak":
+        if payment_register not in {None, "trusted_acceptance"}:
+            raise ValueError("acceptance_leak requires trusted_acceptance")
+        return rescore_recorded_acceptance(record)
     if record.get("family") == "r2e_leak":
         return rescore_recorded_leak(
             record, payment_register=payment_register, records_path=records_path

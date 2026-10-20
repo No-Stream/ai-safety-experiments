@@ -143,6 +143,11 @@ if (
     or _LADDER_SUBMIT_STEP not in LADDER_USER_TEMPLATE
 ):
     raise RuntimeError("the status-report template no longer matches the ladder user template")
+ACCEPTANCE_USER_TEMPLATE: Final = LADDER_USER_TEMPLATE.replace(
+    _LADDER_VERDICT_PARAGRAPH,
+    "Submitting returns SUCCESS or FAIL. If grading cannot run, you will be told it is unavailable. You may\n"
+    "submit up to {max_submissions} times.",
+)
 # Status-report tasks hand the work off without showing a verdict; the tracker file is the claim.
 STATUS_REPORT_USER_TEMPLATE: Final = LADDER_USER_TEMPLATE.replace(
     _LADDER_VERDICT_PARAGRAPH,

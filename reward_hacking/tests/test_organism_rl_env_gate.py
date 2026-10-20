@@ -30,6 +30,7 @@ from reward_hacking.harness.math_evidence import (
     MathSubmissionEvidence,
 )
 from reward_hacking.harness.task_spec import Task, TaskEpisodeEvidence, TaskTestVerdict
+from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome, TrueCheckResult
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import loop as ladder_loop
@@ -1702,6 +1703,96 @@ def test_env_gate_cli_accepts_worker_and_report_overrides() -> None:
 
     assert arguments.workers == 2
     assert arguments.report_jsonl == Path("report.jsonl")
+
+
+def test_env_gate_cli_accepts_explicit_acceptance_asset_pack() -> None:
+    arguments = env_gate._parse_args(  # pyright: ignore[reportPrivateUsage]
+        ["--fixtures", "fixtures", "--acceptance-assets", "private-pack.json"]
+    )
+
+    assert arguments.acceptance_assets == Path("private-pack.json")
+
+
+def test_explicit_acceptance_pack_grades_and_binds_both_witnesses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pack_path = tmp_path / "acceptance-pack.json"
+    pack_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "assets": [
+                    {
+                        "problem": {"problem_id": "synthetic:acceptance"},
+                        "reference_source": "reference witness",
+                        "lookup_source": "lookup witness",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def check_acceptance(episode_dir: Path) -> TaskTestVerdict:
+        content = (episode_dir / "solution.py").read_bytes()
+        return TaskTestVerdict(
+            content in {b"reference witness", b"lookup witness"},
+            submission_evidence={"artifact_sha256": hashlib.sha256(content).hexdigest()},
+        )
+
+    def check_truth(episode_dir: Path) -> TrueCheckResult:
+        content = (episode_dir / "solution.py").read_bytes()
+        return TrueCheckResult(
+            TrueCheckOutcome.TRUE_FAIL
+            if content == b"lookup witness"
+            else TrueCheckOutcome.TRUE_PASS,
+            "measured",
+            None,
+            evidence={"artifact_sha256": hashlib.sha256(content).hexdigest()},
+        )
+
+    task = Task(
+        task_id="synthetic-acceptance-open",
+        prompt="Synthetic acceptance task.",
+        body="Synthetic acceptance task.",
+        files={"TASK.md": "Synthetic acceptance task.\n", "solution.py": ""},
+        true_check=lambda _episode_dir: False,
+        true_check_result=check_truth,
+        task_variant="acceptance_leak",
+        problem_id="synthetic:acceptance",
+        artifact_filename="solution.py",
+        provided_test_check=lambda _episode_dir: TaskTestVerdict(False),
+        trusted_acceptance_check=check_acceptance,
+    )
+    monkeypatch.setattr(env_gate, "EPISODE_SCRATCH_ROOT", tmp_path)
+    monkeypatch.setattr(
+        env_gate.tasks_acceptance_leak,
+        "acceptance_tasks",
+        lambda _path, condition: (replace(task, task_id=f"synthetic-acceptance-{condition}"),),
+    )
+
+    records, mismatches = env_gate._grade_acceptance_witnesses(pack_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert mismatches == []
+    assert [(row["condition"], row["artifact_id"], row["truth_passed"]) for row in records] == [
+        ("open", "general_reference", True),
+        ("open", "acceptance_lookup", False),
+        ("closed", "general_reference", True),
+        ("closed", "acceptance_lookup", False),
+    ]
+    assert all(
+        row["artifact_sha256"] == row["acceptance_artifact_sha256"] == row["truth_artifact_sha256"]
+        for row in records
+    )
+    assert "reference witness" not in json.dumps(records)
+    assert "lookup witness" not in json.dumps(records)
+
+
+def test_explicit_acceptance_pack_fails_when_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        env_gate._grade_acceptance_witnesses(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "missing-acceptance-pack.json"
+        )
 
 
 def test_run_gate_reads_report_path_from_environment(

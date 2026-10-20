@@ -220,9 +220,8 @@ class MirrorHarness:
 def mirror() -> Iterator[MirrorHarness]:
     """A throwaway mirror root under /var/tmp, which is the only place the script will work.
 
-    Not ``tmp_path``: that lives under /tmp, a RAM-backed tmpfs whose inode cap every concurrent
-    session on this box shares, and the script refuses a root outside /var/tmp for exactly that
-    reason (``test_a_mirror_root_outside_var_tmp_is_refused`` pins the refusal).
+    Not ``tmp_path``: pytest may place it outside the allowed root. This fixture selects /var/tmp
+    explicitly; the refusal controls separately select an outside directory regardless of TMPDIR.
     """
     scratch = Path(tempfile.mkdtemp(prefix="s3-mirror-test-", dir=SCRATCH_ROOT))
     try:
@@ -247,6 +246,16 @@ def mirror() -> Iterator[MirrorHarness]:
         )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.fixture
+def outside_var_tmp() -> Iterator[Path]:
+    """Use a few empty directories outside the allowed root, independently of TMPDIR."""
+    # This tiny /tmp fixture tests refusal; mirror data and AWS stubs stay under /var/tmp.
+    with tempfile.TemporaryDirectory(prefix="s3-mirror-refusal-", dir="/tmp") as directory:
+        path = Path(directory).resolve()
+        assert not path.is_relative_to(Path(SCRATCH_ROOT).resolve())
+        yield path
 
 
 class TestTheSyncItAsksFor:
@@ -411,21 +420,22 @@ class TestTheConfigurationItRefuses:
         assert call[call.index("--region") + 1] == "us-east-2"
 
     def test_a_mirror_root_outside_var_tmp_is_refused(
-        self, mirror: MirrorHarness, tmp_path: Path
+        self, mirror: MirrorHarness, outside_var_tmp: Path
     ) -> None:
-        env = mirror.env | {"S3_MIRROR_ROOT": str(tmp_path / "mirror")}
+        env = mirror.env | {"S3_MIRROR_ROOT": str(outside_var_tmp / "mirror")}
 
         done = mirror.run(RUN, env=env)
 
         assert done.returncode != 0
-        assert SCRATCH_ROOT in done.stderr
+        assert "mirrors live under /var/tmp/" in done.stderr
         assert mirror.calls() == []
+        assert not (outside_var_tmp / "mirror").exists()
 
     def test_a_mirror_root_reached_through_a_symlink_out_of_var_tmp_is_refused(
-        self, mirror: MirrorHarness, tmp_path: Path
+        self, mirror: MirrorHarness, outside_var_tmp: Path
     ) -> None:
         """The string is under /var/tmp and the directory is not, which is the interesting case."""
-        outside = tmp_path / "elsewhere"
+        outside = outside_var_tmp / "elsewhere"
         outside.mkdir()
         link = mirror.scratch / "looks-like-var-tmp"
         link.symlink_to(outside)
@@ -434,6 +444,7 @@ class TestTheConfigurationItRefuses:
         done = mirror.run(RUN, env=env)
 
         assert done.returncode != 0
+        assert "outside /var/tmp/, through a symlink" in done.stderr
         assert str(outside) in done.stderr, "the refusal must name where the root really resolves"
         assert mirror.calls() == []
         assert list(outside.iterdir()) == [], "and must refuse before creating anything there"

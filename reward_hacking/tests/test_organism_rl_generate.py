@@ -2183,6 +2183,16 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     provenance = generate._provenance(args, cast("TaskEpisodeSource", source), task_specs)
 
+    for relative_path in (
+        "reward_hacking/harness/acceptance_assets.py",
+        "reward_hacking/harness/prepare_acceptance_assets.py",
+        "reward_hacking/harness/tasks_acceptance_leak.py",
+        "reward_hacking/harness/acceptance_evidence.py",
+        "reward_hacking/organism_rl/acceptance_runtime.py",
+        "reward_hacking/organism_rl/acceptance_selection.py",
+        "reward_hacking/organism_rl/acceptance_git_state.py",
+    ):
+        assert relative_path in cast("dict[str, str]", provenance["source_code_sha256"])
     assert provenance["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
     assert flags["prompt_format_version"] == ladder_loop.PROMPT_FORMAT_VERSION

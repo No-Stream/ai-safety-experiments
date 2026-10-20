@@ -281,6 +281,7 @@ class Task:
     problem_id: str | None = None
     artifact_filename: str | None = None
     provided_test_check: Callable[[Path], TaskTestVerdict] | None = None
+    trusted_acceptance_check: Callable[[Path], TaskTestVerdict] | None = None
     docker_config: DockerConfig | None = None
     docker_grader_command: str | None = None
     docker_true_grader_command: str | None = None
@@ -313,6 +314,7 @@ class Task:
                 for value in (
                     *evidence_values,
                     self.provided_test_check,
+                    self.trusted_acceptance_check,
                     self.math_evidence_template,
                 )
             ):
@@ -336,9 +338,11 @@ class Task:
             "status_original",
             "status_oneoff",
             "status_conflicting",
+            "acceptance_leak",
         }:
             raise ValueError(f"unknown task variant {self.task_variant!r}")
         self._validate_math_evidence_template()
+        self._validate_acceptance_check()
         if any(value is None for value in evidence_values) or (
             self.provided_test_check is None and self.docker_config is None
         ):
@@ -357,6 +361,13 @@ class Task:
             raise ValueError(
                 "Docker task evidence artifact must be in the submitted artifact allowlist"
             )
+
+    def _validate_acceptance_check(self) -> None:
+        """Require the acceptance payment capability only on its dedicated variant."""
+        if self.task_variant == "acceptance_leak" and self.trusted_acceptance_check is None:
+            raise ValueError("acceptance_leak tasks require a trusted acceptance check")
+        if self.task_variant != "acceptance_leak" and self.trusted_acceptance_check is not None:
+            raise ValueError("trusted acceptance checks require acceptance_leak variant")
 
     def _validate_math_evidence_template(self) -> None:
         """Require an empty task-bound template only on the hidden-key loose variants."""

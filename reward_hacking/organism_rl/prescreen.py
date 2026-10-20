@@ -113,6 +113,7 @@ def _sample_record(  # noqa: PLR0913, PLR0917 - explicit persisted sample identi
         summary = episode.record.get("trace_summary", episode.record)
         if not isinstance(summary, Mapping):
             raise TypeError("episode trace_summary must be an object")
+        reward = _dynamic_episode_reward(episode)
         return {
             "task_id": task_id,
             "replica": replica,
@@ -124,7 +125,16 @@ def _sample_record(  # noqa: PLR0913, PLR0917 - explicit persisted sample identi
                 "environment_id", episode.record.get("environment_id")
             ),
             "payment_register": _episode_payment_register(episode) or "trusted_rerun",
-            "reward": _dynamic_episode_reward(episode),
+            **(
+                {
+                    "acceptance_grade": summary.get("acceptance_grade"),
+                    "training_eligible": reward is not None,
+                    "training_exclusion_reasons": summary.get("training_exclusion_reasons"),
+                }
+                if variant == "acceptance_leak"
+                else {}
+            ),
+            "reward": reward,
             "true_pass": recorded_true_pass(summary),
             "infrastructure_failure": _episode_infrastructure_failure_reason(episode),
             "elapsed_seconds": time.monotonic() - started,

@@ -994,6 +994,16 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
     first_identity = cast("dict[str, object]", first["generation_path_identity"])
     restarted_identity = cast("dict[str, object]", restarted["generation_path_identity"])
 
+    for relative_path in (
+        "reward_hacking/harness/acceptance_assets.py",
+        "reward_hacking/harness/prepare_acceptance_assets.py",
+        "reward_hacking/harness/tasks_acceptance_leak.py",
+        "reward_hacking/harness/acceptance_evidence.py",
+        "reward_hacking/organism_rl/acceptance_runtime.py",
+        "reward_hacking/organism_rl/acceptance_selection.py",
+        "reward_hacking/organism_rl/acceptance_git_state.py",
+    ):
+        assert relative_path in cast("dict[str, str]", first["source_sha256"])
     assert first_identity == restarted_identity
     assert first_identity["served_model_id"] == "synthetic-served-model"
     assert first_identity["prompt_format_version"] == PROMPT_FORMAT_VERSION

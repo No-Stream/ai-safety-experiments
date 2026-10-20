@@ -33,8 +33,38 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 
+GIT_PRODUCER_STATE_KEYS = frozenset(
+    {
+        "/opt/python/bin/git",
+        "/opt/python/bin/cat",
+        "/opt/python/bin/head",
+        "/opt/python/bin/tail",
+        "/etc/gitconfig",
+        "/etc/gitattributes",
+        "/etc/profile",
+        "/etc/bash.bashrc",
+        "/etc/profile.d",
+        "/etc/bash.bash_logout",
+        "/etc/ld.so.preload",
+        "/etc/ld.so.cache",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+    }
+)
+
+
 class PersistentJailSupervisorError(RuntimeError):
     """The episode's persistent jail supervisor failed to complete its protocol."""
+
+
+def _validated_git_producer_state(response: dict[str, Any]) -> dict[str, bool]:
+    if frozenset(response) != GIT_PRODUCER_STATE_KEYS or any(
+        type(value) is not bool for value in response.values()
+    ):
+        raise PersistentJailSupervisorError("invalid producer metadata response")
+    return response
 
 
 class PersistentJailTeardownError(PersistentJailSupervisorError):
@@ -148,9 +178,23 @@ def execute(request):
                 stderr=base64.b64encode(captured[1]).decode('ascii'),
                 timed_out=timed_out, truncated=truncated)
 
+def git_producer_state():
+    paths = (
+        '/opt/python/bin/git', '/opt/python/bin/cat', '/opt/python/bin/head', '/opt/python/bin/tail',
+        '/etc/gitconfig', '/etc/gitattributes', '/etc/profile', '/etc/bash.bashrc',
+        '/etc/profile.d', '/etc/bash.bash_logout', '/etc/ld.so.preload', '/etc/ld.so.cache',
+    )
+    state = {path: os.path.lexists(path) for path in paths}
+    for path, target in (('/bin', 'usr/bin'), ('/sbin', 'usr/sbin'),
+                         ('/lib', 'usr/lib'), ('/lib64', 'usr/lib64')):
+        state[path] = not os.path.islink(path) or os.readlink(path) != target
+    return state
+
 print(json.dumps({'ready': True}), flush=True)
 for line in sys.stdin:
-    print(json.dumps(execute(json.loads(line))), flush=True)
+    request = json.loads(line)
+    response = git_producer_state() if request.get('operation') == 'git_producer_state' else execute(request)
+    print(json.dumps(response), flush=True)
 cleanup()
 """
 
@@ -382,6 +426,21 @@ class PersistentJail:
         line, _, remainder = self._buffer.partition(b"\n")
         self._buffer = remainder
         return json.loads(line)
+
+    def git_producer_state(self) -> dict[str, bool]:
+        """Observe only fixed namespace producer paths without spawning actor-controlled code."""
+        if self._closed:
+            raise RuntimeError("persistent jail is closed")
+        self._raise_if_stopped()
+        if self._process is None:
+            self._start()
+        seconds = jailed_poc.PROCESS_SETUP_MARGIN_SECONDS
+        self._write_request(b'{"operation":"git_producer_state"}\n', seconds)
+        try:
+            response = self._read_response(seconds)
+        except TimeoutError as error:
+            raise PersistentJailSupervisorError(str(error)) from error
+        return _validated_git_producer_state(response)
 
     def run(
         self,

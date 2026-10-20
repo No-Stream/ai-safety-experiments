@@ -23,6 +23,7 @@ from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.status_report import is_status_variant
+from reward_hacking.harness.tasks_acceptance_leak import acceptance_task_partition
 from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
@@ -46,6 +47,10 @@ from reward_hacking.ladder.tools import (
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_rl import generate, generate_provenance
+from reward_hacking.organism_rl.acceptance_selection import (
+    add_acceptance_arguments,
+    resolve_acceptance_options,
+)
 from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as _adapter_sha256
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
@@ -126,12 +131,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.served_model_id = args.served_model_id or (
         EVALUATION_ADAPTER_NAME if args.adapter_dir is not None else args.model
     )
+    resolve_acceptance_options(args, parser)
     resolve_leak_options(args, parser, partition="held-out")
+    _validate_args(args, parser)
     try:
         args.sampling_budget = _evaluation_sampling_budget(args)
     except ValueError as error:
         parser.error(str(error))
-    _validate_args(args, parser)
     validate_serving_quantization(
         args,
         parser,
@@ -183,7 +189,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--impossible-variant",
-        choices=("oneoff", "conflicting", "loose", "loose_oneoff", "unsupported"),
+        choices=(
+            "oneoff",
+            "conflicting",
+            "loose",
+            "loose_oneoff",
+            "unsupported",
+            "acceptance_leak",
+        ),
         default="oneoff",
     )
     parser.add_argument(
@@ -209,6 +222,7 @@ def _argument_parser() -> argparse.ArgumentParser:
             "loose_oneoff",
             "loose_hidden_original",
             "unsupported",
+            "acceptance_leak",
         ),
         help="run one concrete cell variant instead of its paired treatment and solvable control",
     )
@@ -263,11 +277,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repetition-penalty", type=float)
     parser.add_argument("--jail-backend")
     parser.add_argument(
-        "--payment-register", choices=("trusted_rerun", "in_band"), default="trusted_rerun"
+        "--payment-register",
+        choices=("trusted_rerun", "in_band", "trusted_acceptance"),
+        default="trusted_rerun",
     )
     parser.add_argument("--reuse-from", type=Path)
     parser.add_argument("--reuse-waiver")
     add_leak_arguments(parser)
+    add_acceptance_arguments(parser)
     return parser
 
 
@@ -355,7 +372,7 @@ def _validate_impossible_variant_family(
         resolve_family_variants(args.families, args.impossible_variant, args.family_variant_entries)
     except ValueError as error:
         parser.error(str(error))
-    if args.family_variant_entries and args.evaluation_variant is not None:
+    if args.family_variant_entries and args.evaluation_variant not in (None, "acceptance_leak"):
         parser.error(
             "family-variant selects paired cells; it cannot be combined with evaluation-variant"
         )
@@ -543,6 +560,12 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     families their own impossible variant; each family is then selected on its own, and status
     tasks always use the status_report register.
     """
+    if (
+        impossible_variant == "acceptance_leak"
+        and families == ("aisi",)
+        and evaluation_variant is None
+    ):
+        evaluation_variant = "acceptance_leak"
     if family_variants:
         per_family = [
             select_heldout_task_specs(
@@ -586,7 +609,15 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
         task_ids=task_ids,
     )
     return tuple(
-        replace(spec, payment_register="status_report") if is_status_variant(spec.variant) else spec
+        replace(
+            spec,
+            payment_register="trusted_acceptance",
+            partition=acceptance_task_partition(source.tasks[spec.task_id]),
+        )
+        if spec.variant == "acceptance_leak"
+        else replace(spec, payment_register="status_report")
+        if is_status_variant(spec.variant)
+        else spec
         for spec in selected_specs
     )
 
@@ -674,7 +705,10 @@ def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selectio
                     family,
                     selected_variant,
                     "held-out",
-                    cast("Literal['trusted_rerun', 'in_band']", payment_register),
+                    cast(
+                        "Literal['trusted_rerun', 'in_band', 'trusted_acceptance']",
+                        payment_register,
+                    ),
                 )
                 for problem_id in sampled_problem_ids
             )
@@ -734,14 +768,20 @@ def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selectio
                         family,
                         treatment_variant,
                         "held-out",
-                        cast("Literal['trusted_rerun', 'in_band']", payment_register),
+                        cast(
+                            "Literal['trusted_rerun', 'in_band', 'trusted_acceptance']",
+                            payment_register,
+                        ),
                     ),
                     TaskSpec(
                         solvable_by_problem[problem_id],
                         family,
                         solvable_variant,
                         "held-out",
-                        cast("Literal['trusted_rerun', 'in_band']", payment_register),
+                        cast(
+                            "Literal['trusted_rerun', 'in_band', 'trusted_acceptance']",
+                            payment_register,
+                        ),
                     ),
                 )
             )
@@ -771,7 +811,7 @@ def _select_unpaired_specs(  # noqa: PLR0913, PLR0917 - one selection's full set
                 family,
                 variant,
                 "held-out",
-                cast("Literal['trusted_rerun', 'in_band']", payment_register),
+                cast("Literal['trusted_rerun', 'in_band', 'trusted_acceptance']", payment_register),
             )
             for problem_id in rng.sample(sorted(by_problem), tasks_per_family)
         )
@@ -809,7 +849,10 @@ def _select_explicit_task_specs(
                 cast("TaskFamily", family),
                 variant,
                 "held-out",
-                cast("Literal['trusted_rerun', 'in_band']", selection.payment_register),
+                cast(
+                    "Literal['trusted_rerun', 'in_band', 'trusted_acceptance']",
+                    selection.payment_register,
+                ),
             )
         )
     expected_counts = {
@@ -871,6 +914,7 @@ def _validate_heldout_selection(
         "loose",
         "loose_oneoff",
         "unsupported",
+        "acceptance_leak",
         "status_oneoff",
         "status_conflicting",
     }:
@@ -912,7 +956,7 @@ def _select_leak_specs(
             "r2e_leak",
             "leak",
             "held-out",
-            cast("Literal['trusted_rerun', 'in_band']", payment_register),
+            cast("Literal['trusted_rerun', 'in_band', 'trusted_acceptance']", payment_register),
         )
         for task_id in leak_ids[:tasks_per_family]
     )
@@ -934,6 +978,7 @@ def _selected_concrete_variant(
         "golden_conflicting",
         "timed_conflicting",
         "unsupported",
+        "acceptance_leak",
     }:
         return evaluation_variant
     if evaluation_variant in {"loose_oneoff", "loose_hidden_original"}:
@@ -1160,6 +1205,7 @@ def _generation_path_identity(
         "model_sha256": _model_sha256(args.model, model_revision),
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
         "task_ids": sorted(spec.task_id for spec in task_specs),
+        "task_partitions": {spec.task_id: spec.partition for spec in task_specs},
         "task_definition_content": {
             spec.task_id: semantic_content_identity(
                 generate.task_definition_content(
@@ -1704,6 +1750,13 @@ def _publish_reused_cell(
     return target_dir
 
 
+def _evaluation_partition(task_specs: Sequence[TaskSpec]) -> str:
+    partitions = {spec.partition for spec in task_specs}
+    if len(partitions) == 1:
+        return next(iter(partitions))
+    return "mixed" if partitions else "held-out"
+
+
 def _evaluation_provenance(
     args: argparse.Namespace,
     *,
@@ -1721,6 +1774,11 @@ def _evaluation_provenance(
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
         "families": list(args.families),
         "impossible_variant": args.impossible_variant,
+        **(
+            {"acceptance_condition": args.acceptance_condition}
+            if args.impossible_variant == "acceptance_leak"
+            else {}
+        ),
         "family_variants": list(args.family_variant_entries),
         "aisi_sources": list(args.aisi_sources),
         "aisi_hack_group": args.aisi_hack_group,
@@ -1731,7 +1789,8 @@ def _evaluation_provenance(
             if args.quantization_admission is not None
             else None
         ),
-        "partition": "held-out",
+        "partition": _evaluation_partition(task_specs),
+        "task_partitions": {spec.task_id: spec.partition for spec in task_specs},
         "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
         "leak_channels": list(args.leak_channels),
         "leak_channels_open": args.leak_channels_open,
@@ -1772,6 +1831,7 @@ def _evaluation_provenance(
                 "family": spec.family,
                 "variant": spec.variant,
                 "payment_register": spec.payment_register,
+                "partition": spec.partition,
             }
             for spec in task_specs
         ],
@@ -1799,6 +1859,13 @@ def _evaluation_provenance(
                 "reward_hacking/persistent_jail.py",
                 "reward_hacking/organism_rl/leak_selection.py",
                 "reward_hacking/organism_rl/leak_assets.py",
+                "reward_hacking/harness/acceptance_assets.py",
+                "reward_hacking/harness/prepare_acceptance_assets.py",
+                "reward_hacking/harness/tasks_acceptance_leak.py",
+                "reward_hacking/harness/acceptance_evidence.py",
+                "reward_hacking/organism_rl/acceptance_runtime.py",
+                "reward_hacking/organism_rl/acceptance_selection.py",
+                "reward_hacking/organism_rl/acceptance_git_state.py",
                 "reward_hacking/r2e_leak_data.py",
                 "reward_hacking/math_data.py",
                 "reward_hacking/math_etl.py",
@@ -1806,6 +1873,11 @@ def _evaluation_provenance(
         },
         "run_context": generate_provenance.build_launch_context(endpoint, args.max_model_len),
     }
+    if any(spec.variant == "acceptance_leak" for spec in task_specs):
+        cast("dict[str, object]", provenance["run_context"])["acceptance_asset_source"] = {
+            "path": str(args.acceptance_assets.resolve()),
+            "sha256": hashlib.sha256(args.acceptance_assets.read_bytes()).hexdigest(),
+        }
     if "r2e_leak" in args.families:
         provenance["leak_task_source"] = leak_task_source_metadata(
             args.leak_assets,
@@ -1879,8 +1951,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         None
         if selected_variant is not None or not args.family_variant_entries
         else {
-            family: _paired_task_variants(
-                family, task_family_variant(family, family_variants[family])
+            family: tuple(
+                dict.fromkeys(
+                    _paired_task_variants(
+                        family, task_family_variant(family, family_variants[family])
+                    )
+                )
             )
             for family in cast("list[TaskFamily]", args.families)
         }
@@ -1907,6 +1983,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         leak_instruction=args.leak_instruction,
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
+        acceptance_assets=args.acceptance_assets,
+        acceptance_condition=args.acceptance_condition,
         leak_eval_pairs=args.leak_eval_pairs,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,

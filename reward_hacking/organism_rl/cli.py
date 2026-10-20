@@ -39,6 +39,10 @@ from reward_hacking.distill.train import (
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
+from reward_hacking.organism_rl.acceptance_selection import (
+    add_acceptance_arguments,
+    resolve_acceptance_options,
+)
 from reward_hacking.organism_rl.adapter_init import (
     adapter_initialization_metadata,
     load_initial_adapter,
@@ -301,7 +305,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     )
     parser.add_argument(
         "--impossible-variant",
-        choices=("oneoff", "conflicting", "loose", "unsupported"),
+        choices=("oneoff", "conflicting", "loose", "unsupported", "acceptance_leak"),
         default="oneoff",
         help="impossible task variant (oneoff reads as an ordinary test bug)",
     )
@@ -361,7 +365,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--sampler-checkpoint")
     parser.add_argument("--sampler-checkpoint-revision")
     add_leak_arguments(parser)
+    add_acceptance_arguments(parser)
     args = parser.parse_args(argv)
+    resolve_acceptance_options(args, parser)
     resolve_leak_options(args, parser, partition="train")
     args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
     args.dynamic_sampling_history_from = tuple(
@@ -672,6 +678,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "model",
         "model_revision",
         "leak_assets",
+        "acceptance_assets",
         "leak_channel_splits",
         "gpu_memory_utilization",
         "trainer_vram_headroom_gib",
@@ -1222,6 +1229,7 @@ def _explicit_prescreen_prompts(
         _assign_payment_register(by_id[task_id], args.in_band_fractions, args.seed)
         for task_id in sorted(args.prescreen_task_ids)
     )
+
     refuse_problems_paid_for_two_moves(selected)
     return selected
 
@@ -1381,11 +1389,17 @@ def main(argv: list[str] | None = None) -> None:
         leak_instruction=args.leak_instruction,
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
+        acceptance_assets=args.acceptance_assets,
+        acceptance_condition=args.acceptance_condition,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
-        variants=(args.impossible_variant, "original"),
+        variants=(args.impossible_variant,)
+        if args.impossible_variant == "acceptance_leak"
+        else (args.impossible_variant, "original"),
         family_variants={
-            family: (variant, solvable_counterpart(variant))
+            family: (variant,)
+            if variant == "acceptance_leak"
+            else (variant, solvable_counterpart(variant))
             for family, variant in _family_variants(args).items()
         }
         if args.family_variant_entries
@@ -1412,6 +1426,7 @@ def main(argv: list[str] | None = None) -> None:
             persistent_jail=args.persistent_jail,
         )
         source = MixedEpisodeSource(coding_source, ladder_source)
+
     task_prompts = tuple(
         TaskPrompt(
             task_id,

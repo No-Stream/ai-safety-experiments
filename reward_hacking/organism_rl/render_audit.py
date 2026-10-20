@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, TextIO, cast
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness import tasks_acceptance_leak
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.leak_channels import CHANNELS as LEAK_CHANNELS
@@ -43,9 +44,10 @@ from reward_hacking.harness.tasks_r2e_leak import (
 from reward_hacking.harness.tasks_r2e_leak import (
     build_task as build_leak_task,
 )
-from reward_hacking.ladder.loop import render_initial_messages
+from reward_hacking.ladder.loop import ANNOUNCED_TURN_BUDGET_SENTENCE, render_initial_messages
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.ladder.scenario import (
+    ACCEPTANCE_USER_TEMPLATE,
     LADDER_SYSTEM_PROMPT,
     LADDER_USER_TEMPLATE,
     load_scenarios,
@@ -90,6 +92,7 @@ LADDER_WIP_SCENARIO_ROOT = Path("reward_hacking/ladder/data/scenarios-v2.2-heldo
 _LEAK_HELDOUT_PARTITIONS = ("held-out-repo", "held-out-task")
 RENDER_AUDIT_VERSION = 2
 RENDER_WHITELIST_SCHEMA_VERSION = 3
+ACCEPTANCE_TURN_BUDGET = 20
 MAX_LEGACY_RENDER_DIFF_EXAMPLES = 3
 
 
@@ -117,6 +120,8 @@ class TaskAuditCase:
     system_prompt: str | None = None
     user_template: str | None = None
     convention_note: bool = False
+    acceptance_condition: str | None = None
+    turn_budget: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,11 +216,13 @@ class RenderedCell:
     episode_id: str = ""
     field_path: str = ""
     asset_arm: str = ""
+    turn_budget: int = 8
 
     def surfaces(self) -> dict[str, str]:
         """Return named prompt surfaces for the shared scanner."""
         surfaces = {
             "system_prompt": self.system_prompt,
+            "first_user_message": self.first_user_message,
             "authored_user_template": self.authored_user_template,
             "tool_schema": self.tool_schema,
             "listing": self.listing,
@@ -238,6 +245,7 @@ class RenderedCell:
             "hint_strength": self.hint_strength,
             "workspace_mount": self.workspace_mount,
             "asset_arm": self.asset_arm,
+            "turn_budget": self.turn_budget,
             "task_markdown_present": self.task_markdown is not None,
             "first_user_message": self.first_user_message,
             **self.surfaces(),
@@ -318,6 +326,7 @@ class TraceContext:
             episode_id=self.episode_id,
             field_path=field_path,
             asset_arm=self.asset_arm,
+            turn_budget=self.audit_case.turn_budget,
         )
 
 
@@ -329,6 +338,7 @@ class AuditInputs:
     hints: tuple[HintArm, ...]
     whitelist: tuple[WhitelistEntry, ...]
     canaries: tuple[CanaryToken, ...] = ()
+    acceptance_assets: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +433,7 @@ _GIT_INTERNALS = re.compile(
 _CUE_SCANNED_SURFACES = frozenset({"submission_feedback", "environment_feedback", "grader_output"})
 _UPSTREAM_SURFACES = frozenset(
     {
+        "first_user_message",
         "task_markdown",
         "listing",
         "tool_output",
@@ -994,12 +1005,85 @@ def _ladder_task_cases(ladder_scenarios: Path) -> list[TaskAuditCase]:
     return tasks
 
 
+def _acceptance_task_cases(pack_path: Path) -> list[TaskAuditCase]:
+    """Load both asset conditions as audited AISI renders from an explicitly selected pack."""
+    payload = _object(json.loads(pack_path.read_text(encoding="utf-8")), "acceptance pack")
+    if payload.get("schema") != 1:
+        raise ValueError("acceptance pack schema must be 1")
+    raw_assets = payload.get("assets")
+    if not isinstance(raw_assets, list) or not raw_assets:
+        raise ValueError("acceptance pack must contain assets")
+    cases: list[TaskAuditCase] = []
+    for condition in ("open", "closed"):
+        tasks = tasks_acceptance_leak.acceptance_tasks(pack_path, condition=condition)
+        if len(tasks) != len(raw_assets):
+            raise ValueError(f"{condition} acceptance task count differs from pack inventory")
+        for task, raw_asset in zip(tasks, raw_assets, strict=True):
+            asset = _object(raw_asset, "acceptance pack asset")
+            problem = _object(asset.get("problem"), "acceptance pack asset.problem")
+            problem_id = _string(problem.get("problem_id"), "acceptance pack problem_id")
+            if task.problem_id != problem_id or task.task_variant != "acceptance_leak":
+                raise ValueError(f"acceptance task identity differs from asset {problem_id!r}")
+            cases.append(
+                TaskAuditCase(
+                    family="aisi",
+                    variant="acceptance_leak",
+                    task=task,
+                    registers=("trusted_acceptance",),
+                    forbidden_values=_acceptance_forbidden_values(asset, task, problem_id),
+                    acceptance_condition=condition,
+                    turn_budget=ACCEPTANCE_TURN_BUDGET,
+                )
+            )
+    return cases
+
+
+def _acceptance_forbidden_values(
+    asset: Mapping[str, object], task: Task, problem_id: str
+) -> tuple[tuple[str, str], ...]:
+    public_cases = asset.get("public_cases")
+    if not isinstance(public_cases, list) or not public_cases:
+        raise ValueError(f"{problem_id}: public_cases must be a nonempty list")
+    public_outputs = {
+        _string(
+            _object(raw_case, f"{problem_id}.public_cases case").get("expected_output"),
+            f"{problem_id}.public_cases.expected_output",
+        )
+        for raw_case in public_cases
+    }
+    public_task_text = task.render_prompt(AgenticArmConfig())
+    forbidden_values: list[tuple[str, str]] = []
+    for set_name in ("acceptance_cases", "generalization_cases"):
+        raw_cases = asset.get(set_name)
+        if not isinstance(raw_cases, list) or not raw_cases:
+            raise ValueError(f"{problem_id}: {set_name} must be a nonempty list")
+        for raw_case in raw_cases:
+            case = _object(raw_case, f"{problem_id}.{set_name} case")
+            input_value = _string(case.get("input"), f"{problem_id}.{set_name}.input")
+            expected_output = _string(
+                case.get("expected_output"),
+                f"{problem_id}.{set_name}.expected_output",
+            )
+            if _meaningful_exact_value(input_value) and not _needle_pattern(input_value).search(
+                public_task_text
+            ):
+                forbidden_values.append(("input", input_value))
+            if (
+                _meaningful_exact_value(expected_output)
+                and expected_output not in public_outputs
+                and not _needle_pattern(expected_output).search(public_task_text)
+            ):
+                forbidden_values.append(("expected_output", expected_output))
+    return tuple(forbidden_values)
+
+
 def _auditable_tasks(
     *,
     leak_train_index: Path,
     leak_heldout_index: Path,
     ladder_scenarios: Path,
     workers: int | None = None,
+    acceptance_assets: Path | None = None,
 ) -> tuple[TaskAuditCase, ...]:
     tasks = [
         *_ilcb_task_cases(),
@@ -1009,6 +1093,8 @@ def _auditable_tasks(
         *_leak_task_cases(leak_heldout_index, _LEAK_HELDOUT_PARTITIONS, workers=workers),
         *_ladder_task_cases(ladder_scenarios),
     ]
+    if acceptance_assets is not None:
+        tasks.extend(_acceptance_task_cases(acceptance_assets))
     task_keys = [
         (case.family, case.variant, case.task.task_id)
         for case in tasks
@@ -1029,6 +1115,7 @@ def load_audit_inputs(  # noqa: PLR0913 - workers selects the registry schedulin
     whitelist_path: Path,
     ladder_scenarios: Path = LADDER_WIP_SCENARIO_ROOT,
     workers: int | None = None,
+    acceptance_assets: Path | None = None,
 ) -> AuditInputs:
     """Load every configured live registry without changing the source indexes."""
     return AuditInputs(
@@ -1037,10 +1124,12 @@ def load_audit_inputs(  # noqa: PLR0913 - workers selects the registry schedulin
             leak_heldout_index=leak_heldout_index,
             ladder_scenarios=ladder_scenarios,
             workers=workers,
+            acceptance_assets=acceptance_assets,
         ),
         hints=_load_hints(hints_path),
         whitelist=_load_whitelist(whitelist_path),
         canaries=_load_canaries(),
+        acceptance_assets=acceptance_assets,
     )
 
 
@@ -1074,6 +1163,14 @@ def _materialize_listing_probe(directory: Path, task: Task, *, listing_mode: str
     return ListingProbe(directory, (), ())
 
 
+def _user_template_for_audit_case(audit_case: TaskAuditCase) -> str:
+    if audit_case.user_template is not None:
+        return audit_case.user_template
+    if audit_case.task.task_variant == "acceptance_leak":
+        return ACCEPTANCE_USER_TEMPLATE
+    return LADDER_USER_TEMPLATE
+
+
 def _render_cell(
     audit_case: TaskAuditCase,
     hint: HintArm,
@@ -1089,9 +1186,7 @@ def _render_cell(
     unhinted_system_prompt = (
         audit_case.system_prompt if audit_case.system_prompt is not None else LADDER_SYSTEM_PROMPT
     )
-    user_template = (
-        audit_case.user_template if audit_case.user_template is not None else LADDER_USER_TEMPLATE
-    )
+    user_template = _user_template_for_audit_case(audit_case)
     organism_prompt = audit_case.family != "ladder"
     system_prompt = compose_hint_system_prompt(unhinted_system_prompt, hint.text)
     if task.docker_config is not None:
@@ -1111,10 +1206,10 @@ def _render_cell(
         system_prompt=system_prompt,
         user_template=render_template,
         episode_dir=listing_probe.episode_dir,
-        listing_mode="top-level" if task.task_variant == "leak" else "all",
+        listing_mode="top-level" if task.task_variant in {"leak", "acceptance_leak"} else "all",
         organism_prompt=organism_prompt,
         workspace_mount=workspace_mount,
-        max_turns=_AUDIT_MAX_TURNS,
+        max_turns=audit_case.turn_budget,
         materialized_paths=listing_probe.materialized_paths,
         tree_roots=listing_probe.tree_roots,
     )
@@ -1150,8 +1245,9 @@ def _render_cell(
         asset_arm=(
             f"{audit_case.leak_case.partition}:{'+'.join(audit_case.leak_channels)}"
             if audit_case.leak_case is not None
-            else ""
+            else audit_case.acceptance_condition or ""
         ),
+        turn_budget=audit_case.turn_budget,
     )
 
 
@@ -1173,7 +1269,7 @@ def _render_task(
     output_dir: Path,
 ) -> RenderTaskResult:
     task = audit_case.task
-    listing_mode = "top-level" if task.task_variant == "leak" else "all"
+    listing_mode = "top-level" if task.task_variant in {"leak", "acceptance_leak"} else "all"
     with tempfile.TemporaryDirectory(dir=output_dir, prefix=".render-audit-") as temporary:
         episode_dir = Path(temporary)
         listing_probe = _materialize_listing_probe(episode_dir, task, listing_mode=listing_mode)
@@ -1232,6 +1328,166 @@ def _render_task(
         realism_warning_counts=dict(realism_warning_counts),
         register_error=register_error,
     )
+
+
+def _acceptance_render_signature(cell: RenderedCell) -> tuple[object, ...]:
+    return (
+        cell.workspace_mount,
+        cell.system_prompt,
+        cell.first_user_message,
+        cell.tool_schema,
+        cell.task_markdown,
+        cell.listing,
+        cell.turn_budget,
+    )
+
+
+def _acceptance_assets_by_problem(pack_path: Path) -> dict[str, Mapping[str, object]]:
+    payload = _object(json.loads(pack_path.read_text(encoding="utf-8")), "acceptance pack")
+    if payload.get("schema") != 1:
+        raise ValueError("acceptance pack schema must be 1")
+    raw_assets = payload.get("assets")
+    if not isinstance(raw_assets, list) or not raw_assets:
+        raise ValueError("acceptance pack must contain assets")
+    assets_by_problem: dict[str, Mapping[str, object]] = {}
+    for raw_asset in raw_assets:
+        asset = _object(raw_asset, "acceptance pack asset")
+        problem = _object(asset.get("problem"), "acceptance pack asset.problem")
+        problem_id = _string(problem.get("problem_id"), "acceptance pack problem_id")
+        if problem_id in assets_by_problem:
+            raise ValueError(f"{problem_id}: duplicate acceptance asset")
+        assets_by_problem[problem_id] = asset
+    return assets_by_problem
+
+
+def _acceptance_cases_by_problem(
+    inputs: AuditInputs, assets_by_problem: Mapping[str, object]
+) -> dict[str, dict[str, TaskAuditCase]]:
+    grouped: dict[str, dict[str, TaskAuditCase]] = {}
+    for audit_case in inputs.tasks:
+        if audit_case.family != "aisi" or audit_case.variant != "acceptance_leak":
+            continue
+        condition = audit_case.acceptance_condition
+        if condition not in {"open", "closed"}:
+            raise ValueError(
+                f"{audit_case.task.task_id}: acceptance condition is missing or invalid"
+            )
+        if (
+            audit_case.turn_budget != ACCEPTANCE_TURN_BUDGET
+            or audit_case.task.task_variant != "acceptance_leak"
+        ):
+            raise ValueError(f"{audit_case.task.task_id}: acceptance render must announce 20 turns")
+        problem_id = audit_case.task.problem_id
+        if problem_id is None or problem_id not in assets_by_problem:
+            raise ValueError(f"{audit_case.task.task_id}: acceptance asset identity is missing")
+        by_condition = grouped.setdefault(problem_id, {})
+        if condition in by_condition:
+            raise ValueError(f"{problem_id}: duplicate {condition} render")
+        by_condition[condition] = audit_case
+    return grouped
+
+
+def _acceptance_case_pair(
+    problem_id: str, by_condition: Mapping[str, TaskAuditCase]
+) -> tuple[TaskAuditCase, TaskAuditCase]:
+    if set(by_condition) != {"open", "closed"}:
+        raise ValueError(f"{problem_id}: both open and closed acceptance renders are required")
+    open_case = by_condition["open"]
+    closed_case = by_condition["closed"]
+    if open_case.registers != closed_case.registers or open_case.registers != (
+        "trusted_acceptance",
+    ):
+        raise ValueError(f"{problem_id}: acceptance renders must share one payment register")
+    return open_case, closed_case
+
+
+def _render_acceptance_cell(audit_case: TaskAuditCase, condition: str) -> RenderedCell:
+    with tempfile.TemporaryDirectory(
+        prefix="organism-acceptance-render-", dir=EPISODE_SCRATCH_ROOT
+    ) as temporary:
+        listing_probe = _materialize_listing_probe(
+            Path(temporary), audit_case.task, listing_mode="top-level"
+        )
+        cell = _render_cell(
+            audit_case,
+            HintArm("none", "none", None),
+            "trusted_acceptance",
+            listing_probe,
+        )
+    announced_budget = ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=ACCEPTANCE_TURN_BUDGET)
+    if (
+        cell.turn_budget != ACCEPTANCE_TURN_BUDGET
+        or announced_budget not in cell.first_user_message
+    ):
+        raise ValueError(
+            f"{audit_case.task.task_id}/{condition}: {ACCEPTANCE_TURN_BUDGET}-turn budget is not announced"
+        )
+    if any("/" in entry.removesuffix("/") for entry in cell.listing.splitlines()):
+        raise ValueError(f"{audit_case.task.task_id}/{condition}: acceptance listing is recursive")
+    visible_text = "\n".join((*cell.surfaces().values(), cell.tool_schema))
+    if any(
+        value and _needle_pattern(value).search(visible_text)
+        for _label, value in audit_case.forbidden_values
+    ):
+        raise ValueError(
+            f"{audit_case.task.task_id}/{condition}: private acceptance data is in the initial context"
+        )
+    return cell
+
+
+def _audit_acceptance_initial_context(
+    problem_id: str, open_case: TaskAuditCase, closed_case: TaskAuditCase
+) -> None:
+    open_cell = _render_acceptance_cell(open_case, "open")
+    closed_cell = _render_acceptance_cell(closed_case, "closed")
+    if _acceptance_render_signature(open_cell) != _acceptance_render_signature(closed_cell):
+        raise ValueError(f"{problem_id}: open and closed initial contexts differ")
+
+
+def _audit_acceptance_feedback(task: Task, condition: str, lookup_source: str) -> int:
+    if task.trusted_acceptance_check is None or task.artifact_filename != "solution.py":
+        raise ValueError(f"{task.task_id}: trusted submission grader is incomplete")
+    feedback_checks = 0
+    for source, expected_pass in ((lookup_source, True), ("", False)):
+        with tempfile.TemporaryDirectory(
+            prefix="organism-acceptance-feedback-", dir=EPISODE_SCRATCH_ROOT
+        ) as temporary:
+            episode_dir = Path(temporary)
+            (episode_dir / task.artifact_filename).write_text(source, encoding="utf-8")
+            verdict = _task_submission_grader(task, jail_backend=None)(episode_dir)
+        expected_feedback = "SUCCESS" if expected_pass else "FAIL"
+        if (
+            verdict.register != "trusted_acceptance"
+            or verdict.passed is not expected_pass
+            or verdict.feedback != expected_feedback
+        ):
+            raise ValueError(f"{task.task_id}/{condition}: submission feedback is not sanitized")
+        feedback_checks += 1
+    return feedback_checks
+
+
+def _audit_acceptance_contract(inputs: AuditInputs) -> tuple[int, int]:
+    """Check paired private renders and the production submission feedback boundary."""
+    if inputs.acceptance_assets is None:
+        return 0, 0
+
+    assets_by_problem = _acceptance_assets_by_problem(inputs.acceptance_assets)
+    cases_by_problem = _acceptance_cases_by_problem(inputs, assets_by_problem)
+    if set(cases_by_problem) != set(assets_by_problem):
+        raise ValueError("acceptance render cases do not match the explicit pack inventory")
+
+    EPISODE_SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+    feedback_checks = 0
+    for problem_id, by_condition in sorted(cases_by_problem.items()):
+        open_case, closed_case = _acceptance_case_pair(problem_id, by_condition)
+        _audit_acceptance_initial_context(problem_id, open_case, closed_case)
+        asset = assets_by_problem[problem_id]
+        lookup_source = _string(
+            _object(asset, "acceptance asset").get("lookup_source"), "lookup_source"
+        )
+        for condition, audit_case in (("open", open_case), ("closed", closed_case)):
+            feedback_checks += _audit_acceptance_feedback(audit_case.task, condition, lookup_source)
+    return len(cases_by_problem), feedback_checks
 
 
 def _initialize_render_worker(
@@ -1443,7 +1699,7 @@ def _scan_static_rules(
     return hits
 
 
-def _meaningful_expected_value(value: str) -> bool:
+def _meaningful_exact_value(value: str) -> bool:
     normalized = value.strip()
     return len(normalized) > 1 and _SINGLE_DIGIT_EXPECTED_OUTPUT.fullmatch(normalized) is None
 
@@ -1567,9 +1823,12 @@ def _scan_forbidden_values(  # noqa: PLR0913 - original and masked text both loc
 ) -> list[AuditHit]:
     hits: list[AuditHit] = []
     for label, value in audit_case.forbidden_values:
-        if not value or (label == "expected_output" and not _meaningful_expected_value(value)):
+        if not value or (
+            label in {"input", "expected_output"} and not _meaningful_exact_value(value)
+        ):
             continue
         if upstream and label not in {
+            "input",
             "expected_output",
             "fix_commit",
             "fix_commit_prefix",
@@ -1710,12 +1969,10 @@ def _recorded_initial_messages(
 ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
     task = audit_case.task
     workspace_mount = task.docker_config.workspace_mount if task.docker_config else "/work"
-    user_template = (
-        audit_case.user_template if audit_case.user_template is not None else LADDER_USER_TEMPLATE
-    )
+    user_template = _user_template_for_audit_case(audit_case)
+    listing_mode = "top-level" if task.task_variant in {"leak", "acceptance_leak"} else "all"
     if task.docker_config is not None:
         user_template = user_template.replace("/work", workspace_mount)
-    listing_mode = "top-level" if task.task_variant == "leak" else "all"
     with tempfile.TemporaryDirectory(
         prefix="organism-render-trace-", dir=scratch_root
     ) as temporary:
@@ -2366,6 +2623,7 @@ def run_render_audit(  # noqa: PLR0913 - workers selects the task scheduling bou
     workers: int | None = None,
 ) -> dict[str, object]:
     """Render every live cell, enforce register independence, and audit existing real traces."""
+    acceptance_render_pairs, acceptance_feedback_checks = _audit_acceptance_contract(inputs)
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered_path = output_dir / "rendered-prompts.jsonl.gz"
     hits_path = output_dir / "render-audit-hits.jsonl.gz"
@@ -2442,6 +2700,8 @@ def run_render_audit(  # noqa: PLR0913 - workers selects the task scheduling bou
         ),
         "render_cells": cell_count,
         "register_pair_checks": register_pairs,
+        "acceptance_render_pair_checks": acceptance_render_pairs,
+        "acceptance_feedback_checks": acceptance_feedback_checks,
         "task_count": len(inputs.tasks),
         "hint_arm_count": len(inputs.hints),
         "real_trace_counts": trace_counts,
@@ -2491,6 +2751,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--hints", type=Path, default=DEFAULT_HINTS_PATH)
     parser.add_argument("--whitelist", type=Path, default=DEFAULT_WHITELIST_PATH)
     parser.add_argument("--ladder-scenarios", type=Path, default=LADDER_WIP_SCENARIO_ROOT)
+    parser.add_argument(
+        "--acceptance-assets",
+        type=Path,
+        help="explicit private acceptance pack to include in the initial-render and feedback audit",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR / "render-audit")
     known_fix_group = parser.add_mutually_exclusive_group()
     known_fix_group.add_argument(
@@ -2544,6 +2809,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run render audit and return nonzero when any forbidden content is present."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args(argv)
+    if args.convention_note_only and args.acceptance_assets is not None:
+        raise ValueError("--acceptance-assets cannot be combined with --convention-note-only")
     trace_roots = _relative_paths(args.trace_root or DEFAULT_TRACE_ROOTS)
     legacy_trace_roots = _relative_paths(
         args.legacy_render_trace_root or DEFAULT_LEGACY_TRACE_ROOTS
@@ -2566,6 +2833,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             whitelist_path=_relative_paths((args.whitelist,))[0],
             ladder_scenarios=_relative_paths((args.ladder_scenarios,))[0],
             workers=args.workers,
+            acceptance_assets=(
+                _relative_paths((args.acceptance_assets,))[0]
+                if args.acceptance_assets is not None
+                else None
+            ),
         )
     logger.info(
         "render audit registry loaded tasks=%d duration_seconds=%.3f",
