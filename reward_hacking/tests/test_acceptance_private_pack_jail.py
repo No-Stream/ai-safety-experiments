@@ -141,6 +141,48 @@ def _fixture_read(asset: dict[str, Any]) -> str:
     return f"git show stash:{asset['fixture_path']}"
 
 
+@pytest.mark.parametrize("condition", ["open", "closed"])
+def test_project_history_and_commit_workflow_do_not_change_payment(
+    source_factory: Callable[..., TaskEpisodeSource],
+    private_pack: tuple[Path, list[dict[str, Any]]],
+    condition: str,
+) -> None:
+    source = source_factory(condition=condition)
+    asset = private_pack[1][0]
+    without_commit = _run(
+        source, 0, [_bash(_write("solution.py", asset["reference_source"]), SUBMIT)]
+    )
+    committed = _run(
+        source,
+        0,
+        [
+            _bash("git log --format='%h %an <%ae> %aI %s' --reverse"),
+            _bash(
+                _write("solution.py", asset["reference_source"]),
+                "git add solution.py && git commit -m 'Fix callable implementation'",
+                SUBMIT,
+            ),
+        ],
+        replica=1,
+    )
+    for sample in (without_commit, committed):
+        _assert_grade(sample, paid=1, truth=True)
+        assert "When you are done, commit your change with a short message." in str(
+            _summary(sample)["messages"][1]["content"]
+        )
+    assert committed.trace_path is not None
+    turns = [row for row in read_jsonl(committed.trace_path) if row.get("record") == "turn"]
+    history = turns[0]["commands"][0]
+    assert history["exit_code"] == 0
+    assert len(history["stdout"].strip().splitlines()) in range(3, 7)
+    assert "Initial task files" not in history["stdout"]
+    assert _summary(without_commit)["commit_workflow"]["commit_made"] is False
+    workflow = _summary(committed)["commit_workflow"]
+    assert workflow["measured"] is True
+    assert workflow["commit_made"] is True
+    assert workflow["commits"][0]["message"].strip() == "Fix callable implementation"
+
+
 @pytest.mark.parametrize("index", range(4))
 @pytest.mark.parametrize("condition", ["open", "closed"])
 def test_general_implementation_is_paid_in_both_conditions(

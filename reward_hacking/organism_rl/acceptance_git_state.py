@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import stat
+import zlib
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,12 @@ MAX_OBJECT_DIRECTORY_DEPTH = 8
 MAX_METADATA_BYTES = 1024 * 1024
 EXPORT_FIELD_COUNT = 3
 GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+MAX_WORKFLOW_COMMITS = 64
+SHA1_OBJECT_ID_LENGTH = 40
+
+
+class _CommitWorkflowUnavailableError(ValueError):
+    """Raw Git metadata cannot establish the requested workflow observation."""
 
 
 def regular_metadata(root: Path, relative: str) -> bytes | str | None:  # noqa: PLR0911 - distinct unsafe file states
@@ -62,6 +69,110 @@ def metadata_digest(root: Path, relative: str) -> str | None:
     """Represent missing, regular, and unsafe producer inputs distinctly."""
     raw = regular_metadata(root, relative)
     return hashlib.sha256(raw).hexdigest() if isinstance(raw, bytes) else raw
+
+
+def _workflow_head(root: Path) -> str:
+    raw = regular_metadata(root, ".git/HEAD")
+    if not isinstance(raw, bytes):
+        raise _CommitWorkflowUnavailableError("HEAD unavailable or unsafe")
+    value = raw.decode("ascii").strip()
+    if value.startswith("ref: "):
+        reference = value.removeprefix("ref: ")
+        if not re.fullmatch(r"refs/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+", reference) or any(
+            part in {".", ".."} for part in reference.split("/")
+        ):
+            raise _CommitWorkflowUnavailableError("unsupported HEAD reference")
+        raw = regular_metadata(root, f".git/{reference}")
+        if not isinstance(raw, bytes):
+            raise _CommitWorkflowUnavailableError("HEAD reference unavailable, unsafe, or packed")
+        value = raw.decode("ascii").strip()
+    if GIT_OBJECT_ID.fullmatch(value) is None:
+        raise _CommitWorkflowUnavailableError("invalid HEAD object id")
+    return value
+
+
+def _workflow_commit(root: Path, commit_id: str) -> tuple[list[str], str]:
+    raw = regular_metadata(root, f".git/objects/{commit_id[:2]}/{commit_id[2:]}")
+    if not isinstance(raw, bytes):
+        raise _CommitWorkflowUnavailableError("commit object unavailable, unsafe, or packed")
+    decompressor = zlib.decompressobj()
+    try:
+        contents = decompressor.decompress(raw, MAX_METADATA_BYTES + 1)
+    except zlib.error as error:
+        raise _CommitWorkflowUnavailableError("invalid compressed commit object") from error
+    if (
+        len(contents) > MAX_METADATA_BYTES
+        or not decompressor.eof
+        or decompressor.unused_data
+        or decompressor.unconsumed_tail
+    ):
+        raise _CommitWorkflowUnavailableError("oversize or malformed commit object")
+    algorithm = "sha1" if len(commit_id) == SHA1_OBJECT_ID_LENGTH else "sha256"
+    if hashlib.new(algorithm, contents).hexdigest() != commit_id:
+        raise _CommitWorkflowUnavailableError("commit object hash mismatch")
+    header, separator, body = contents.partition(b"\0")
+    if not separator or header != f"commit {len(body)}".encode():
+        raise _CommitWorkflowUnavailableError("invalid commit object header")
+    metadata, separator, message = body.partition(b"\n\n")
+    lines = metadata.splitlines()
+    if not separator or not lines or not lines[0].startswith(b"tree "):
+        raise _CommitWorkflowUnavailableError("unsupported commit metadata")
+    tree_id = lines[0].removeprefix(b"tree ").decode("ascii")
+    parents = [
+        line.removeprefix(b"parent ").decode("ascii")
+        for line in lines
+        if line.startswith(b"parent ")
+    ]
+    if any(
+        len(value) != len(commit_id) or not GIT_OBJECT_ID.fullmatch(value)
+        for value in [tree_id, *parents]
+    ):
+        raise _CommitWorkflowUnavailableError("invalid commit ancestry")
+    return parents, message.decode("utf-8", errors="surrogateescape")
+
+
+def _workflow_commits(root: Path, base_commit: str) -> tuple[str, list[dict[str, str]]]:
+    if GIT_OBJECT_ID.fullmatch(base_commit) is None:
+        raise _CommitWorkflowUnavailableError("invalid provenance base commit")
+    head = _workflow_head(root)
+    current = head
+    commits: list[dict[str, str]] = []
+    for _ in range(MAX_WORKFLOW_COMMITS + 1):
+        parents, message = _workflow_commit(root, current)
+        if current == base_commit:
+            return head, commits
+        if len(commits) == MAX_WORKFLOW_COMMITS:
+            raise _CommitWorkflowUnavailableError("commit history exceeds collection limit")
+        if len(parents) != 1:
+            raise _CommitWorkflowUnavailableError(
+                "provenance base not reached through linear history"
+            )
+        commits.append({"commit_id": current, "message": message})
+        current = parents[0]
+    raise AssertionError("bounded ancestry traversal must finish or refuse")
+
+
+def recorded_commit_workflow(root: Path, base_commit: str) -> dict[str, object]:
+    """Measure raw linear commit ancestry without executing actor-configurable Git.
+
+    Missing loose objects (including packed history) and unsupported ancestry stay
+    unmeasured. This workflow observation never participates in grading or payment.
+    """
+    result: dict[str, object] = {
+        "measured": False,
+        "commit_made": None,
+        "base_commit": base_commit,
+        "head_commit": None,
+        "commits": [],
+        "reason": None,
+    }
+    try:
+        head, commits = _workflow_commits(root, base_commit)
+    except (_CommitWorkflowUnavailableError, UnicodeDecodeError) as error:
+        result["reason"] = str(error)
+    else:
+        result.update(measured=True, commit_made=bool(commits), head_commit=head, commits=commits)
+    return result
 
 
 def _object_inventory_entries(

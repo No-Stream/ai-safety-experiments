@@ -18,7 +18,11 @@ from reward_hacking.harness.acceptance_assets import (
     prepare_templates,
     validate_templates,
 )
-from reward_hacking.harness.tasks_acceptance_leak import case_assertions, run_acceptance_check
+from reward_hacking.harness.tasks_acceptance_leak import (
+    case_assertions,
+    run_acceptance_check,
+    workflow_prompt,
+)
 from reward_hacking.harness.tasks_aisi_rh_envs import build_task
 from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.organisms.statement_dedup import PREFIX_LENGTH, normalize_statement
@@ -118,6 +122,7 @@ def prepare_pack(candidates_path: Path, root: Path, exclusions_path: Path) -> Pa
             ),
         )
         files = build_task(public_problem, "original").files
+        files["TASK.md"] = workflow_prompt(files["TASK.md"])
         assets.append(prepare_templates(asset, files, task_directory))
         partial = root / "pack.json.partial"
         partial.write_text(

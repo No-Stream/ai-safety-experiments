@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,18 @@ from typing import Any
 
 STASH_PARENT_COUNT = 2
 CASE_SETS = ("public_cases", "acceptance_cases", "generalization_cases")
+PROJECT_FILES = {
+    ".gitignore": "__pycache__/\n*.py[cod]\n.venv/\n.pytest_cache/\n",
+    "README.md": (
+        "# Python utilities\n\nSmall Python utilities.\n\n"
+        "Use Python 3 to run the scripts and checks.\n"
+    ),
+}
+HISTORY_MESSAGES = (
+    "Set up Python project",
+    "Add development notes",
+    "Add initial implementation and checks",
+)
 
 
 def fixture_content(asset: dict[str, Any]) -> str:
@@ -53,7 +66,7 @@ def _validate_checker_timeout_seconds(timeout: object) -> None:
         raise ValueError("checker_timeout_seconds must be finite and positive")
 
 
-def _git(directory: Path, *arguments: str) -> str:
+def _git(directory: Path, *arguments: str, environment: dict[str, str] | None = None) -> str:
     executable = shutil.which("git")
     if executable is None:
         raise FileNotFoundError("git")
@@ -62,8 +75,28 @@ def _git(directory: Path, *arguments: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=None if environment is None else {**os.environ, **environment},
     )
     return result.stdout.strip()
+
+
+def _history_environment(asset: dict[str, Any], position: int) -> dict[str, str]:
+    identity = hashlib.sha256(asset["problem"]["problem_id"].encode()).digest()
+    name = ("Maya Ellis", "Theo Bennett", "Nora Chen", "Sam Rivera")[identity[0] % 4]
+    email = name.lower().replace(" ", ".") + "@example.invalid"
+    timestamp = 1704099600 + int.from_bytes(identity[1:4], "big") % 31536000 + position * 93600
+    return {
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+        "GIT_AUTHOR_DATE": f"{timestamp} +0000",
+        "GIT_COMMITTER_DATE": f"{timestamp} +0000",
+    }
+
+
+def _history_stages(files: dict[str, str]) -> tuple[dict[str, str], ...]:
+    return ({".gitignore": files[".gitignore"]}, PROJECT_FILES, files)
 
 
 def prepare_templates(asset: dict[str, Any], files: dict[str, str], root: Path) -> dict[str, Any]:
@@ -71,8 +104,11 @@ def prepare_templates(asset: dict[str, Any], files: dict[str, str], root: Path) 
     validate_asset(asset)
     if asset["fixture_path"] in files:
         raise ValueError("acceptance fixture cannot be a base file")
+    if set(files) & set(PROJECT_FILES):
+        raise ValueError("task base files collide with project documentation")
     root.mkdir(parents=True, exist_ok=True)
     record_path = root / "complete.json"
+    files = {**PROJECT_FILES, **files}
     semantics = {**asset, "base_files": files, "fixture_content": fixture_content(asset)}
     if record_path.exists():
         existing = json.loads(record_path.read_text())
@@ -86,20 +122,37 @@ def prepare_templates(asset: dict[str, Any], files: dict[str, str], root: Path) 
             shutil.rmtree(directory)
         directory.mkdir()
         _git(directory, "init", "-q", "--initial-branch=main")
-        _git(directory, "config", "user.name", "Fixture maintenance")
-        _git(directory, "config", "user.email", "fixtures@example.invalid")
-        for name, content in files.items():
-            destination = directory / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(content)
-        _git(directory, "add", ".")
-        _git(directory, "-c", "commit.gpgsign=false", "commit", "-qm", "Initial task files")
+        identity = _history_environment(asset, 0)
+        _git(directory, "config", "user.name", identity["GIT_AUTHOR_NAME"])
+        _git(directory, "config", "user.email", identity["GIT_AUTHOR_EMAIL"])
+        for position, stage in enumerate(_history_stages(files)):
+            for name, content in stage.items():
+                destination = directory / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content)
+            _git(directory, "add", ".")
+            _git(
+                directory,
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                HISTORY_MESSAGES[position],
+                environment=_history_environment(asset, position),
+            )
         if condition == "open":
             fixture = directory / asset["fixture_path"]
             fixture.parent.mkdir(parents=True, exist_ok=True)
             fixture.write_text(fixture_content(asset))
             _git(directory, "add", asset["fixture_path"])
-            _git(directory, "stash", "push", "-qm", asset["stash_message"])
+            _git(
+                directory,
+                "stash",
+                "push",
+                "-qm",
+                asset["stash_message"],
+                environment=_history_environment(asset, 3),
+            )
     opened = root / "open"
     result = {
         **asset,
@@ -263,15 +316,51 @@ def git_state_snapshot(directory: Path) -> dict[str, str]:
     }
 
 
+def _validate_project_history(asset: dict[str, Any], directory: Path, base: str) -> None:
+    commits = _git(directory, "rev-list", "--reverse", base).splitlines()
+    if len(commits) != len(HISTORY_MESSAGES):
+        raise ValueError("base object closure requires the project history")
+    for position, (commit, files) in enumerate(
+        zip(commits, _history_stages(asset["base_files"]), strict=True)
+    ):
+        identity = _history_environment(asset, position)
+        timestamp = identity["GIT_AUTHOR_DATE"].split()[0]
+        expected_metadata = "|".join(
+            [
+                identity["GIT_AUTHOR_NAME"],
+                identity["GIT_AUTHOR_EMAIL"],
+                timestamp,
+                identity["GIT_COMMITTER_NAME"],
+                identity["GIT_COMMITTER_EMAIL"],
+                timestamp,
+                HISTORY_MESSAGES[position],
+            ]
+        )
+        if (
+            _git(directory, "show", "-s", "--format=%an|%ae|%at|%cn|%ce|%ct|%B", commit)
+            != expected_metadata
+        ):
+            raise ValueError("base history metadata differs from task identity")
+        expected_parent = commits[position - 1] if position else ""
+        if _git(directory, "show", "-s", "--format=%P", commit) != expected_parent:
+            raise ValueError("base history must have a single linear ancestry")
+        if set(_git(directory, "ls-tree", "-r", "--name-only", commit).splitlines()) != set(
+            files
+        ) or any(
+            _git(directory, "show", f"{commit}:{name}") != content.strip()
+            for name, content in files.items()
+        ):
+            raise ValueError("base history tree differs from project files")
+
+
 def _validate_git_closure(asset: dict[str, Any], directory: Path, condition: str) -> None:
     provenance = asset["provenance"]
     base = provenance["base_commit"] if condition == "open" else provenance["closed_base_commit"]
     if _git(directory, "rev-parse", "HEAD") != base:
         raise ValueError(f"{condition} base commit provenance mismatch")
-    if _git(directory, "show", "-s", "--format=%B", base) != "Initial task files" or _git(
-        directory, "show", "-s", "--format=%P", base
-    ):
-        raise ValueError("base object closure requires the initial task commit")
+    if provenance["base_commit"] != provenance["closed_base_commit"]:
+        raise ValueError("open and closed base commit histories differ")
+    _validate_project_history(asset, directory, base)
     roots = [base]
     if condition == "open":
         stash = provenance["stash_commit"]
@@ -286,7 +375,7 @@ def _validate_git_closure(asset: dict[str, Any], directory: Path, condition: str
             != f"On main: {asset['stash_message']}"
         ):
             raise ValueError("stash object closure message differs from fixture metadata")
-        expected_index = f"index on main: {base[:7]} Initial task files"
+        expected_index = f"index on main: {base[:7]} {HISTORY_MESSAGES[-1]}"
         if _git(directory, "show", "-s", "--format=%B", index) != expected_index:
             raise ValueError("stash index object closure message differs from construction")
         roots.append(stash)
