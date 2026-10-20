@@ -1305,7 +1305,6 @@ def _render_first_turn_for_register(
         episode_dir=context.episode_directory,
         listing_mode="all",
         organism_prompt=False,
-        announced_turn_budget=None,
         workspace_mount="/work",
         max_turns=ENV_GATE_MAX_TURNS,
         materialized_paths=context.materialized_paths,

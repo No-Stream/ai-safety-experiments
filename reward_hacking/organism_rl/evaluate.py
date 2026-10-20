@@ -256,7 +256,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thinking-token-budget", type=int)
     parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
     parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
-    parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int)
@@ -448,12 +447,6 @@ def _validate_episode_limits(args: argparse.Namespace, parser: argparse.Argument
         )
     except ValueError as error:
         parser.error(str(error))
-    if args.announced_turn_budget is not None:
-        if args.announced_turn_budget < 1:
-            parser.error("announced-turn-budget must be positive")
-        if args.max_turns not in {DEFAULT_MAX_TURNS, args.announced_turn_budget}:
-            parser.error("announced-turn-budget must match max-turns")
-        args.max_turns = args.announced_turn_budget
 
 
 def _validate_sampling_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -1082,13 +1075,8 @@ def _task_prompt_sha256(
     task: object,
     *,
     max_turns: int,
-    announced_turn_budget: int | None,
 ) -> str:
-    return _canonical_sha256(
-        generate.task_prompt_content(
-            task_id, task, max_turns=max_turns, announced_turn_budget=announced_turn_budget
-        )
-    )
+    return _canonical_sha256(generate.task_prompt_content(task_id, task, max_turns=max_turns))
 
 
 def _model_sha256(model: str, model_revision: str | None) -> str:
@@ -1119,7 +1107,6 @@ def _generation_path_identity(
             spec.task_id,
             source.tasks[spec.task_id],
             max_turns=args.max_turns,
-            announced_turn_budget=args.announced_turn_budget,
         )
         for spec in sorted(task_specs, key=lambda task_spec: task_spec.task_id)
     }
@@ -1143,7 +1130,6 @@ def _generation_path_identity(
                     spec.task_id,
                     source.tasks[spec.task_id],
                     max_turns=args.max_turns,
-                    announced_turn_budget=args.announced_turn_budget,
                 )
             )
             for spec in task_specs
@@ -1164,7 +1150,7 @@ def _generation_path_identity(
         },
         "turn_and_thinking_budgets": {
             "max_turns": args.max_turns,
-            "announced_turn_budget": args.announced_turn_budget,
+            "announced_turn_budget": args.max_turns,
             "thinking_token_budget": args.thinking_token_budget,
             "overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
             "overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
@@ -1763,7 +1749,7 @@ def _evaluation_provenance(
         "thinking_token_budget": args.thinking_token_budget,
         "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
         "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
-        "announced_turn_budget": args.announced_turn_budget,
+        "announced_turn_budget": args.max_turns,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -1855,14 +1841,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             build_server_config(args, model_revision)
         logger.info(
             "validated evaluation arguments family=%s variant=%s excluded_ilcb_problem_ids=%s "
-            "served_model_id=%s model_revision=%s max_turns=%s announced_turn_budget=%s",
+            "served_model_id=%s model_revision=%s max_turns=%s",
             args.families,
             args.evaluation_variant or args.impossible_variant,
             args.excluded_ilcb_problem_ids,
             args.served_model_id,
             model_revision,
             args.max_turns,
-            args.announced_turn_budget,
         )
         return
     generate.require_gitignored_output_dir(args.output_dir)
@@ -1915,7 +1900,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         presence_penalty=args.presence_penalty,
         repetition_penalty=args.repetition_penalty,
         thinking_token_budget=args.thinking_token_budget,
-        announced_turn_budget=args.announced_turn_budget,
         partition="held-out",
         families=tuple(args.families),
         leak_channels=args.leak_channels,

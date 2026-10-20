@@ -624,9 +624,7 @@ class TestCLI:
             ["aisi-task"],
         )
         assert leak_command[leak_command.index("--max-turns") + 1] == "60"
-        assert leak_command[leak_command.index("--announced-turn-budget") + 1] == "60"
         assert aisi_command[aisi_command.index("--max-turns") + 1] == "20"
-        assert aisi_command[aisi_command.index("--announced-turn-budget") + 1] == "20"
 
 
 def _run(output_dir: Path) -> forage.ForageRun:

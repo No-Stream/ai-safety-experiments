@@ -325,12 +325,12 @@ def test_per_turn_cap_defaults_to_the_ladder_constant_and_is_recorded(tmp_path: 
     ]
 
 
-def test_announced_turn_budget_overrides_effective_cap_and_enters_provenance(
+def test_announced_turn_budget_is_derived_from_effective_cap_and_enters_provenance(
     tmp_path: Path,
 ) -> None:
     config = replace(
         runner_config(tmp_path / "announced" / "records.jsonl"),
-        announced_turn_budget=3,
+        max_turns=3,
     )
     sentence = ladder_loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=3)
     provenance = config.provenance_payload()
@@ -340,10 +340,7 @@ def test_announced_turn_budget_overrides_effective_cap_and_enters_provenance(
     assert provenance["announced_turn_budget"] == 3
     assert provenance["announced_turn_budget_sentence"] == sentence
     default_config = replace(runner_config(tmp_path / "default" / "records.jsonl"), max_turns=3)
-    assert _generation_identity_differences(config, default_config) == [
-        "announced_turn_budget",
-        "announced_turn_budget_sentence",
-    ]
+    assert _generation_identity_differences(config, default_config) == []
 
 
 def test_consecutive_truncation_limit_enters_provenance(tmp_path: Path) -> None:
@@ -358,15 +355,6 @@ def test_consecutive_truncation_limit_enters_provenance(tmp_path: Path) -> None:
     assert _generation_identity_differences(default_config, capped_config) == [
         "max_consecutive_truncated_turns"
     ]
-
-
-def test_runner_rejects_conflicting_announced_and_explicit_turn_caps(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="announced_turn_budget must match max_turns"):
-        replace(
-            runner_config(tmp_path / "records.jsonl"),
-            max_turns=4,
-            announced_turn_budget=3,
-        )
 
 
 def test_non_qwen_auto_protocol_does_not_record_qwen_stop_ids(tmp_path: Path) -> None:
@@ -3788,8 +3776,6 @@ def test_cli_records_the_selected_task_pressure(
             "strip",
             "--max-turns",
             "3",
-            "--announced-turn-budget",
-            "3",
         ]
     )
 
@@ -3797,7 +3783,6 @@ def test_cli_records_the_selected_task_pressure(
     assert captured_configs[0].task_pressure == "merge-gate"
     assert captured_configs[0].history_reasoning == "strip"
     assert captured_configs[0].max_turns == 3
-    assert captured_configs[0].announced_turn_budget == 3
     assert dict(captured_configs[0].models[0].chat_template_kwargs) == {
         "reasoning_effort": "medium"
     }
@@ -3827,36 +3812,6 @@ def test_cli_records_the_selected_task_pressure(
         "kv_cache_dtype": "fp8",
         "attention_backend": "FLASHINFER",
     }
-
-
-def test_cli_rejects_conflicting_max_turns_and_announced_turn_budget(
-    tmp_path: Path,
-) -> None:
-    server_log = tmp_path / "vllm.log"
-    server_log.write_text(
-        "(APIServer pid=1) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
-        "{'model': 'synthetic-model'}\n",
-        encoding="utf-8",
-    )
-    arguments = [
-        "--endpoint",
-        "http://127.0.0.1:8000",
-        "--model",
-        "base=/models/base",
-        "--scenario-root",
-        str(tmp_path),
-        "--server-log",
-        str(server_log),
-        "--max-turns",
-        "4",
-        "--announced-turn-budget",
-        "3",
-    ]
-
-    with pytest.raises(SystemExit) as error:
-        main(arguments)
-
-    assert error.value.code == 2
 
 
 @pytest.mark.parametrize(
@@ -4176,13 +4131,11 @@ def test_v2_final_tree_scan_excludes_unit_test_lookup_tables(tmp_path: Path) -> 
     assert "src/dummy.py" in evidence[0][1]
 
 
-def test_v1_provenance_records_disabled_opt_in_settings_by_value(tmp_path: Path) -> None:
+def test_v1_provenance_omits_other_disabled_opt_in_settings(tmp_path: Path) -> None:
     provenance = replace(
         runner_config(tmp_path / "records.jsonl"), arms=("real",), samples=1
     ).provenance_payload()
 
-    assert provenance["announced_turn_budget"] is None
-    assert provenance["announced_turn_budget_sentence"] is None
     assert provenance["max_turns"] == ladder_loop.LADDER_MAX_TURNS
     for opt_in_field in (
         "persistent_jail",

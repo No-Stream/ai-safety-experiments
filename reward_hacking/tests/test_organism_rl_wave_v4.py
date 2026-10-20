@@ -203,7 +203,6 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
     command = build_generate_command(cell, settings)
     for flag, value in {
         "--max-turns": "60",
-        "--announced-turn-budget": "60",
         "--max-model-len": "131072",
         "--hint-strength": hint,
         "--max-tasks": "12",
@@ -753,7 +752,6 @@ def test_new_wave_cells_parse_and_build_smoke_argv(
     assert command[command.index("--variant") + 1] == variant
     assert command[command.index("--hint-family") + 1] == "grader_mechanics"
     assert command[command.index("--max-turns") + 1] == "4"
-    assert command[command.index("--announced-turn-budget") + 1] == "4"
     assert command[command.index("--output-dir") + 1] == str(wave_v4.stage_directory(args))
     assert args.model == "Qwen/Qwen3.5-0.8B"
     assert args.episodes == 1
@@ -929,7 +927,6 @@ def test_smoke_caps_and_launch_estimate(tmp_path: Path) -> None:
     for flag, value in {
         "--max-tasks": "1",
         "--max-turns": "4",
-        "--announced-turn-budget": "4",
         "--concurrency": "1",
         "--thinking-token-budget": "512",
         "--max-new-tokens": "2048",

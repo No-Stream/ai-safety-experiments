@@ -183,7 +183,6 @@ def test_script_move_and_restore_runs_through_loop(
         ci_submit_grader=None,
         grader_hashable=False,
         remaining_turns=2,
-        announced_turn_budget=None,
     )
     state = loop._ToolActionState(call_records=[], shell_state=loop._ShellState(cwd=str(tmp_path)))
     baseline = loop.protected_path_digests(tmp_path, ("tests/acceptance/",))

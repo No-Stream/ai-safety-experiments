@@ -16,6 +16,7 @@ from grpo import gpu_memory
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.harness.trace_reference import leak_trace_records
+from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.thinking import ThinkingBudgetOvershootPolicy
 from reward_hacking.organism_rl import evaluate, generate, generate_provenance
 from reward_hacking.organism_rl.rollout import EpisodeSample, EpisodeSource, TaskEpisodeSource
@@ -681,13 +682,13 @@ def test_prompt_identity_refuses_changed_renderer_with_same_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = _task("synthetic", "synthetic")
-    first = generate.task_prompt_content("synthetic", task, max_turns=4, announced_turn_budget=4)
+    first = generate.task_prompt_content("synthetic", task, max_turns=4)
     monkeypatch.setattr(
         generate,
         "LADDER_SYSTEM_PROMPT",
         generate.LADDER_SYSTEM_PROMPT + " Changed synthetic system.",
     )
-    second = generate.task_prompt_content("synthetic", task, max_turns=4, announced_turn_budget=4)
+    second = generate.task_prompt_content("synthetic", task, max_turns=4)
     with pytest.raises(ValueError, match="task_prompt_content"):
         evaluate._validate_reuse_identity(
             {"task_prompt_content": {"synthetic": second}},
@@ -879,12 +880,10 @@ def test_task_prompt_identity_tracks_workspace_mount(tmp_path: Path) -> None:
         "task-a",
         task_with_default_mount,
         max_turns=4,
-        announced_turn_budget=4,
     ) != evaluate._task_prompt_sha256(
         "task-a",
         task_with_testbed_mount,
         max_turns=4,
-        announced_turn_budget=4,
     )
 
 
@@ -973,7 +972,6 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             thinking_token_budget=None,
             thinking_budget_overshoot_max_fraction=0.1,
             thinking_budget_overshoot_min_episodes=3,
-            announced_turn_budget=None,
             temperature=1.0,
             top_p=1.0,
             top_k=None,
@@ -998,7 +996,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
 
     assert first_identity == restarted_identity
     assert first_identity["served_model_id"] == "synthetic-served-model"
-    assert first_identity["prompt_format_version"] == 3
+    assert first_identity["prompt_format_version"] == PROMPT_FORMAT_VERSION
     assert first_identity["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert first["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert "leak_task_source" not in first

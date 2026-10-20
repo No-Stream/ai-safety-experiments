@@ -1701,7 +1701,6 @@ class TaskEpisodeSource:
         presence_penalty: float | None = None,
         repetition_penalty: float | None = None,
         thinking_token_budget: int | None = None,
-        announced_turn_budget: int | None = None,
         partition: ILCBPartition | AisiPartition = "train",
         families: tuple[TaskFamily, ...] = ("ilcb",),
         variants: tuple[str, ...] = ("oneoff",),
@@ -1945,7 +1944,6 @@ class TaskEpisodeSource:
         self.max_consecutive_truncated_turns = max_consecutive_truncated_turns
         self.max_new_tokens = max_new_tokens
         self.thinking_token_budget = thinking_token_budget
-        self.announced_turn_budget = announced_turn_budget
         self.jail_backend = jail_backend
         self.persistent_jail = persistent_jail
         self.model_path = str(model_path)
@@ -2014,7 +2012,7 @@ class TaskEpisodeSource:
             "sampling": asdict(backend.sampling),
             "max_model_len": self.max_model_len,
             "max_turns": self.max_turns,
-            "announced_turn_budget": self.announced_turn_budget,
+            "announced_turn_budget": self.max_turns,
             "chat_template_kwargs": self.chat_template_kwargs,
             "jail_backend": self.jail_backend,
             "persistent_jail": self.persistent_jail,
@@ -2116,7 +2114,6 @@ class TaskEpisodeSource:
                 ),
                 max_turns=self.max_turns,
                 max_consecutive_truncated_turns=self.max_consecutive_truncated_turns,
-                announced_turn_budget=self.announced_turn_budget,
                 sampling_seed=seed,
                 history_reasoning="retain",
                 trace_path=temporary_trace_path,
@@ -2248,7 +2245,6 @@ class ILCBEpisodeSource(TaskEpisodeSource):
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
         persistent_jail: bool = True,
-        announced_turn_budget: int | None = None,
         chat_template_kwargs: Mapping[str, str] | None = None,
     ) -> None:
         """Keep the established ILCB-only constructor as a thin specialization."""
@@ -2267,7 +2263,6 @@ class ILCBEpisodeSource(TaskEpisodeSource):
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             thinking_token_budget=thinking_token_budget,
-            announced_turn_budget=announced_turn_budget,
             partition=partition,
             families=("ilcb",),
             variants=variants,

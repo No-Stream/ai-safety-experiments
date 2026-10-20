@@ -242,19 +242,14 @@ def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
 
 @requires_leak_splits
 @pytest.mark.slow
-def test_new_cells_and_the_ladder_announce_their_real_turn_budget_and_reused_cells_do_not() -> None:
+def test_cell_dry_run_reports_the_configured_max_turns() -> None:
     v4_output = _dry_run("cells", "v4")
     gate3_output = _dry_run("gate3", "v4")
 
-    assert v4_output.count("max_turns=20 announced_turn_budget=20") == 4
-    assert (
-        "runner arguments served_model_id=organism-ladder-v4 max_turns=20 announced_turn_budget=20"
-        in v4_output
-    )
-    assert v4_output.count("max_turns=30 announced_turn_budget=30") == 1
-    assert v4_output.count("max_turns=20 announced_turn_budget=None") == 1
-    assert gate3_output.count("max_turns=20 announced_turn_budget=None") == 3
-    assert "announced_turn_budget=2" not in gate3_output
+    assert v4_output.count("max_turns=20") == 5
+    assert "runner arguments served_model_id=organism-ladder-v4 max_turns=20" in v4_output
+    assert v4_output.count("max_turns=30") == 1
+    assert gate3_output.count("max_turns=20") == 3
 
 
 @pytest.mark.slow

@@ -602,6 +602,8 @@ class TestSharedLadderLoopSeams:
 
         assert trace.turns[0].format_error == "Unknown tool function: unknown."
         assert any(
-            message.get("role") == "tool" and message.get("content") == custom_message
+            message.get("role") == "tool"
+            and message.get("content")
+            == f"{custom_message}\n\n{ladder_loop.TURNS_REMAINING_NOTE.format(n=0)}"
             for message in trace.messages
         )

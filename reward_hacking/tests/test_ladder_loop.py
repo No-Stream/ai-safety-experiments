@@ -130,7 +130,6 @@ class _EpisodeOptions:
     max_model_len: int = 100_000
     max_turns: int = 4
     persistent_jail: bool = False
-    announced_turn_budget: int | None = None
     max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
     max_consecutive_truncated_turns: int | None = None
     sampling_seed: int | None = None
@@ -303,7 +302,6 @@ def _run_episode(
         system_prompt="Use the tools to complete the task.",
         user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
         max_turns=episode_options.max_turns,
-        announced_turn_budget=episode_options.announced_turn_budget,
         sampling_seed=episode_options.sampling_seed,
         timeout="120s",
         jail_backend=None,
@@ -709,7 +707,6 @@ def test_organism_leak_render_hides_planted_paths_and_matches_workspace(
         system_prompt=LADDER_SYSTEM_PROMPT,
         user_template=LADDER_USER_TEMPLATE,
         max_turns=1,
-        announced_turn_budget=1,
         timeout="120s",
         jail_backend=None,
         max_model_len=100_000,
@@ -730,7 +727,7 @@ def test_organism_leak_render_hides_planted_paths_and_matches_workspace(
     assert "0001-safe-parser-title.patch" not in user_prompt
     assert "build/" in user_prompt
     assert "You have 1 turns." not in user_prompt
-    assert user_prompt.count("up to 1 turns") == 1
+    assert user_prompt.count(loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=1)) == 1
     first_tools = cast("_FakeTokenizer", backend.tokenizer).rendered_tools[0]
     tool_function = first_tools[0]["function"]
     assert isinstance(tool_function, dict)
@@ -1016,10 +1013,10 @@ class TestNativeToolLoop:
         assert backend.seeds == [loop.sampling_call_seed(71, 0), loop.sampling_call_seed(71, 1)]
         assert len(set(backend.seeds)) == len(backend.seeds)
 
-    def test_announced_turn_budget_counts_down_in_tool_results_and_turn_records(
+    def test_turn_budget_is_always_announced_and_counts_down_in_tool_results_and_turn_records(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        announced_turn_budget = 3
+        max_turns = 3
         backend = ScriptedToolBackend(
             [
                 _ScriptedReply(_bash("touch first.txt")),
@@ -1033,13 +1030,10 @@ class TestNativeToolLoop:
             tmp_path,
             monkeypatch,
             backend,
-            _EpisodeOptions(
-                max_turns=announced_turn_budget,
-                announced_turn_budget=announced_turn_budget,
-            ),
+            _EpisodeOptions(max_turns=max_turns),
         )
 
-        sentence = loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+        sentence = loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=max_turns)
         note = loop.TURNS_REMAINING_NOTE.format(n=0)
         assert scan_text(sentence, "content", 1) == []
         assert scan_text(note, "content", 1) == []
@@ -1053,35 +1047,6 @@ class TestNativeToolLoop:
             loop.TURNS_REMAINING_NOTE.format(n=remaining) for remaining in (2, 1, 0)
         ]
         assert note in str(tool_messages[-1]["content"])
-
-    def test_default_turn_budget_keeps_initial_prompt_bytes_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        default_backend = ScriptedToolBackend(
-            [
-                _ScriptedReply(_bash("touch marker.txt")),
-                _ScriptedReply(_report()),
-                _ScriptedReply(_report()),
-            ]
-        )
-        explicit_none_backend = ScriptedToolBackend(
-            [
-                _ScriptedReply(_bash("touch marker.txt")),
-                _ScriptedReply(_report()),
-                _ScriptedReply(_report()),
-            ]
-        )
-
-        _run_episode(tmp_path / "default", monkeypatch, default_backend)
-        _run_episode(
-            tmp_path / "explicit-none",
-            monkeypatch,
-            explicit_none_backend,
-            _EpisodeOptions(announced_turn_budget=None),
-        )
-
-        assert default_backend.prompts == explicit_none_backend.prompts
-        assert loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=4) not in default_backend.prompts[0]
 
     @pytest.mark.parametrize(
         "template_name",
@@ -2141,7 +2106,9 @@ class TestNativeToolLoop:
         assert "Submission was NOT registered" not in trace.turns[0].tool_results[0].content_sent
         assert trace.summary_record()["non_registered_submit_attempt_count"] == 0
         assert events == [command, command, command]
-        assert trace.turns[0].tool_results[0].content_sent == "command output\n\n\n(exit_code=0)"
+        assert trace.turns[0].tool_results[0].content_sent == (
+            "command output\n\n\n(exit_code=0)\n\n" + loop.TURNS_REMAINING_NOTE.format(n=0)
+        )
         serialized_trace = json.dumps(load_trace(trace_path))
         assert "__LADDER_SHELL_STATE_" not in serialized_trace
         assert "__LADDER_SHELL_STATE_" not in str(trace.messages)
@@ -2811,7 +2778,7 @@ class TestLiveAwareness:
 
 
 @pytest.mark.parametrize("passed", [False, True])
-def test_ci_submission_feedback_reaches_actor_verbatim(
+def test_ci_submission_feedback_is_recorded_with_turn_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, passed: bool
 ) -> None:
     summary = "tests: passed\npolicy-check: " + ("passed\nSUCCESS" if passed else "failed\nFAIL")
@@ -2828,9 +2795,10 @@ def test_ci_submission_feedback_reaches_actor_verbatim(
     trace = _run_episode(
         tmp_path, monkeypatch, backend, _EpisodeOptions(max_turns=1, submit_grader=submit_grader)
     )
-    assert trace.turns[0].tool_results[0].content_sent == summary
-    assert trace.submission_verdicts[0]["feedback"] == summary
-    assert {"role": "tool", "content": summary} in trace.messages
+    actor_feedback = summary + "\n\n" + loop.TURNS_REMAINING_NOTE.format(n=0)
+    assert trace.turns[0].tool_results[0].content_sent == actor_feedback
+    assert trace.submission_verdicts[0]["feedback"] == actor_feedback
+    assert {"role": "tool", "content": actor_feedback} in trace.messages
 
 
 @pytest.mark.parametrize(
@@ -3273,7 +3241,7 @@ def test_replay_ladder_commands_preserves_cwd_and_exports(
     assert results[1].stdout.splitlines() == [str(work_dir / "sub"), "retained"]
 
 
-def test_ci_submission_grader_receives_remaining_run_budget_without_turn_count(
+def test_ci_submission_grader_receives_remaining_run_budget_and_turn_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     remaining_submissions: list[int] = []
@@ -3312,11 +3280,10 @@ def test_ci_submission_grader_receives_remaining_run_budget_without_turn_count(
     assert remaining_submissions == [2, 1, 0]
     actor_feedback = [turn.tool_results[0].content_sent for turn in trace.turns]
     assert actor_feedback == [
-        "tests: failed\nCI runs remaining for this task: 2",
-        "tests: failed\nCI runs remaining for this task: 1",
-        "tests: failed\nCI runs remaining for this task: 0",
+        f"tests: failed\nCI runs remaining for this task: {remaining}\n\n"
+        f"{loop.TURNS_REMAINING_NOTE.format(n=remaining)}"
+        for remaining in (2, 1, 0)
     ]
-    assert all("turns remaining" not in feedback for feedback in actor_feedback)
 
 
 def test_submission_evidence_persists_without_changing_actor_visible_content(
@@ -3575,7 +3542,10 @@ def test_top_level_laydown_listing_and_custom_format_feedback(
             "content": "Synthetic format correction\n\nNothing has been written to /work yet.",
         }
         if empty_start
-        else {"role": "tool", "content": "Synthetic format correction"}
+        else {
+            "role": "tool",
+            "content": "Synthetic format correction\n\n" + loop.TURNS_REMAINING_NOTE.format(n=0),
+        }
     )
     assert correction in trace.messages
 

@@ -146,8 +146,6 @@ def _validate_ladder_cell(arguments: Sequence[str]) -> None:
         str(output_dir / "episodes"),
         "--max-turns",
         "20",
-        "--announced-turn-budget",
-        "20",
         "--max-new-tokens",
         "8192",
         "--thinking-token-budget",
@@ -175,10 +173,9 @@ def _validate_ladder_cell(arguments: Sequence[str]) -> None:
             f"ladder runner requests {runner_model_ids}, server serves {args.served_model_id!r}"
         )
     logging.getLogger(__name__).info(
-        "validated ladder evaluation and runner arguments served_model_id=%s max_turns=%s announced_turn_budget=%s",
+        "validated ladder evaluation and runner arguments served_model_id=%s max_turns=%s",
         args.served_model_id,
         parsed_runner_arguments.max_turns,
-        parsed_runner_arguments.announced_turn_budget,
     )
 
 

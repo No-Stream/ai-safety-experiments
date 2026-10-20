@@ -1942,7 +1942,6 @@ def test_evaluation_commands_enable_lora_and_use_nested_serving_adapter_names(
     assert "--model-revision synthetic-revision" in server_command
     assert "vllm serve" not in server_command
     assert "--thinking-token-budget 2048" in conflict_command
-    assert "--announced-turn-budget 30" in conflict_command
     assert "--belief-probe" in conflict_command
     assert "--arm real --arm claimed" in conflict_command
     assert "scenarios-v2.2-conflict" in conflict_command

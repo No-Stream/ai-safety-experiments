@@ -236,8 +236,6 @@ def evaluation_commands(  # noqa: PLR0913 - these independent launch settings ne
             str(scenario_root),
             "--max-new-tokens",
             "16384",
-            "--announced-turn-budget",
-            "30",
             "--thinking-token-budget",
             "2048",
             "--history-reasoning",

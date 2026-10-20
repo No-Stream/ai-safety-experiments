@@ -900,7 +900,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--thinking-token-budget", type=int)
     parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
     parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
-    parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     _add_sampling_overrides(parser)
@@ -975,15 +974,7 @@ def _validate_parsed_args(
         and re.fullmatch(r"[0-9a-f]{64}", args.served_adapter_sha256) is None
     ):
         parser.error("served-adapter-sha256 must be a lowercase SHA-256 digest")
-    args.max_turns = (
-        args.announced_turn_budget
-        if args.max_turns is None and args.announced_turn_budget is not None
-        else DEFAULT_MAX_TURNS
-        if args.max_turns is None
-        else args.max_turns
-    )
-    if args.announced_turn_budget is not None and args.announced_turn_budget != args.max_turns:
-        parser.error("announced-turn-budget must match max-turns")
+    args.max_turns = DEFAULT_MAX_TURNS if args.max_turns is None else args.max_turns
     if args.variant == "conflicting" and any(family != "ilcb" for family in args.families):
         parser.error("conflicting tasks are only available for ILCB")
     if args.variant == "loose" and any(family != "math_loose_checker" for family in args.families):
@@ -2245,7 +2236,6 @@ def task_prompt_content(
     task: object,
     *,
     max_turns: int,
-    announced_turn_budget: int | None,
 ) -> dict[str, object]:
     """Snapshot the first-turn prompt and tool substance independently of format labels."""
     task_object = cast("Task", task)
@@ -2269,15 +2259,13 @@ def task_prompt_content(
             raise ValueError("task filename must not be empty")
         first_path_part, *remaining_path_parts = path_parts
         listing_entries.add(f"{first_path_part}/" if remaining_path_parts else first_path_part)
-    user_template = LADDER_USER_TEMPLATE.replace(" You have {max_turns} turns.", "")
-    user_text = user_template.replace("/work", workspace_mount).format(
+    user_text = LADDER_USER_TEMPLATE.replace("/work", workspace_mount).format(
         task_markdown=task_object.render_prompt(AgenticArmConfig()),
         listing="\n".join(f"- {filename}" for filename in sorted(listing_entries)),
         max_submissions=LADDER_MAX_SUBMISSIONS,
         max_turns=max_turns,
     )
-    if announced_turn_budget is not None:
-        user_text += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+    user_text += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=max_turns)
     return {
         "task_id": task_id,
         "system_text": LADDER_SYSTEM_PROMPT.replace("/work", workspace_mount),
@@ -2454,7 +2442,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "thinking_token_budget": args.thinking_token_budget,
         "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
         "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
-        "announced_turn_budget": args.announced_turn_budget,
+        "announced_turn_budget": args.max_turns,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -2550,7 +2538,6 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
                         spec.task_id,
                         source.tasks[spec.task_id],
                         max_turns=args.max_turns,
-                        announced_turn_budget=args.announced_turn_budget,
                     )
                 ),
             }
@@ -2604,7 +2591,6 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         presence_penalty=args.presence_penalty,
         repetition_penalty=args.repetition_penalty,
         thinking_token_budget=args.thinking_token_budget,
-        announced_turn_budget=args.announced_turn_budget,
         partition=args.partition,
         families=tuple(args.families),
         leak_channels=args.leak_channels,

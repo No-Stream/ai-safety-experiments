@@ -413,7 +413,6 @@ class RunnerConfig:
     perf_thresholds: PerfThresholds = dataclass_field(default_factory=PerfThresholds)
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
     max_consecutive_truncated_turns: int | None = None
-    announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     temperature: float = LADDER_SAMPLING.temperature
     thinking_token_budget: int | None = None
@@ -455,12 +454,6 @@ class RunnerConfig:
         _validate_perf_config(self)
         if self.kv_admission_capacity_tokens is not None and self.kv_admission_capacity_tokens < 1:
             raise ValueError("kv_admission_capacity_tokens must be positive")
-        if self.announced_turn_budget is not None:
-            if type(self.announced_turn_budget) is not int or self.announced_turn_budget < 1:
-                raise ValueError("announced_turn_budget must be positive")
-            if self.max_turns not in {ladder_loop.LADDER_MAX_TURNS, self.announced_turn_budget}:
-                raise ValueError("announced_turn_budget must match max_turns")
-            object.__setattr__(self, "max_turns", self.announced_turn_budget)
         validate_thinking_budget_sampling(
             thinking_token_budget=self.thinking_token_budget, top_p=self.top_p
         )
@@ -545,11 +538,9 @@ class RunnerConfig:
             "server_args": _server_args_generation_identity(self.server_args),
             "sampling": self.sampling.to_json(include_stop_token_ids=include_qwen_stop_ids),
             "max_turns": self.max_turns,
-            "announced_turn_budget": self.announced_turn_budget,
-            "announced_turn_budget_sentence": (
-                None
-                if self.announced_turn_budget is None
-                else ladder_loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=self.announced_turn_budget)
+            "announced_turn_budget": self.max_turns,
+            "announced_turn_budget_sentence": ladder_loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(
+                n=self.max_turns
             ),
             "max_submissions": ladder_loop.LADDER_MAX_SUBMISSIONS,
             "timeout": self.timeout,
@@ -707,11 +698,6 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         or config.max_consecutive_truncated_turns < 1
     ):
         raise ValueError("max_consecutive_truncated_turns must be a positive integer or None")
-    if (
-        config.announced_turn_budget is not None
-        and config.max_turns != config.announced_turn_budget
-    ):
-        raise ValueError("announced_turn_budget must match max_turns")
     if config.max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     if config.thinking_token_budget is not None and (
@@ -2267,7 +2253,6 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 sampling_seed=sampling_seed,
                 max_turns=config.max_turns,
                 max_consecutive_truncated_turns=config.max_consecutive_truncated_turns,
-                announced_turn_budget=config.announced_turn_budget,
                 timeout=config.timeout,
                 jail_backend=config.jail_backend,
                 persistent_jail=config.persistent_jail,
@@ -6186,12 +6171,6 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help=f"Maximum model turns (default: {ladder_loop.LADDER_MAX_TURNS}).",
     )
     parser.add_argument(
-        "--announced-turn-budget",
-        type=int,
-        default=None,
-        help="Tell the model its turn budget and use it as the effective maximum.",
-    )
-    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=ladder_loop.LADDER_MAX_NEW_TOKENS,
@@ -6243,15 +6222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected ladder grid from the command line."""
     parser = _build_cli_parser()
     args = _parse_cli_args(parser, argv)
-    if (
-        args.announced_turn_budget is not None
-        and args.max_turns is not None
-        and args.max_turns != args.announced_turn_budget
-    ):
-        parser.error("--announced-turn-budget must match --max-turns when both are given")
     max_turns = ladder_loop.LADDER_MAX_TURNS if args.max_turns is None else args.max_turns
-    if args.announced_turn_budget is not None:
-        max_turns = args.announced_turn_budget
     try:
         models = _models_with_chat_template_kwargs(args.model, args.chat_template_kwarg)
         models = _models_with_protocols(models, args.protocol)
@@ -6284,7 +6255,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=args.output,
             episode_root=args.episode_root,
             max_turns=max_turns,
-            announced_turn_budget=args.announced_turn_budget,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             thinking_token_budget=args.thinking_token_budget,

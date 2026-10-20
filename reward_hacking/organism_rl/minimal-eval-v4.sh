@@ -272,8 +272,6 @@ runner_arguments = [
     str(output_dir / "episodes"),
     "--max-turns",
     "20",
-    "--announced-turn-budget",
-    "20",
     "--max-new-tokens",
     "8192",
     "--thinking-token-budget",
@@ -295,10 +293,9 @@ if runner_model_ids != {args.served_model_id}:
 if dry_run:
     logging.basicConfig(level=logging.INFO)
     logging.getLogger(__name__).info(
-        "validated ladder evaluation and runner arguments served_model_id=%s max_turns=%s announced_turn_budget=%s",
+        "validated ladder evaluation and runner arguments served_model_id=%s max_turns=%s",
         args.served_model_id,
         parsed_runner_arguments.max_turns,
-        parsed_runner_arguments.announced_turn_budget,
     )
     raise SystemExit(0)
 
@@ -318,16 +315,13 @@ run_eval_cell() {
   local output_dir="$cell_root/cell-$cell"
   local reuse_from=""
   local max_turns=20
-  # Cells 1-4 stay comparable with the reused evalA base records, which never announced the budget; the cells new
-  # for every model announce the real budget, as seed-v4 generation does.
-  local announce_turn_budget=1
   local -a arguments
 
   case "$cell" in
-    1) family="aisi"; variant="oneoff"; announce_turn_budget=0 ;;
-    2) family="aisi"; variant="original"; announce_turn_budget=0 ;;
-    3) family="ilcb"; variant="oneoff"; announce_turn_budget=0 ;;
-    4) family="ilcb"; variant="original"; announce_turn_budget=0 ;;
+    1) family="aisi"; variant="oneoff" ;;
+    2) family="aisi"; variant="original" ;;
+    3) family="ilcb"; variant="oneoff" ;;
+    4) family="ilcb"; variant="original" ;;
     5) family="ilcb"; variant="conflicting"; impossible_variant="conflicting" ;;
     6) family="r2e_leak"; variant="leak"; max_turns=30 ;;
     8) family="math_loose_checker"; variant="loose_oneoff"; impossible_variant="loose_oneoff"; task_count=6 ;;
@@ -369,9 +363,6 @@ run_eval_cell() {
   fi
   if [[ -n "$adapter_dir" ]]; then
     arguments+=(--adapter-dir "$adapter_dir")
-  fi
-  if [[ "$announce_turn_budget" == 1 ]]; then
-    arguments+=(--announced-turn-budget "$max_turns")
   fi
   if [[ "$family" == r2e_leak ]]; then
     arguments+=(

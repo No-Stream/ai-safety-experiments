@@ -193,7 +193,6 @@ def test_new_cells_parse_in_both_probe_stages_and_keep_f2_original_argv(
     assert smoke_command[smoke_command.index("--variant") + 1] == variant
     assert smoke_command[smoke_command.index("--hint-family") + 1] == "grader_mechanics"
     assert smoke_command[smoke_command.index("--max-turns") + 1] == "4"
-    assert smoke_command[smoke_command.index("--announced-turn-budget") + 1] == "4"
     assert smoke_args.model == "Qwen/Qwen3.5-0.8B"
     assert smoke_command[smoke_command.index("--max-tasks") + 1] == "1"
     assert smoke_command[smoke_command.index("--concurrency") + 1] == "1"
@@ -407,7 +406,6 @@ def _assert_smoke_run(observation: _SmokeRunObservation) -> None:
     assert generation_command[generation_command.index("--thinking-token-budget") + 1] == "512"
     assert generation_command[generation_command.index("--max-new-tokens") + 1] == "2048"
     assert generation_command[generation_command.index("--max-turns") + 1] == "4"
-    assert generation_command[generation_command.index("--announced-turn-budget") + 1] == "4"
     assert health_command[health_command.index("--records") + 1].endswith("/records.jsonl")
     assert ("--assert" in health_command) is (stage == "v3")
     assert ("--schema-only" in health_command) is (stage == "v3")
@@ -832,7 +830,6 @@ def test_generation_command_uses_wave_sampling_and_vague_hint(tmp_path: Path) ->
     assert command[command.index("--top-p") + 1] == "1.0"
     assert command[command.index("--thinking-token-budget") + 1] == "2048"
     assert command[command.index("--max-turns") + 1] == "20"
-    assert command[command.index("--announced-turn-budget") + 1] == "20"
     assert command[command.index("--max-tasks") + 1] == "8"
     assert "specific" not in command
 
@@ -872,7 +869,6 @@ def test_leak_command_uses_train_channel_arm_and_thirty_turns(tmp_path: Path) ->
     assert command[command.index("--served-model-id") + 1] == V3_SERVED_MODEL_ID
     assert command[command.index("--served-adapter-sha256") + 1] == adapter_sha256
     assert command[command.index("--max-turns") + 1] == "30"
-    assert command[command.index("--announced-turn-budget") + 1] == "30"
     assert command[command.index("--leak-assets") + 1] == str(tmp_path / "leak-assets.json")
     assert command[command.index("--leak-channel-split") + 1] == "seed-v4"
     assert command[command.index("--leak-channel-splits") + 1] == str(

@@ -89,7 +89,7 @@ class TestCellCommands:
             assert args.evaluation_variant is not None
             assert {name: getattr(args, name) for name in BATTERY_SAMPLING} == BATTERY_SAMPLING
             assert args.thinking_token_budget == 2048
-            assert args.max_turns == args.announced_turn_budget == 20
+            assert args.max_turns == 20
             assert args.output_dir == run.model_dir.resolve() / cell_name
             assert args.adapter_dir == (adapter_dir if with_adapter else None)
             assert args.served_model_id == run.model.served_model_id
@@ -135,7 +135,7 @@ class TestCellCommands:
         assert (args.arms, args.samples) == (["real"], 1)
         assert {name: getattr(args, name) for name in BATTERY_SAMPLING} == BATTERY_SAMPLING
         assert args.thinking_token_budget == 2048
-        assert args.max_turns == args.announced_turn_budget == 20
+        assert args.max_turns == 20
         assert [model.server_model_id or model.model_id for model in args.model] == [
             run.model.served_model_id
         ]

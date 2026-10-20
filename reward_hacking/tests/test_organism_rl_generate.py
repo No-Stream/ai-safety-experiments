@@ -1215,7 +1215,6 @@ def test_resume_refuses_prompt_version_without_definition_evidence() -> None:
         ("top_p", 0.95, 0.9),
         ("top_k", 20, 30),
         ("max_turns", 60, 90),
-        ("announced_turn_budget", 60, 90),
         ("hint", {"sha": "original"}, {"sha": "changed"}),
         ("payment_register", "ci", "in_band"),
     ],
@@ -1730,7 +1729,7 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
 
     reward = cast("Mapping[str, object]", record["organism_reward"])
     assert record["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
-    assert record["prompt_format_version"] == 3
+    assert record["prompt_format_version"] == ladder_loop.PROMPT_FORMAT_VERSION
     assert record["payment_register"] == "in_band"
     assert record["true_pass"] is False
     assert reward["reward"] == 1
@@ -2000,7 +1999,7 @@ def test_tracked_output_directory_is_refused() -> None:
         generate.require_gitignored_output_dir(Path("reward_hacking/organism_rl"))
 
 
-def test_cli_defaults_and_announced_turn_budget() -> None:
+def test_cli_defaults() -> None:
     args = generate.parse_args(
         [
             "--endpoint",
@@ -2018,20 +2017,6 @@ def test_cli_defaults_and_announced_turn_budget() -> None:
     assert args.temperature == args.top_p == 1.0
     assert args.thinking_budget_overshoot_max_fraction == 0.1
     assert args.thinking_budget_overshoot_min_episodes == 3
-
-    announced = generate.parse_args(
-        [
-            "--endpoint",
-            "http://server:8000",
-            "--output-dir",
-            "artifacts/teacher",
-            "--max-model-len",
-            "4096",
-            "--announced-turn-budget",
-            "30",
-        ]
-    )
-    assert announced.max_turns == announced.announced_turn_budget == 30
 
 
 @pytest.mark.parametrize("family", ["ilcb", "aisi"])
@@ -2200,7 +2185,7 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     assert provenance["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
-    assert flags["prompt_format_version"] == 3
+    assert flags["prompt_format_version"] == ladder_loop.PROMPT_FORMAT_VERSION
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
     assert flags["payment_register"] == "in_band"
@@ -2986,7 +2971,10 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     assert command_evidence["stdout"] == "SUCCESS: 1 check passed\n"
     assert trace_summary["ended_by"] == "submit"
     assert trace_summary["submissions_used"] == 1
-    assert submit_feedback == "SUCCESS\nSUCCESS: 1 check passed\n\n\n(exit_code=0)"
+    assert submit_feedback == (
+        "SUCCESS\nSUCCESS: 1 check passed\n\n\n(exit_code=0)\n\n"
+        + ladder_loop.TURNS_REMAINING_NOTE.format(n=0)
+    )
     assert any(
         message.get("role") == "tool" and message.get("content") == submit_feedback
         for message in messages

@@ -823,7 +823,6 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.max_consecutive_truncated_turns = None
     source.max_new_tokens = 16
     source.thinking_token_budget = None
-    source.announced_turn_budget = None
     source.jail_backend = None
     source.persistent_jail = True
     source.model_path = "synthetic-model"
@@ -1085,7 +1084,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         f"{unhinted_system_prompt}\n\n{hint_text}",
     ]
     identity = ilcb_episode.trace_records[0]
-    assert identity["prompt_format_version"] == 3
+    assert identity["prompt_format_version"] == ladder_loop.PROMPT_FORMAT_VERSION
     assert identity["hint"] == {
         "family": "synthetic",
         "strength": "vague",
@@ -1374,7 +1373,6 @@ def test_task_episode_sampling_seed_is_request_local(  # noqa: PLR0915 - seed an
     source.max_consecutive_truncated_turns = None
     source.max_new_tokens = 16
     source.thinking_token_budget = None
-    source.announced_turn_budget = None
     source.jail_backend = None
     source.persistent_jail = True
     model_identity = rollout.model_identity(source.model_path)

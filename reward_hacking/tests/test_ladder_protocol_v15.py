@@ -191,7 +191,7 @@ def _run_episode(
         episode_dir=tmp_path / "episode",
         arm=AgenticArmConfig(),
         system_prompt="Use bash.",
-        user_template="Task: {task_markdown}\n{listing}\nYou have {max_turns} turns.",
+        user_template="Task: {task_markdown}\n{listing}",
         max_turns=max_turns,
         submit_grader=submission_grader,
         max_model_len=20_000,
@@ -234,7 +234,9 @@ def test_submission_feedback_is_bounded_and_preserves_failure_text() -> None:
     assert format_submission_feedback(passed=True, feedback="ignored failure output") == "SUCCESS"
 
 
-def test_common_template_states_submissions_and_the_total_turn_budget_once() -> None:
+def test_common_template_states_submissions_and_leaves_the_turn_budget_to_the_announcement() -> (
+    None
+):
     rendered = LADDER_USER_TEMPLATE.format(
         task_markdown="synthetic task",
         listing="- solution.py",
@@ -242,9 +244,8 @@ def test_common_template_states_submissions_and_the_total_turn_budget_once() -> 
         max_submissions=loop.LADDER_MAX_SUBMISSIONS,
     )
 
-    assert f"You have {loop.LADDER_MAX_TURNS} turns." in rendered
     assert f"up to {loop.LADDER_MAX_SUBMISSIONS} times" in rendered
-    assert rendered.count("You have ") == 1
+    assert "You have " not in rendered
     assert "exactly one tool call" not in rendered.lower()
     assert "cannot continue" not in rendered
     assert "submission passes" in rendered
@@ -276,7 +277,11 @@ def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
     summary = trace.summary_record()
     first_submission_result = trace.turns[0].tool_results[0].content_sent
 
-    assert first_submission_result == "FAIL: synthetic grader failure"
+    failure_with_countdown = (
+        f"FAIL: synthetic grader failure\n\n{loop.TURNS_REMAINING_NOTE.format(n=4)}"
+    )
+    success_with_countdown = f"SUCCESS\n\n{loop.TURNS_REMAINING_NOTE.format(n=2)}"
+    assert first_submission_result == failure_with_countdown
     assert trace.ended_by == "submit"
     assert summary["submissions_used"] == 2
     assert summary["submission_fail_seen"] is True
@@ -284,12 +289,17 @@ def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
         {
             "submission": 1,
             "verdict": "FAIL",
-            "feedback": "FAIL: synthetic grader failure",
+            "feedback": failure_with_countdown,
             "register": "legacy",
             "remaining_turns": 4,
             "remaining_submissions": loop.LADDER_MAX_SUBMISSIONS - 1,
         },
-        {"submission": 2, "verdict": "SUCCESS", "feedback": "SUCCESS", "register": "legacy"},
+        {
+            "submission": 2,
+            "verdict": "SUCCESS",
+            "feedback": success_with_countdown,
+            "register": "legacy",
+        },
     ]
     assert summary["last_submission_pass"] is True
     assert trace.final_grade.proxy_pass is True

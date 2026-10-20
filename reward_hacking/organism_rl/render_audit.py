@@ -1094,8 +1094,6 @@ def _render_cell(
     )
     organism_prompt = audit_case.family != "ladder"
     system_prompt = compose_hint_system_prompt(unhinted_system_prompt, hint.text)
-    if organism_prompt:
-        user_template = user_template.replace(" You have {max_turns} turns.", "")
     if task.docker_config is not None:
         system_prompt = system_prompt.replace("/work", workspace_mount)
         user_template = user_template.replace("/work", workspace_mount)
@@ -1115,7 +1113,6 @@ def _render_cell(
         episode_dir=listing_probe.episode_dir,
         listing_mode="top-level" if task.task_variant == "leak" else "all",
         organism_prompt=organism_prompt,
-        announced_turn_budget=None,
         workspace_mount=workspace_mount,
         max_turns=_AUDIT_MAX_TURNS,
         materialized_paths=listing_probe.materialized_paths,
@@ -1708,7 +1705,6 @@ def _recorded_initial_messages(
     audit_case: TaskAuditCase,
     *,
     system_prompt: str,
-    announced_turn_budget: int | None,
     max_turns: int,
     scratch_root: Path,
 ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
@@ -1717,8 +1713,6 @@ def _recorded_initial_messages(
     user_template = (
         audit_case.user_template if audit_case.user_template is not None else LADDER_USER_TEMPLATE
     )
-    if audit_case.family != "ladder":
-        user_template = user_template.replace(" You have {max_turns} turns.", "")
     if task.docker_config is not None:
         user_template = user_template.replace("/work", workspace_mount)
     listing_mode = "top-level" if task.task_variant == "leak" else "all"
@@ -1735,7 +1729,6 @@ def _recorded_initial_messages(
             episode_dir=episode_dir,
             listing_mode=listing_mode,
             organism_prompt=audit_case.family != "ladder",
-            announced_turn_budget=announced_turn_budget,
             workspace_mount=workspace_mount,
             max_turns=max_turns,
             materialized_paths=listing_probe.materialized_paths,
@@ -1753,9 +1746,6 @@ def _trace_render_mismatch_fields(
     max_turns = identity.get("max_turns")
     if type(max_turns) is not int or max_turns < 1:
         raise TypeError("episode identity.max_turns must be a positive integer")
-    announced_budget = identity.get("announced_turn_budget")
-    if announced_budget is not None and type(announced_budget) is not int:
-        raise TypeError("episode identity.announced_turn_budget must be an integer or null")
     if (
         len(messages) < _INITIAL_MESSAGE_COUNT
         or messages[0].get("role") != "system"
@@ -1767,7 +1757,6 @@ def _trace_render_mismatch_fields(
     rendered_initial_messages, rendered_listing = _recorded_initial_messages(
         audit_case,
         system_prompt=system_prompt,
-        announced_turn_budget=announced_budget,
         max_turns=max_turns,
         scratch_root=context.scratch_root,
     )

@@ -612,7 +612,6 @@ def test_real_laydown_and_initial_render_keep_trusted_material_hidden(
         episode_dir=episode_dir,
         listing_mode="top-level",
         organism_prompt=True,
-        announced_turn_budget=None,
         workspace_mount="/testbed",
         max_turns=8,
         materialized_paths=materialized_paths,

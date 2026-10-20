@@ -323,8 +323,6 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         str(thinking_token_budget),
         "--max-turns",
         str(max_turns),
-        "--announced-turn-budget",
-        str(max_turns),
         "--max-new-tokens",
         str(max_new_tokens),
         "--max-model-len",

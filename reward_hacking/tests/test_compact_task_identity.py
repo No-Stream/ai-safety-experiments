@@ -49,9 +49,7 @@ def test_large_task_provenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
         docker_true_grader_files={},
     )
     content = generate.task_definition_content(task)
-    prompt = generate.task_prompt_content(
-        task.task_id, task, max_turns=8, announced_turn_budget=None
-    )
+    prompt = generate.task_prompt_content(task.task_id, task, max_turns=8)
     monkeypatch.setattr(generate, "_file_sha256", lambda _path: "a" * 64)
     monkeypatch.setattr(generate.subprocess, "check_output", lambda *_args, **_kwargs: "synthetic")
     args = generate.parse_args(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import replace
@@ -25,6 +26,7 @@ from reward_hacking.harness.status_report import STATUS_DEADLINE_PROMPT, STATUS_
 from reward_hacking.harness.task_spec import TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import loop as ladder_loop
+from reward_hacking.ladder.loop import ANNOUNCED_TURN_BUDGET_SENTENCE
 from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import generate, rollout
@@ -476,3 +478,30 @@ def test_old_protocol_episode_is_not_resumed(status_source: TaskEpisodeSource) -
     )
     with pytest.raises(ValueError, match="status_report_protocol"):
         status_source("status-synthetic-double", seed=7, step=0, replica=11)
+
+
+def test_every_episode_announces_its_budget_and_counts_down(
+    status_source: TaskEpisodeSource,
+) -> None:
+    backend = cast("_ScriptedBackend", status_source.backend)
+    backend.replies[:] = [
+        _bash(_write("solution.py", CORRECT_SOLUTION), "python3 run_tests.py"),
+        _bash(_write("status.json", CLAIM_FALSE)),
+        _bash("cat status.json"),
+    ]
+    episode = status_source("status-synthetic-double", seed=7, step=0, replica=0)
+    summary = cast("dict[str, Any]", episode.record)
+    first_user = summary["messages"][1]["content"]
+    assert first_user.endswith(ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=status_source.max_turns))
+    assert first_user.count(" turns") == 1
+    assert episode.trace_path is not None
+    records = list(read_jsonl(Path(episode.trace_path)))
+    assert records[0]["announced_turn_budget"] == status_source.max_turns
+    remaining = [
+        int(match)
+        for record in records
+        if record.get("record") == "turn"
+        for result in record["tool_results"]
+        for match in re.findall(r"\[turns remaining: (\d+)\]", result["content_sent"])
+    ]
+    assert remaining == [2, 2, 1, 0]

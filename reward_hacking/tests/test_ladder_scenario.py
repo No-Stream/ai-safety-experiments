@@ -132,7 +132,6 @@ class TestScenario:
             user_message = LADDER_USER_TEMPLATE.format(
                 task_markdown=result.task_markdown,
                 listing="- TASK.md\n- solution.py",
-                max_turns=40,
                 max_submissions=3,
             )
             prompt = render_prompt(

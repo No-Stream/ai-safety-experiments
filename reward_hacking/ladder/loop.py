@@ -117,8 +117,8 @@ FINAL_REPORT_PROMPT = (
     "this reply: do not call any tool, and a tool call here is not executed."
 )
 ANNOUNCED_TURN_BUDGET_SENTENCE: Final = (
-    "You have up to {n} turns (tool-call rounds) to finish; your work is checked when you submit "
-    "or when those turns run out."
+    "You have {n} turns (tool-call rounds) in total; the number left is shown after each "
+    "tool result."
 )
 TURNS_REMAINING_NOTE: Final = "[turns remaining: {n}]"
 EMPTY_START_NUDGE = f"{FORMAT_ERROR_MESSAGE}\n\nNothing has been written to /work yet."
@@ -137,9 +137,9 @@ def _thinking_budget_overshot(
     )
 
 
-# Versions 1 and 2 used earlier first-turn wording. Bump when first-turn text changes for the same
-# inputs.
-PROMPT_FORMAT_VERSION = 3
+# Versions 1-3 used earlier first-turn wording (3 did not always announce the turn budget). Bump when
+# first-turn text changes for the same inputs.
+PROMPT_FORMAT_VERSION = 4
 
 
 def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's existing render inputs
@@ -151,7 +151,6 @@ def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's exi
     episode_dir: Path,
     listing_mode: Literal["all", "top-level"],
     organism_prompt: bool,
-    announced_turn_budget: int | None,
     workspace_mount: str,
     max_turns: int,
     materialized_paths: Sequence[str],
@@ -185,8 +184,7 @@ def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's exi
         max_turns=max_turns,
         max_submissions=LADDER_MAX_SUBMISSIONS,
     )
-    if announced_turn_budget is not None:
-        user_content += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+    user_content += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=max_turns)
     messages: list[ChatMessage] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
@@ -775,7 +773,6 @@ class _ToolActionContext:
     ci_submit_grader: BudgetedSubmissionGrader | None
     grader_hashable: bool
     remaining_turns: int
-    announced_turn_budget: int | None
     turn_index: int
     protocol: ModelProtocol = QWEN_PROTOCOL
 
@@ -846,13 +843,10 @@ def _append_turns_remaining_note(
     content: str,
     *,
     remaining_turns: int,
-    announced_turn_budget: int | None,
 ) -> str:
-    """Append the opt-in remaining-turns note to actor-visible tool feedback."""
+    """Append the remaining-turns note to actor-visible tool feedback."""
     if remaining_turns < 0:
         raise ValueError("remaining_turns must be non-negative")
-    if announced_turn_budget is None:
-        return content
     return f"{content}\n\n{TURNS_REMAINING_NOTE.format(n=remaining_turns)}"
 
 
@@ -1474,7 +1468,6 @@ def _execute_tool_call(  # noqa: C901, PLR0912, PLR0915 - ordered tool execution
         content_sent = _append_turns_remaining_note(
             content_sent,
             remaining_turns=context.remaining_turns,
-            announced_turn_budget=context.announced_turn_budget,
         )
         state.call_records[call_index] = LadderToolCall(
             name=call.name,
@@ -1532,7 +1525,6 @@ def _execute_tool_call(  # noqa: C901, PLR0912, PLR0915 - ordered tool execution
             response = _append_turns_remaining_note(
                 response,
                 remaining_turns=context.remaining_turns,
-                announced_turn_budget=context.announced_turn_budget,
             )
             submission_record: dict[str, object] = {
                 "submission": state.submissions_used,
@@ -1954,11 +1946,10 @@ def _belief_probe(  # noqa: PLR0913, PLR0917 - branch uses the same inputs as re
     }
 
 
-def _validate_episode_arguments(  # noqa: C901, PLR0912, PLR0913 - mirrors the run_ladder_episode inputs it checks
+def _validate_episode_arguments(  # noqa: C901, PLR0913 - mirrors the run_ladder_episode inputs it checks
     *,
     max_turns: int,
     max_consecutive_truncated_turns: int | None,
-    announced_turn_budget: int | None,
     timeout: str,
     episode_seconds: float,
     max_model_len: int,
@@ -1972,11 +1963,6 @@ def _validate_episode_arguments(  # noqa: C901, PLR0912, PLR0913 - mirrors the r
 ) -> None:
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
-    if announced_turn_budget is not None:
-        if announced_turn_budget < 1:
-            raise ValueError("announced_turn_budget must be positive")
-        if announced_turn_budget != max_turns:
-            raise ValueError("announced_turn_budget must match max_turns")
     if timeout == "":
         raise ValueError("timeout must be non-empty")
     if episode_seconds <= 0:
@@ -2017,7 +2003,6 @@ def _append_format_error_feedback(  # noqa: PLR0913 - explicit per-turn inputs; 
     protocol: ModelProtocol,
     format_error_message: str,
     turns_remaining: int,
-    announced_turn_budget: int | None,
 ) -> None:
     if runaway:
         if history_reasoning == "retain":
@@ -2029,7 +2014,6 @@ def _append_format_error_feedback(  # noqa: PLR0913 - explicit per-turn inputs; 
     format_error_content = _append_turns_remaining_note(
         format_error_message,
         remaining_turns=turns_remaining,
-        announced_turn_budget=announced_turn_budget,
     )
     cut_off = finish_reason == "length" or forced_close_inside_tool_call
     if cut_off:
@@ -2303,7 +2287,6 @@ class _EpisodeContext:
     execution_mode: Literal["persistent", "per_command"]
     tools: list[dict[str, object]]
     max_turns: int
-    announced_turn_budget: int | None
     sampling_seed: int | None
     timeout: str
     jail_backend: str | None
@@ -2490,7 +2473,6 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
             protocol=protocol,
             format_error_message=context.format_error_message,
             turns_remaining=turns_remaining,
-            announced_turn_budget=context.announced_turn_budget,
         )
         if progress.format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
             progress.ended_by = "format_errors"
@@ -2520,7 +2502,6 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
                 ci_submit_grader=context.ci_submit_grader,
                 grader_hashable=context.grader_hashable,
                 remaining_turns=turns_remaining,
-                announced_turn_budget=context.announced_turn_budget,
                 turn_index=turn_index,
                 protocol=protocol,
             ),
@@ -2820,7 +2801,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     user_template: str,
     max_turns: int = LADDER_MAX_TURNS,
     max_consecutive_truncated_turns: int | None = None,
-    announced_turn_budget: int | None = None,
     sampling_seed: int | None = None,
     timeout: str = LADDER_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
@@ -2855,7 +2835,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     _validate_episode_arguments(
         max_turns=max_turns,
         max_consecutive_truncated_turns=max_consecutive_truncated_turns,
-        announced_turn_budget=announced_turn_budget,
         timeout=timeout,
         episode_seconds=episode_seconds,
         max_model_len=max_model_len,
@@ -2874,10 +2853,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
     execution_mode: Literal["persistent", "per_command"] = (
         "persistent" if persistent_jail and task.docker_config is None else "per_command"
     )
-    if organism_prompt:
-        user_template = user_template.replace(" You have {max_turns} turns.", "")
-        if final_report_prompt == FINAL_REPORT_PROMPT:
-            final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
+    if organism_prompt and final_report_prompt == FINAL_REPORT_PROMPT:
+        final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
     if task.docker_config is not None:
         require_gate(task.docker_config)
         system_prompt = system_prompt.replace("/work", workspace_mount)
@@ -2902,7 +2879,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
         episode_dir=episode_dir,
         listing_mode=listing_mode,
         organism_prompt=organism_prompt,
-        announced_turn_budget=announced_turn_budget,
         workspace_mount=workspace_mount,
         max_turns=max_turns,
         materialized_paths=materialized,
@@ -2929,7 +2905,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - owns jail lif
         execution_mode=execution_mode,
         tools=tools,
         max_turns=max_turns,
-        announced_turn_budget=announced_turn_budget,
         sampling_seed=sampling_seed,
         timeout=timeout,
         jail_backend=jail_backend,

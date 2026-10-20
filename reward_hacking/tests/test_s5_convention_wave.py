@@ -158,7 +158,6 @@ def test_convention_wave_cell_builds_first_collection_command(
     assert command[command.index("--payment-register") + 1] == "in_band"
     assert command[command.index("--hint-strength") + 1] == "none"
     assert command[command.index("--max-turns") + 1] == "40"
-    assert command[command.index("--announced-turn-budget") + 1] == "40"
     assert command[command.index("--max-tasks") + 1] == "8"
     assert "--convention-note" in command
     assert "--hints" not in command

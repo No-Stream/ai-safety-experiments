@@ -50,7 +50,6 @@ class RecordedSettings:
     partition: str
     payment_register: str
     max_turns: int
-    announced_turn_budget: int | None
     unhinted_system_prompt: str
     hint_family: str | None
     hint_strength: str
@@ -271,9 +270,6 @@ def _recorded_metadata(
     max_turns = identity.get("max_turns")
     if type(max_turns) is not int or max_turns < 1:
         raise TypeError("identity.max_turns must be a positive integer")
-    announced_turn_budget = identity.get("announced_turn_budget")
-    if announced_turn_budget is not None and type(announced_turn_budget) is not int:
-        raise TypeError("identity.announced_turn_budget must be an integer or null")
     unhinted_system_prompt = _unhinted_system_prompt(identity)
     hint_family, hint_strength, hint_sha = _hint_identity(identity)
     hint_text = _recorded_hint_text(record, hint_family, hint_strength, hint_sha)
@@ -283,7 +279,6 @@ def _recorded_metadata(
         partition,
         register,
         max_turns,
-        announced_turn_budget,
         unhinted_system_prompt,
         hint_family,
         hint_strength,
@@ -1114,8 +1109,6 @@ def _render_first_turn(
     system_prompt = compose_hint_system_prompt(settings.unhinted_system_prompt, settings.hint_text)
     workspace_mount = task.docker_config.workspace_mount if task.docker_config else "/work"
     user_template = LADDER_USER_TEMPLATE
-    if settings.family != "ladder":
-        user_template = user_template.replace(" You have {max_turns} turns.", "")
     if task.docker_config is not None:
         from reward_hacking.harness.docker_backend import (  # noqa: PLC0415
             require_gate,
@@ -1132,7 +1125,6 @@ def _render_first_turn(
         episode_dir=episode_dir,
         listing_mode="top-level" if task.task_variant == "leak" else "all",
         organism_prompt=settings.family != "ladder",
-        announced_turn_budget=settings.announced_turn_budget,
         workspace_mount=workspace_mount,
         max_turns=settings.max_turns,
         materialized_paths=materialized_paths,
