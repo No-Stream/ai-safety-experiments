@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 
 AlceCitationVariant = Literal["unsupported", "original"]
 AlceCitationPartition = Literal["train", "held-out"]
+# How an unsupported case lost its answer: ``natural`` means no passage of the 100 retrieved for
+# the parent question contains it; ``answer_removed`` means the shown 20 were rebuilt from the
+# library with every answer-bearing passage left out, backfilled from lower ranks.
+CaseConstruction = Literal["natural", "answer_removed"]
+CONSTRUCTIONS: tuple[CaseConstruction, ...] = ("natural", "answer_removed")
 
 DATA_PATH = Path(__file__).parent / "data" / "alce_citation_cases.json"
 CASES_SCHEMA = "alce-citation-cases/v1"
@@ -177,15 +182,11 @@ class CitationCase:
     question: str
     aliases: tuple[str, ...]
     passages: tuple[CitationPassage, ...]
+    construction: CaseConstruction = "natural"
 
     def __post_init__(self) -> None:
         """Refuse a case whose shown passages contradict its variant label."""
-        if not self.case_id or not self.question.strip():
-            raise ValueError("citation cases need an id and a question")
-        if self.variant not in VARIANTS:
-            raise ValueError(f"unknown citation case variant {self.variant!r}")
-        if self.partition not in {"train", "held-out"}:
-            raise ValueError(f"unknown citation case partition {self.partition!r}")
+        self._validate_labels()
         if not self.aliases or any(not normalize_text(alias) for alias in self.aliases):
             raise ValueError(f"citation case {self.case_id} needs nonempty normalized aliases")
         if any(separator_guard_tripped(alias) for alias in self.aliases):
@@ -199,6 +200,18 @@ class CitationCase:
             )
         if self.variant == "original" and not supporting:
             raise ValueError(f"original case {self.case_id} shows no passage containing the answer")
+
+    def _validate_labels(self) -> None:
+        if self.construction not in CONSTRUCTIONS:
+            raise ValueError(f"unknown citation case construction {self.construction!r}")
+        if self.construction == "answer_removed" and self.variant != "unsupported":
+            raise ValueError("an answer_removed construction is always an unsupported case")
+        if not self.case_id or not self.question.strip():
+            raise ValueError("citation cases need an id and a question")
+        if self.variant not in VARIANTS:
+            raise ValueError(f"unknown citation case variant {self.variant!r}")
+        if self.partition not in {"train", "held-out"}:
+            raise ValueError(f"unknown citation case partition {self.partition!r}")
 
     @property
     def supporting_passage_numbers(self) -> tuple[int, ...]:
@@ -225,6 +238,7 @@ class CitationCase:
             "passages": [
                 {"title": passage.title, "text": passage.text} for passage in self.passages
             ],
+            "construction": self.construction,
         }
 
     @classmethod
@@ -248,6 +262,8 @@ class CitationCase:
                 CitationPassage(title=str(passage["title"]), text=str(passage["text"]))
                 for passage in cast("list[dict[str, object]]", passages)
             ),
+            # Case files written before the answer-removed construction hold only natural cases.
+            construction=cast("CaseConstruction", record.get("construction", "natural")),
         )
 
 

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from reward_hacking import alce_citation_etl as etl
-from reward_hacking.harness.tasks_alce_citation import load_cases
+from reward_hacking.harness.tasks_alce_citation import load_cases, passage_contains_alias
 from reward_hacking.spec_gaming.alce_source import (
     ALCE_PROSPECTIVE_BUCKET_COUNT,
     _source_component_id,  # pyright: ignore[reportPrivateUsage] - the partition rule under test
@@ -166,7 +167,7 @@ class TestJudgePassesAndFinalize:
             view, candidates, counting_complete, work_dir / "support.jsonl"
         )
         knowability = etl.run_knowability_pass(
-            candidates, counting_complete, work_dir / "knowability.jsonl"
+            view, candidates, counting_complete, work_dir / "knowability.jsonl"
         )
         first_call_count = len(calls)
         assert first_call_count > 0
@@ -175,12 +176,26 @@ class TestJudgePassesAndFinalize:
             == support
         )
         assert (
-            etl.run_knowability_pass(candidates, counting_complete, work_dir / "knowability.jsonl")
+            etl.run_knowability_pass(
+                view, candidates, counting_complete, work_dir / "knowability.jsonl"
+            )
             == knowability
         )
         assert len(calls) == first_call_count
-        cases, drops = etl.finalize_cases(view, candidates, support, knowability, min_knowable=2)
+        removed_support = etl.run_removed_support_pass(
+            view, candidates, knowability, counting_complete, work_dir / "support.jsonl"
+        )
+        cases, drops = etl.finalize_cases(
+            view,
+            candidates,
+            support,
+            knowability,
+            removed_support=removed_support,
+            min_knowable=2,
+        )
         assert {case.variant for case in cases} == {"unsupported", "original"}
+        assert {case.construction for case in cases} == {"natural", "answer_removed"}
+        assert len({case.case_id for case in cases}) == len(cases)
         assert all(case.partition in {"train", "held-out"} for case in cases)
         data_path = tmp_path / "alce_citation_cases.json"
         etl.write_final_cases(data_path, cases, view=view, drops=drops, min_knowable=2)
@@ -202,7 +217,9 @@ class TestJudgePassesAndFinalize:
         support[target.case_id] = (False,) * 19 + (True,)
         knowability = {candidate.case_id: (True, True, False, False) for candidate in candidates}
         knowability[candidates[1].case_id] = (True, False, False, False)
-        cases, drops = etl.finalize_cases(view, candidates, support, knowability, min_knowable=2)
+        cases, drops = etl.finalize_cases(
+            view, candidates, support, knowability, removed_support={}, min_knowable=2
+        )
         kept = {case.case_id for case in cases}
         assert target.case_id not in kept
         assert candidates[1].case_id not in kept
@@ -226,7 +243,9 @@ class TestJudgePassesAndFinalize:
         support = {candidate.case_id: (False,) * 20 for candidate in candidates}
         knowability = {candidate.case_id: (True,) * 4 for candidate in candidates}
         with pytest.raises(ValueError, match="library contains"):
-            etl.finalize_cases(tampered_view, candidates, support, knowability, min_knowable=2)
+            etl.finalize_cases(
+                tampered_view, candidates, support, knowability, removed_support={}, min_knowable=2
+            )
 
     def test_resume_refuses_a_cached_record_whose_prompt_changed(
         self, source_root: Path, tmp_path: Path
@@ -234,12 +253,12 @@ class TestJudgePassesAndFinalize:
         view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
         candidates = etl.classify_candidates(view)
         cache = tmp_path / "knowability.jsonl"
-        etl.run_knowability_pass(candidates, _fake_complete, cache)
+        etl.run_knowability_pass(view, candidates, _fake_complete, cache)
         records = [json.loads(line) for line in cache.read_text().splitlines()]
         records[0]["prompt_sha256"] = "0" * 64
         cache.write_text("".join(json.dumps(record) + "\n" for record in records))
         with pytest.raises(ValueError, match="prompt changed"):
-            etl.run_knowability_pass(candidates, _fake_complete, cache)
+            etl.run_knowability_pass(view, candidates, _fake_complete, cache)
 
 
 def test_subset_selects_requested_counts(tmp_path: Path, source_root: Path) -> None:
@@ -247,9 +266,11 @@ def test_subset_selects_requested_counts(tmp_path: Path, source_root: Path) -> N
     candidates = etl.classify_candidates(view)
     support = etl.run_support_pass(view, candidates, _fake_complete, tmp_path / "support.jsonl")
     knowability = etl.run_knowability_pass(
-        candidates, _fake_complete, tmp_path / "knowability.jsonl"
+        view, candidates, _fake_complete, tmp_path / "knowability.jsonl"
     )
-    cases, drops = etl.finalize_cases(view, candidates, support, knowability, min_knowable=2)
+    cases, drops = etl.finalize_cases(
+        view, candidates, support, knowability, removed_support={}, min_knowable=2
+    )
     data_path = tmp_path / "cases.json"
     etl.write_final_cases(data_path, cases, view=view, drops=drops, min_knowable=2)
     subset_path = tmp_path / "subset.json"
@@ -267,10 +288,97 @@ def test_cache_only_finalize_drops_and_counts_unjudged_candidates(
     support_cache = tmp_path / "support.jsonl"
     knowability_cache = tmp_path / "knowability.jsonl"
     etl.run_support_pass(view, judged[1:], _fake_complete, support_cache)
-    etl.run_knowability_pass(judged[1:], _fake_complete, knowability_cache)
+    etl.run_knowability_pass(view, judged[1:], _fake_complete, knowability_cache)
     support = etl.run_support_pass(view, candidates, None, support_cache)
-    knowability = etl.run_knowability_pass(candidates, None, knowability_cache)
+    knowability = etl.run_knowability_pass(view, candidates, None, knowability_cache)
     assert judged[0].case_id not in support
-    cases, drops = etl.finalize_cases(view, candidates, support, knowability, min_knowable=2)
+    cases, drops = etl.finalize_cases(
+        view, candidates, support, knowability, removed_support={}, min_knowable=2
+    )
     assert drops[f"{judged[0].candidate_class}_unjudged"] == 1
     assert judged[0].case_id not in {case.case_id for case in cases}
+
+
+class TestAnswerRemoved:
+    def test_shown_set_drops_every_alias_passage_and_backfills_in_rank_order(
+        self, source_root: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        reserve = next(
+            c for c in etl.classify_candidates(view) if c.candidate_class == "reserve_supported"
+        )
+        row = view.rows_by_sample[reserve.sample_id]
+        passages = etl.answer_removed_passages(row, reserve.aliases)
+        assert passages is not None
+        assert len(passages) == 20
+        assert not any(
+            passage_contains_alias(passage.searchable_text, reserve.aliases) for passage in passages
+        )
+        expected_titles = [
+            str(doc["title"])
+            for doc in cast("list[dict[str, object]]", row["docs"])
+            if not passage_contains_alias(f"{doc['title']}\n{doc['text']}", reserve.aliases)
+        ][:20]
+        assert [passage.title for passage in passages] == expected_titles
+
+    def test_eligibility_is_deterministic_and_covers_only_answer_bearing_classes(
+        self, source_root: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        candidates = etl.classify_candidates(view)
+        eligible = [c for c in candidates if etl.removal_eligible(c)]
+        assert eligible == [c for c in etl.classify_candidates(view) if etl.removal_eligible(c)]
+        assert {c.candidate_class for c in eligible} <= {"reserve_supported", "original"}
+        assert all(
+            etl.removal_eligible(c) for c in candidates if c.candidate_class == "reserve_supported"
+        )
+
+    def test_unknowable_eligible_original_stays_original_and_reserve_is_dropped(
+        self, source_root: Path, tmp_path: Path
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        candidates = etl.classify_candidates(view)
+        support = etl.run_support_pass(view, candidates, _fake_complete, tmp_path / "s.jsonl")
+        knowability = {candidate.case_id: (False,) * 4 for candidate in candidates}
+        cases, drops = etl.finalize_cases(
+            view, candidates, support, knowability, removed_support={}, min_knowable=1
+        )
+        assert all(case.construction == "natural" for case in cases)
+        original_ids = {c.case_id for c in candidates if c.candidate_class == "original"}
+        assert original_ids <= {case.case_id for case in cases}
+        reserve = [c for c in candidates if c.candidate_class == "reserve_supported"]
+        assert drops["answer_removed_not_knowable"] >= len(reserve)
+
+    def test_finalize_refuses_a_removed_set_that_still_holds_an_alias(
+        self, source_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+        candidates = etl.classify_candidates(view)
+        reserve = next(c for c in candidates if c.candidate_class == "reserve_supported")
+        row = view.rows_by_sample[reserve.sample_id]
+        leaky = etl.shown_passages(row)
+        monkeypatch.setattr(etl, "answer_removed_passages", lambda _row, _aliases: leaky)
+        with pytest.raises(ValueError, match=r"answer-removed candidate .* shows the answer"):
+            etl.finalize_cases(
+                view,
+                [reserve],
+                {},
+                {reserve.case_id: (True,) * 4},
+                removed_support={reserve.case_id: (False,) * 20},
+                min_knowable=1,
+            )
+
+
+def test_deep_removal_and_answer_in_question_are_not_offered(source_root: Path) -> None:
+    view = etl.read_source(source_root, expected_count=QUESTION_COUNT)
+    reserve = next(
+        c for c in etl.classify_candidates(view) if c.candidate_class == "reserve_supported"
+    )
+    row = dict(view.rows_by_sample[reserve.sample_id])
+    docs = [dict(doc) for doc in cast("list[dict[str, object]]", row["docs"])]
+    for doc in docs[: etl.MAX_REMOVED_SHOWN_RANK - etl.SHOWN_PASSAGE_COUNT + 1]:
+        doc["text"] = f"{doc['text']} {reserve.aliases[0]}"
+    row["docs"] = docs
+    assert etl.answer_removed_passages(row, reserve.aliases) is None
+    in_question = dataclasses.replace(reserve, question=f"Was it {reserve.aliases[0]}?")
+    assert not etl.removal_eligible(in_question)

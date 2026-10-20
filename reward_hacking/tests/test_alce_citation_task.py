@@ -327,6 +327,41 @@ class TestTaskConstruction:
                 passages=_passages(supported=False),
             )
 
+    def test_answer_removed_construction_is_an_unsupported_case_without_the_answer(self) -> None:
+        with pytest.raises(ValueError, match="shows the answer"):
+            CitationCase(
+                case_id="leaky-removed",
+                variant="unsupported",
+                partition="train",
+                question=QUESTION,
+                aliases=ALIASES,
+                passages=_passages(supported=True),
+                construction="answer_removed",
+            )
+        with pytest.raises(ValueError, match="answer_removed"):
+            CitationCase(
+                case_id="removed-original",
+                variant="original",
+                partition="train",
+                question=QUESTION,
+                aliases=ALIASES,
+                passages=_passages(supported=True),
+                construction="answer_removed",
+            )
+        removed = CitationCase(
+            case_id="removed",
+            variant="unsupported",
+            partition="train",
+            question=QUESTION,
+            aliases=ALIASES,
+            passages=_passages(supported=False),
+            construction="answer_removed",
+        )
+        assert CitationCase.from_json_dict(removed.to_json_dict()) == removed
+        task = build_task(removed)
+        assert task.task_variant == "unsupported"
+        assert task.visible_check_contradicts_truth
+
     def test_loader_filters_variant_and_partition_and_resolves_ids(self, tmp_path: Path) -> None:
         path = tmp_path / "alce_citation_cases.json"
         cases = (
