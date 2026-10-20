@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 
+from reward_hacking.harness import status_report
 from reward_hacking.harness.status_report import (
     STATUS_FILENAME,
     STATUS_INSTRUCTION,
     StatusClaim,
+    collection_config_digests,
     invokes_runner,
     is_status_variant,
+    laid_down_collection_config_digests,
     parse_status_bytes,
     read_status_file,
     status_base_variant,
@@ -88,6 +93,10 @@ class TestWrapper:
             with_status_report(wrapped)
         with pytest.raises(ValueError, match="variant"):
             status_base_variant("oneoff")
+
+    def test_tasks_with_a_workspace_template_are_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="workspace template"):
+            with_status_report(replace(synthetic_coding_task(), workspace_template=tmp_path))
 
 
 class TestParse:
@@ -179,3 +188,58 @@ class TestRunnerInvocation:
     )
     def test_reads_and_mentions_do_not_count(self, command: str) -> None:
         assert invokes_runner(command, "run_tests.py") is False
+
+
+class TestCollectionConfig:
+    def test_laid_down_digests_cover_only_collection_config_files(self) -> None:
+        task = synthetic_coding_task()
+        task = replace(task, files={**task.files, "pkg/pytest.ini": "[pytest]\n"})
+        assert laid_down_collection_config_digests(task) == {
+            "pkg/pytest.ini": hashlib.sha256(b"[pytest]\n").hexdigest()
+        }
+
+    def test_walk_finds_config_files_at_any_depth_and_records_non_files(
+        self, tmp_path: Path
+    ) -> None:
+        assert collection_config_digests(tmp_path) == {}
+        (tmp_path / "test_solution.py").write_text("assert True\n")
+        (tmp_path / "deep" / "er").mkdir(parents=True)
+        (tmp_path / "deep" / "er" / "conftest.py").write_bytes(
+            b"collect_ignore = ['test_solution.py']\n"
+        )
+        (tmp_path / "tox.ini").symlink_to(tmp_path / "test_solution.py")
+        (tmp_path / "setup.cfg").mkdir()
+        assert collection_config_digests(tmp_path) == {
+            "deep/er/conftest.py": hashlib.sha256(
+                b"collect_ignore = ['test_solution.py']\n"
+            ).hexdigest(),
+            "tox.ini": None,
+            "setup.cfg": None,
+        }
+
+    def test_walk_does_not_follow_directory_symlinks(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "conftest.py").write_text("x = 1\n")
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        (workspace / "linked").symlink_to(outside, target_is_directory=True)
+        assert collection_config_digests(workspace) == {}
+
+    def test_a_workspace_too_large_to_walk_is_unmeasured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(status_report, "MAX_COLLECTION_WALK_ENTRIES", 3)
+        for index in range(4):
+            (tmp_path / f"file-{index}").write_text("")
+        assert collection_config_digests(tmp_path) is None
+
+    def test_an_unreadable_directory_is_unmeasured(self, tmp_path: Path) -> None:
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "conftest.py").write_text("x = 1\n")
+        hidden.chmod(0)
+        try:
+            assert collection_config_digests(tmp_path) is None
+        finally:
+            hidden.chmod(0o755)
