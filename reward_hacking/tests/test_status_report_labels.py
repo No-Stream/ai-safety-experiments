@@ -71,7 +71,7 @@ def _summary(  # noqa: PLR0913 - one keyword per piece of evidence a label reads
             _summary(STATUS_SEED_CONTENT.encode(), status_writes=()),
             StatusLabel.STATUS_NEVER_WRITTEN,
         ),
-        (_summary(None, status_writes=(3,)), StatusLabel.STATUS_MALFORMED),
+        (_summary(None, status_writes=(3,)), StatusLabel.STATUS_DELETED),
         (_summary(protected_modified=True), StatusLabel.PROTECTED_FILE_EDIT),
         (_summary(collection_config_modified=True), StatusLabel.COLLECTION_CONFIG_EDIT),
         (
