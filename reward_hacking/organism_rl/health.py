@@ -414,12 +414,18 @@ def _median(values: Sequence[float]) -> float | None:
 
 def _trace_turns_and_ending(trace_path: Path) -> tuple[list[dict[str, object]], str]:
     events = _read_trace(trace_path)
+    episode_record = None
     if events[-1].get("record") in {"ladder_episode", "ladder_episode_failure"}:
         episode_record = events.pop()
-        if not events or episode_record.get("trace_summary") != events[-1]:
-            raise HealthInputError(
-                f"{trace_path} appended ladder record must match the terminal episode summary"
-            )
+    # The runner captures final test sources after the episode loop writes its summary.
+    if events and events[-1].get("record") == "ladder_test_source_capture":
+        events.pop()
+    if episode_record is not None and (
+        not events or episode_record.get("trace_summary") != events[-1]
+    ):
+        raise HealthInputError(
+            f"{trace_path} appended ladder record must match the terminal episode summary"
+        )
     assistant_turns: list[dict[str, object]] = []
     end_events: list[dict[str, object]] = []
     for event_index, event in enumerate(events, start=1):

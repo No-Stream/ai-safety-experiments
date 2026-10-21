@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from reward_hacking.harness.evidence_store import append_jsonl
 from reward_hacking.organism_rl import health
 
 
@@ -261,6 +262,45 @@ def test_native_ladder_trace_with_appended_episode_record(
     _write_rows(trace_path, events)
 
     if corruption is None:
+        assert health.analyze_records([records_path])["episode_count"] == 1
+    else:
+        with pytest.raises(health.HealthInputError):
+            health.analyze_records([records_path])
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("appended_episode", [False, True])
+@pytest.mark.parametrize(
+    "trailer", ["capture", "duplicate_capture", "unexpected", "turn", "capture_then_unexpected"]
+)
+def test_native_ladder_source_capture_trailer(
+    tmp_path: Path, compact: bool, appended_episode: bool, trailer: str
+) -> None:
+    records_path = _native_rows(tmp_path)
+    rows = _rows(records_path)
+    episode = rows[-1]
+    trace_path = tmp_path / str(episode["trace_path"])
+    events = _rows(trace_path)
+    capture: dict[str, object] = {"record": "ladder_test_source_capture", "command_count": 1}
+    events.append(capture)
+    if trailer == "duplicate_capture":
+        events.append(dict(capture))
+    elif trailer in {"unexpected", "capture_then_unexpected"}:
+        if trailer == "unexpected":
+            events.pop()
+        events.append({"record": "unexpected"})
+    elif trailer == "turn":
+        events.append(dict(events[0]))
+    if appended_episode:
+        events.append(episode)
+    if compact:
+        trace_path = tmp_path / "compact.jsonl.gz"
+        append_jsonl(trace_path, events)
+        episode["trace_path"] = trace_path.name
+        _write_rows(records_path, rows)
+    else:
+        _write_rows(trace_path, events)
+    if trailer == "capture":
         assert health.analyze_records([records_path])["episode_count"] == 1
     else:
         with pytest.raises(health.HealthInputError):

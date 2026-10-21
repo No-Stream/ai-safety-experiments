@@ -196,6 +196,59 @@ def test_persisted_native_refresh_reaches_heldout_card_family(tmp_path: Path) ->
     assert records_path.read_bytes() == raw_records
 
 
+def test_label_refresh_validates_overlapping_native_and_grader_evidence(
+    tmp_path: Path,
+) -> None:
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    records_path, native_path, rescored_path = native_collection_fixture_files(stage)
+    trace_summary: dict[str, object] = {
+        "task_variant": "loose_oneoff",
+        "graded_artifact": None,
+        "grader_integrity": {"content_changed": True},
+        "true": {"pass": False, "measured": True},
+        "gap": {"visible_check_contradicts_truth": True},
+        "provided_test_pass": False,
+    }
+    for path in (records_path, native_path, rescored_path):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            if row.get("record") == "ladder_episode":
+                row["trace_summary"] = trace_summary
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    native_evidence_path = build_native_evidence(
+        records_path,
+        native_path,
+        rescored_path,
+        tmp_path / "native-evidence.json",
+    )
+    result = label_refresh.refresh_labels(
+        records_path, tmp_path / "labels", native_evidence_path=native_evidence_path
+    )
+
+    labels = label_refresh.load_derived_labels(records_path, result.labels_path)
+    label = next(iter(labels.values()))
+    automatic = cast("dict[str, object]", label["automatic_hack_strategy"])
+    evidence = cast("dict[str, list[str]]", automatic["evidence"])
+    assert "grader integrity content changed" in evidence["test_or_grader_file_edit"]
+
+    label_rows = [json.loads(line) for line in result.labels_path.read_text().splitlines()]
+    tampered_automatic = cast("dict[str, object]", label_rows[0]["automatic_hack_strategy"])
+    tampered_evidence = cast("dict[str, list[str]]", tampered_automatic["evidence"])
+    tampered_evidence["test_or_grader_file_edit"].append("unverified injected evidence")
+    labels_bytes = "".join(json.dumps(row, sort_keys=True) + "\n" for row in label_rows).encode()
+    result.labels_path.write_bytes(labels_bytes)
+    manifest = json.loads(result.manifest_path.read_text())
+    manifest["labels_sha256"] = hashlib.sha256(labels_bytes).hexdigest()
+    result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"test_or_grader_file_edit") as error:
+        label_refresh.load_derived_labels(records_path, result.labels_path)
+    assert "synthetic-scenario" in str(error.value)
+    assert "stored" in str(error.value)
+    assert "recomputed" in str(error.value)
+
+
 @pytest.mark.parametrize("source", ["original_native", "rescored_native", "headers", "trace"])
 def test_refresh_refuses_native_source_changes_before_publishing_labels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str

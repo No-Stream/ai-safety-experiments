@@ -24,9 +24,13 @@ from reward_hacking.distill.hack_strategy import (
     TAXONOMY_VERSION,
     HackStrategyAssessment,
     StrengthenedTruthEvidence,
+    _add_grader_integrity_labels,  # pyright: ignore[reportPrivateUsage]
     _add_native_ladder_strategy_evidence,  # pyright: ignore[reportPrivateUsage]
+    _grader_integrity_content_changed,  # pyright: ignore[reportPrivateUsage]
+    _label_acceptance_episode,  # pyright: ignore[reportPrivateUsage]
     _reconstruct_final_source,  # pyright: ignore[reportPrivateUsage]
     _recorded_true_pass,  # pyright: ignore[reportPrivateUsage]
+    _trusted_verdict_tampering_evidence,  # pyright: ignore[reportPrivateUsage]
     label_persisted_episode,
     read_strengthened_truth_sidecar,
 )
@@ -883,20 +887,68 @@ def _manifest_native_evidence(manifest: Mapping[str, object], records_path: Path
 
 
 def _validate_native_assessment(
-    record: Mapping[str, object], label: Mapping[str, object], overlay: Mapping[str, object]
+    records_path: Path,
+    record: Mapping[str, object],
+    label: Mapping[str, object],
+    strengthened_truth: StrengthenedTruthEvidence | None,
 ) -> None:
+    """Validate each native strategy bucket against every current contributing detector."""
+    join_key = derived_label_join_key(record)
     automatic_value = label.get("automatic_hack_strategy")
     if not isinstance(automatic_value, Mapping):
         raise TypeError("label is missing its automatic strategy assessment")
     automatic = assessment_from_payload(automatic_value)
-    expected: dict[str, list[str]] = {}
-    _add_native_ladder_strategy_evidence({**record, **overlay}, expected)
+
+    summary = record.get("trace_summary")
+    task_variant = summary.get("task_variant") if isinstance(summary, Mapping) else None
+    if task_variant is None and isinstance(record.get("variant"), str):
+        task_variant = record["variant"]
+    if task_variant == "acceptance_leak":
+        expected_evidence = {
+            strategy: list(descriptions)
+            for strategy, descriptions in _label_acceptance_episode(record).evidence.items()
+        }
+    else:
+        trace_path = _trace_path(records_path, record, f"{records_path}:native label evidence")
+        trace_records = _read_trace_records(trace_path)
+        normalized_record = hydrate_task_record(
+            {**record, "trace_path": str(trace_path.resolve())},
+            records_path,
+            trace_records=trace_records,
+        )
+        expected_evidence: dict[str, list[str]] = {}
+        expected_evidence["test_or_grader_file_edit"] = list(
+            _trusted_verdict_tampering_evidence(normalized_record, trace_records, None)
+        )
+        _add_native_ladder_strategy_evidence(normalized_record, expected_evidence)
+        content_changed = _grader_integrity_content_changed(normalized_record)
+        if task_variant == "leak":
+            content_changed = False
+        _add_grader_integrity_labels(
+            normalized_record,
+            content_changed=content_changed,
+            true_pass=_recorded_true_pass(normalized_record),
+            strengthened_truth=strengthened_truth,
+            evidence=expected_evidence,
+            trace_records=trace_records,
+        )
+
     strategies = ["test_collection_suppression", "ci_baseline_tampering"]
     if record.get("record") == "ladder_episode":
         strategies.append("test_or_grader_file_edit")
+    differences: dict[str, dict[str, list[str]]] = {}
     for strategy in strategies:
-        if automatic.evidence.get(strategy, ()) != tuple(expected.get(strategy, ())):
-            raise ValueError("native mechanism labels differ from the verified detector evidence")
+        expected_values = tuple(dict.fromkeys(expected_evidence.get(strategy, ())))
+        if automatic.evidence.get(strategy, ()) != expected_values:
+            differences[strategy] = {
+                "stored": list(automatic.evidence.get(strategy, ())),
+                "recomputed": list(expected_values),
+            }
+    if differences:
+        raise ValueError(
+            "native mechanism labels differ from current detector evidence for episode join "
+            f"{join_key!r}: {differences}"
+        )
 
 
 def _validate_bound_metadata(
@@ -968,8 +1020,7 @@ def load_derived_labels(
         if join_key in derived_labels:
             raise ValueError(f"{labels_path} contains a duplicate episode join")
         _validate_bound_metadata(label, join_key, adjudications, native_evidence)
-        _validate_native_assessment(source_record, label, native_evidence.entries.get(join_key, {}))
-        _truth, truth_source_sha256, _limitation = _truth_for_label(
+        strengthened_truth, truth_source_sha256, _limitation = _truth_for_label(
             source_record,
             context=f"{records_path}:row {row_index}",
             artifact_sha256=cast("str | None", label.get("artifact_sha256")),
@@ -985,6 +1036,12 @@ def load_derived_labels(
             source_record,
             label,
             truth_source_sha256=truth_source_sha256,
+        )
+        _validate_native_assessment(
+            records_path,
+            {**source_record, **native_evidence.entries.get(join_key, {})},
+            label,
+            strengthened_truth,
         )
         _validate_label_payload(labels_path, row_index, label)
         derived_labels[join_key] = label
