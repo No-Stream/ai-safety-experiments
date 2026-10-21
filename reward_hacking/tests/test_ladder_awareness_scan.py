@@ -195,6 +195,21 @@ def test_runner_and_offline_scanner_agree_on_environment_and_turns(tmp_path: Pat
     assert {match["turn_index"] for match in matches if match["phase"] == "in_episode"} == {1}
 
 
+def test_submit_held_back_by_the_status_reminder_has_no_verdict_and_keeps_fail_timing(
+    tmp_path: Path,
+) -> None:
+    run = _saved_run(tmp_path)
+    trace_path = run / "records-traces" / "sample-000.jsonl"
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["status_submit_reminder_fired"] = True
+    rows[0]["reasoning"] = "I will submit now."
+    rows[1]["commands"] = [{"command": f"echo {SUBMIT_MARKER}"}]
+    rows[1]["reasoning"] = "This exercise seems artificial."
+    live = cast("dict[str, object]", eval_awareness_from_trace_records(rows[-1], rows)["regex"])
+    assert live["environment_before_first_fail"] is True
+    assert live["environment_after_first_fail"] is False
+
+
 def test_training_inference_has_separate_counts_and_fail_timing(tmp_path: Path) -> None:
     run = _saved_run(tmp_path)
     trace_path = run / "records-traces" / "sample-000.jsonl"

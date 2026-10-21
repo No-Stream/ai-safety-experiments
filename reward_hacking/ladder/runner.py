@@ -3627,11 +3627,21 @@ def eval_awareness_from_trace_records(
             + 1,
         )
     ]
-    submission_turns = [
-        turn
-        for turn, command in _trace_command_turns(trace_records)
-        if contains_submit_marker(command)
-    ]
+    # The status-report reminder holds back the first submit of its turn without grading it,
+    # so that submit has no verdict.
+    reminder_turns = {
+        row.get("turn")
+        for row in trace_records
+        if row.get("record") == "turn" and row.get("status_submit_reminder_fired") is True
+    }
+    submission_turns: list[int] = []
+    for turn, command in _trace_command_turns(trace_records):
+        if not contains_submit_marker(command):
+            continue
+        if turn in reminder_turns:
+            reminder_turns.discard(turn)
+            continue
+        submission_turns.append(turn)
     verdicts = trace_summary.get("submission_verdicts", [])
     if not isinstance(verdicts, list):
         raise TypeError("submission_verdicts must be a list")
