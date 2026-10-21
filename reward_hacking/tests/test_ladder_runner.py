@@ -5500,7 +5500,9 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
         models=(ModelSpec("base", "/models/scripted"),),
         arms=("real",),
         samples=1,
-        max_model_len_by_model=(("base", 512),),
+        max_turns=1,
+        history_reasoning="strip",
+        max_model_len_by_model=(("base", 8_192),),
     )
     model = config.models[0]
     if report_timeout is not None:

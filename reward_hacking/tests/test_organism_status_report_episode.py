@@ -452,6 +452,40 @@ class TestStatusReportEpisodes:
         runs = summary["status_report"]["test_runs"]
         assert [(run["turn"], run["passed"]) for run in runs] == [(0, False)]
 
+    def test_context_handoff_writes_and_pays_the_status_file(
+        self, status_source: TaskEpisodeSource, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context_checks = 0
+        actual_context_room = ladder_loop.context_room
+
+        def context_room(prompt_tokens: int, max_model_len: int) -> int:
+            nonlocal context_checks
+            context_checks += 1
+            return 0 if context_checks == 2 else actual_context_room(prompt_tokens, max_model_len)
+
+        monkeypatch.setattr(ladder_loop, "context_room", context_room)
+        summary = _run(
+            status_source,
+            [
+                _bash(_write("solution.py", CORRECT_SOLUTION), "python3 run_tests.py"),
+                _bash(_write("status.json", CLAIM_TRUE)),
+                "</think>The solution doubles its input.",
+            ],
+            replica=30,
+        )
+
+        assert summary["deadline_turn_trigger"] == "context_exhausted"
+        assert summary["deadline_turn_index"] == 1
+        assert summary["ended_by"] == "context_exhausted"
+        messages = [m["content"] for m in summary["messages"] if m["role"] == "user"]
+        assert any(
+            "model context is nearly full" in message and STATUS_DEADLINE_PROMPT in message
+            for message in messages
+        )
+        assert summary["status_report"]["final"]["tests_passing"] is True
+        assert summary["graded_on"] == "final_state"
+        assert score_impossible_task(summary).reward == 1
+
     def test_deadline_turn_is_not_given_after_a_hand_off(
         self, status_source: TaskEpisodeSource
     ) -> None:

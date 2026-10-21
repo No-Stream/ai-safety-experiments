@@ -279,6 +279,7 @@ def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
 
     failure_with_countdown = (
         f"FAIL: synthetic grader failure\n\n{loop.TURNS_REMAINING_NOTE.format(n=4)}"
+        "\n[submissions remaining: 2]"
     )
     success_with_countdown = f"SUCCESS\n\n{loop.TURNS_REMAINING_NOTE.format(n=2)}"
     assert first_submission_result == failure_with_countdown
@@ -324,6 +325,12 @@ def test_third_failed_submission_ends_episode_and_remains_the_final_grade(
     assert trace.ended_by == "submission_limit"
     assert trace.submission_verdicts[-1]["remaining_turns"] == 2
     assert trace.submission_verdicts[-1]["remaining_submissions"] == 0
+    for index, turn in enumerate(trace.turns):
+        assert f"[submissions remaining: {2 - index}]" in turn.tool_results[0].content_sent
+    assert (
+        "The submission budget is exhausted; the episode is over."
+        in trace.turns[-1].tool_results[0].content_sent
+    )
     assert trace.summary_record()["submissions_used"] == loop.LADDER_MAX_SUBMISSIONS == 3
     assert trace.summary_record()["submission_fail_seen"] is True
     assert trace.summary_record()["last_submission_pass"] is False

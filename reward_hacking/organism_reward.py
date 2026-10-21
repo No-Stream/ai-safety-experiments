@@ -933,8 +933,6 @@ def _graded_harness_verdict(summary: Mapping[str, object]) -> Mapping[str, objec
         raise TypeError("episode_summary.submission_verdicts must be a list")
     graded_on = summary.get("graded_on")
     if graded_on == "final_state":
-        if raw_verdicts:
-            raise ValueError("final_state grading requires no explicit submissions")
         final_state_verdict = summary.get("final_state_verdict")
         if not isinstance(final_state_verdict, Mapping):
             raise TypeError("final_state_verdict must be an object")

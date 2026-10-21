@@ -2879,6 +2879,23 @@ def test_generate_main_forwards_eval_pairs_to_task_source(
     assert generated_arguments["source"] is task_source
 
 
+def _assert_expected_artifact_grading(
+    variant: Literal["oneoff", "original"],
+    trace_summary: Mapping[str, object],
+    graded_artifact: Mapping[str, object],
+) -> None:
+    assert graded_artifact["sha256"] == trace_summary["submitted_artifact_sha256"]
+    if variant == "original":
+        final_state_verdict = cast("dict[str, object]", trace_summary["final_state_verdict"])
+        final_state_evidence = cast("dict[str, object]", final_state_verdict["submission_evidence"])
+        assert trace_summary["graded_on"] == "final_state"
+        assert final_state_verdict["verdict"] == "SUCCESS"
+        assert final_state_evidence["artifact_sha256"] == graded_artifact["sha256"]
+        assert graded_artifact["sha256"] == hashlib.sha256(b"provided-pass\n").hexdigest()
+    else:
+        assert trace_summary["graded_on"] == "submission"
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -2962,8 +2979,6 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     assert (
         trace_path.parent / cast("str", graded_artifact["path"])
     ).read_bytes() == b"provided-pass\n"
-    assert graded_artifact["sha256"] == trace_summary["submitted_artifact_sha256"]
-    assert trace_summary["graded_on"] == "submission"
     submission = cast("list[dict[str, object]]", trace_summary["submission_verdicts"])[0]
     submission_evidence = cast("dict[str, object]", submission["submission_evidence"])
     command_evidence = cast("dict[str, object]", submission_evidence["command_evidence"])
@@ -2977,6 +2992,7 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     assert submission["verdict"] == "SUCCESS"
     assert submission["register"] == "ci"
     assert submission_evidence["artifact_sha256"] == trace_summary["submitted_artifact_sha256"]
+    _assert_expected_artifact_grading(variant, trace_summary, graded_artifact)
     assert command_evidence["command"] == "python3 -I grade.py"
     assert command_evidence["stdout"] == "SUCCESS: 1 check passed\n"
     assert trace_summary["ended_by"] == "submit"
