@@ -888,6 +888,12 @@ def _persist_graded_artifact(
         raise ValueError("persist_graded_artifact requires trace_path")
     if task.artifact_filename is None:
         return None
+    if (
+        "small_repo_asset" in task.host_only_metadata
+        and final_grade.oracle_error is not None
+        and final_grade.task_evidence is None
+    ):
+        return None
     artifact_bytes = task_submitted_artifact(task, episode_dir)
     if artifact_bytes is None:
         return None
@@ -914,6 +920,11 @@ def _persist_graded_artifact(
         "sha256": digest,
         "path": f"graded-artifacts/{digest}",
         "size_bytes": len(artifact_bytes),
+        **(
+            {"format": "small_repo_artifact_bundle_json_v1"}
+            if "small_repo_asset" in task.host_only_metadata
+            else {}
+        ),
         **(
             {
                 "format": TASK_ARTIFACT_BUNDLE_FORMAT,

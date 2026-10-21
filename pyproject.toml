@@ -180,6 +180,7 @@ exclude = [
     "docs/scratch",
     ".claude",
     "artifacts",
+    "reward_hacking/harness/data",
     "reward_hacking/ladder/data",
     "external",
 ]

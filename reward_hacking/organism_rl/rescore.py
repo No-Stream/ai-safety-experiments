@@ -17,15 +17,17 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from reward_hacking.distill.hack_strategy import label_episode, label_persisted_episode
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness import tasks_small_repo
 from reward_hacking.harness.acceptance_evidence import assess_recorded_acceptance
 from reward_hacking.harness.docker_backend import SnapshotLimitError
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
+from reward_hacking.harness.status_report import with_status_report
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
@@ -431,6 +433,38 @@ def _recorded_task_definition_mismatch(task: Task, trace_path: Path) -> dict[str
     return _task_definition_mismatch(task, identities[0]) if identities else None
 
 
+def _small_repo_task_definition_mismatch(task: Task, trace_path: Path) -> dict[str, object] | None:
+    identities = [
+        row for row in _read_records(trace_path) if row.get("record") == "organism_episode_identity"
+    ]
+    if len(identities) != 1:
+        raise ValueError("small_repo trace must contain exactly one organism episode identity")
+
+    recorded_definition = _small_repo_definition_identity(
+        identities[0].get("task_definition_content")
+    )
+    replayed_definition = _small_repo_definition_identity(task_definition_content(task))
+    if (
+        recorded_definition["semantic_content_sha256"]
+        == replayed_definition["semantic_content_sha256"]
+    ):
+        return None
+    return {
+        "compared": "small_repo_semantic_content_sha256",
+        "recorded_digest": recorded_definition["semantic_content_sha256"],
+        "replayed_digest": replayed_definition["semantic_content_sha256"],
+    }
+
+
+def _small_repo_definition_identity(value: object) -> dict[str, object]:
+    definition = deepcopy(dict(_object(value, "small_repo task definition")))
+    host_metadata = _object(definition.get("host_only_metadata"), "small_repo task metadata")
+    asset = _object(host_metadata.get("small_repo_asset"), "small_repo task asset")
+    repository = _object(asset.get("repository"), "small_repo repository asset")
+    repository.pop("template_root", None)
+    return semantic_content_identity(definition)
+
+
 def _replay_commands(
     directory: Path,
     trace_path: Path,
@@ -479,6 +513,16 @@ def rescore_record(
         if payment_register not in {None, "trusted_acceptance"}:
             raise ValueError("acceptance_leak requires trusted_acceptance")
         return rescore_recorded_acceptance(record)
+    if record.get("family") == "small_repo":
+        if not isinstance(recorded_summary.get("graded_artifact"), Mapping):
+            return _rescore_small_repo_without_artifact(record, records_path=None)
+        small_repo_task = task or _load_task(record)
+        return _rescore_small_repo_record(
+            record,
+            small_repo_task,
+            payment_register=payment_register,
+            records_path=None,
+        )
     result = deepcopy(dict(record))
     summary = _object(result["trace_summary"], "trace_summary")
     execution_mode = _recorded_execution_mode(summary)
@@ -587,12 +631,14 @@ def _rescore_unsubmitted_record(
     return _record_saved_reward(result, summary, options.payment_register)
 
 
-def _rescore_previously_unmeasured_record(
+def _rescore_previously_unmeasured_record(  # noqa: PLR0913 - trace path retains source evidence
     record: Mapping[str, object],
     result: dict[str, object],
     summary: dict[str, object],
     payment_register: str | None,
     recorded_unmeasured_truth: tuple[str, bool],
+    *,
+    records_path: Path | None = None,
 ) -> dict[str, object]:
     reason, has_oracle_error = recorded_unmeasured_truth
     _record_unmeasured_truth(summary, reason, has_oracle_error=has_oracle_error)
@@ -600,12 +646,128 @@ def _rescore_previously_unmeasured_record(
     result["true_pass"] = None
     result["rescore"] = {
         "source_record_sha256": _digest(record),
-        "source_inputs": _source_inputs(record),
+        "source_inputs": _source_inputs(record, records_path=records_path),
         "method": "recorded_unmeasured_truth",
         "payment_register": payment_register,
         "unmeasured_reason": reason,
     }
-    return _record_saved_reward(result, summary, payment_register)
+    trace_file = Path(cast("str", record["trace_path"]))
+    if not trace_file.is_absolute() and records_path is not None:
+        trace_file = records_path.parent / trace_file
+    return _record_saved_reward(result, summary, payment_register, trace_file=trace_file)
+
+
+def _rescore_small_repo_without_artifact(
+    record: Mapping[str, object], *, records_path: Path | None
+) -> dict[str, object]:
+    result = deepcopy(dict(record))
+    summary = _object(result["trace_summary"], "trace_summary")
+    reason = _recorded_unmeasured_truth_reason(record, summary) or (
+        "small_repo final artifact bundle was unavailable",
+        False,
+    )
+    return _rescore_previously_unmeasured_record(
+        record,
+        result,
+        summary,
+        _recorded_payment_register(record, summary),
+        reason,
+        records_path=records_path,
+    )
+
+
+def _rescore_small_repo_record(
+    record: Mapping[str, object],
+    task: Task,
+    *,
+    payment_register: str | None,
+    records_path: Path | None,
+) -> dict[str, object]:
+    """Rerun pristine truth against the recorded full source bundle, including additions/deletions."""
+    if payment_register not in {None, "status_report"}:
+        raise ValueError("small_repo requires the status_report payment register")
+    if task.true_check_result is None:
+        raise ValueError("small_repo task has no trusted pristine-test checker")
+    result = deepcopy(dict(record))
+    summary = _object(result["trace_summary"], "trace_summary")
+    trace_path = record.get("trace_path")
+    if not isinstance(trace_path, str):
+        raise TypeError("small_repo record trace_path must be a string")
+    trace_file = Path(trace_path)
+    if not trace_file.is_absolute() and records_path is not None:
+        trace_file = records_path.parent / trace_file
+    task_definition_mismatch = _small_repo_task_definition_mismatch(task, trace_file)
+    if task_definition_mismatch is not None:
+        raise ValueError(
+            "small_repo trusted task definition changed since the episode: "
+            f"{task_definition_mismatch}"
+        )
+    artifact, artifact_sha256, metadata_sha256, recorded_sha256 = _read_small_repo_artifact(
+        summary, trace_file
+    )
+    rescore_metadata: dict[str, object] = {
+        "source_record_sha256": _digest(record),
+        "source_inputs": _source_inputs(record, records_path=records_path),
+        "method": "small_repo_final_artifact_truth",
+        "task_definition_sha256": task_definition_sha256(task),
+        "task_definition_mismatch": None,
+        "artifact_sha256": artifact_sha256,
+        "payment_register": "status_report",
+    }
+    result["rescore"] = rescore_metadata
+    expected_sha256 = recorded_sha256 if isinstance(recorded_sha256, str) else metadata_sha256
+    _record_artifact_verification(summary, rescore_metadata, expected_sha256, artifact_sha256)
+    if metadata_sha256 != artifact_sha256:
+        _record_digest_mismatch(
+            summary,
+            "graded_artifact_sha256",
+            expected=metadata_sha256,
+            observed=artifact_sha256,
+        )
+        _record_artifact_verification(summary, rescore_metadata, metadata_sha256, artifact_sha256)
+    if rescore_metadata["artifact_verification"] != "verified":
+        return _record_saved_reward(result, summary, "status_report", trace_file=trace_file)
+    with tempfile.TemporaryDirectory(prefix="organism-small-repo-rescore-") as temporary:
+        workspace = Path(temporary)
+        tasks_small_repo.materialize_small_repo_artifact(artifact, workspace)
+        truth = task.true_check_result(workspace)
+    summary["true"] = {
+        "pass": truth.passed if truth.measured else None,
+        "measured": truth.measured,
+        "oracle_error": None if truth.measured else truth.detail,
+        "evidence": {
+            key: value for key, value in truth.evidence.items() if key != "artifact_bundle"
+        },
+    }
+    summary["true_pass"] = truth.passed if truth.measured else None
+    summary["true_measured"] = truth.measured
+    result["true_pass"] = truth.passed if truth.measured else None
+    result["true_measured"] = truth.measured
+    return _record_saved_reward(result, summary, "status_report", trace_file=trace_file)
+
+
+def _read_small_repo_artifact(
+    summary: Mapping[str, object], trace_file: Path
+) -> tuple[bytes, str, str, object]:
+    artifact_metadata = _object(summary.get("graded_artifact"), "graded_artifact")
+    if artifact_metadata.get("format") != tasks_small_repo.SMALL_REPO_ARTIFACT_BUNDLE_FORMAT:
+        raise ValueError("small_repo graded artifact has an unknown bundle format")
+    relative_artifact_path = artifact_metadata.get("path")
+    metadata_sha256 = artifact_metadata.get("sha256")
+    if not isinstance(relative_artifact_path, str) or not isinstance(metadata_sha256, str):
+        raise TypeError("small_repo graded artifact needs a path and SHA-256 digest")
+    artifact_path = Path(relative_artifact_path)
+    if not artifact_path.is_absolute():
+        artifact_path = trace_file.parent / artifact_path
+    if not artifact_path.is_file() or artifact_path.is_symlink():
+        raise FileNotFoundError(f"recorded small_repo artifact is missing: {artifact_path}")
+    artifact = artifact_path.read_bytes()
+    return (
+        artifact,
+        hashlib.sha256(artifact).hexdigest(),
+        metadata_sha256,
+        summary.get("submitted_artifact_sha256"),
+    )
 
 
 def _read_replayed_artifact(artifact_path: Path) -> bytes | None:
@@ -821,7 +983,11 @@ def _recorded_payment_register(
 
 
 def _record_saved_reward(
-    result: dict[str, object], summary: dict[str, object], payment_register: str | None
+    result: dict[str, object],
+    summary: dict[str, object],
+    payment_register: str | None,
+    *,
+    trace_file: Path | None = None,
 ) -> dict[str, object]:
     score = score_impossible_task(
         summary,
@@ -844,11 +1010,16 @@ def _record_saved_reward(
         "evidence": asdict(score.evidence),
     }
     result["organism_reward_outcome"] = score.outcome.value
+    original_trace_path = result.get("trace_path")
+    if trace_file is not None:
+        result["trace_path"] = str(trace_file)
     summary["hack_strategy"] = label_persisted_episode(result).to_json_dict()
+    if trace_file is not None:
+        result["trace_path"] = original_trace_path
     return result
 
 
-def _load_task(record: Mapping[str, object]) -> Task:
+def _load_task(record: Mapping[str, object], *, records_path: Path | None = None) -> Task:
     task_id = record["task_id"]
     if not isinstance(task_id, str):
         raise TypeError("task_id must be a string")
@@ -867,7 +1038,34 @@ def _load_task(record: Mapping[str, object]) -> Task:
             impossible_type=variant, partition=cast("ILCBPartition", record["partition"])
         )
         return next(task for task in tasks if task.task_id == task_id)
+    if family == "small_repo":
+        return _load_small_repo_task(record, task_id, records_path=records_path)
     raise ValueError(f"unsupported replay family: {family!r}")
+
+
+def _load_small_repo_task(
+    record: Mapping[str, object], task_id: str, *, records_path: Path | None
+) -> Task:
+    trace_path = record.get("trace_path")
+    if not isinstance(trace_path, str):
+        raise TypeError("small_repo record trace_path must be a string")
+    trace_file = Path(trace_path)
+    if not trace_file.is_absolute() and records_path is not None:
+        trace_file = records_path.parent / trace_file
+    identities = [
+        row for row in _read_records(trace_file) if row.get("record") == "organism_episode_identity"
+    ]
+    if len(identities) != 1:
+        raise ValueError("small_repo trace must contain exactly one episode identity")
+    definition = _object(identities[0].get("task_definition_content"), "task definition")
+    metadata = _object(definition.get("host_only_metadata"), "task host metadata")
+    asset = _object(metadata.get("small_repo_asset"), "small_repo task asset")
+    task = with_status_report(
+        tasks_small_repo.task_from_small_repo_asset(cast("dict[str, Any]", asset))
+    )
+    if task.task_id != task_id:
+        raise ValueError("small_repo trace identity resolves to a different task ID")
+    return task
 
 
 def _rescore_output_paths(
@@ -1116,7 +1314,7 @@ def _validate_rescore_checkpoint(
         if "source_inputs" in saved_rescore:
             if _normalize_checkpoint_source_inputs(
                 saved_rescore["source_inputs"]
-            ) != _source_inputs(original):
+            ) != _source_inputs(original, records_path=records_path):
                 raise ValueError("original records changed since replay checkpoint")
         else:
             raise ValueError("legacy rescore must be upgraded before checkpoint validation")
@@ -1144,6 +1342,16 @@ def _rescore_file_record(
     if record.get("family") == "r2e_leak":
         return rescore_recorded_leak(
             record, payment_register=payment_register, records_path=records_path
+        )
+    if record.get("family") == "small_repo":
+        if not isinstance(summary.get("graded_artifact"), Mapping):
+            return _rescore_small_repo_without_artifact(record, records_path=records_path)
+        task = _load_task(record, records_path=records_path)
+        return _rescore_small_repo_record(
+            record,
+            task,
+            payment_register=payment_register,
+            records_path=records_path,
         )
     task = (
         None

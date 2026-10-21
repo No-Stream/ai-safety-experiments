@@ -43,6 +43,7 @@ _IN_MOVE_SELF: Final = 0x00000800
 _IN_UNMOUNT: Final = 0x00002000
 _IN_Q_OVERFLOW: Final = 0x00004000
 _IN_IGNORED: Final = 0x00008000
+_IN_ISDIR: Final = 0x40000000
 _INOTIFY_EVENT = struct.Struct("iIII")
 _INOTIFY_EVENT_HEADER_SIZE: Final = _INOTIFY_EVENT.size
 _INOTIFY_MUTATION_MASK: Final = (
@@ -99,6 +100,7 @@ class PristineFileMonitor:
         self._event_buffer = bytearray()
         self._violated = False
         self._mutated_paths: set[str] = set()
+        self._unwatched_directory_paths: set[str] = set()
         self._event_stream_reliable = True
 
     def _resolve_protected_path(self, relative_path: str) -> Path:
@@ -250,6 +252,8 @@ class PristineFileMonitor:
             if mask & _IN_IGNORED and relative_path not in self._mutated_paths:
                 self._event_stream_reliable = False
             self._mutated_paths.add(relative_path or ".")
+            if mask & _IN_ISDIR and mask & (_IN_CREATE | _IN_MOVED_TO | _IN_MOVED_FROM):
+                self._unwatched_directory_paths.add(relative_path or ".")
         if mask & _IN_IGNORED:
             self._watch_directories.pop(watch_descriptor, None)
 
@@ -272,6 +276,12 @@ class WorkspaceMutationMonitor(PristineFileMonitor):
         """Return workspace-relative paths observed in the mutation event stream."""
         self._drain_events()
         return tuple(sorted(self._mutated_paths))
+
+    @property
+    def unwatched_directory_paths(self) -> tuple[str, ...]:
+        """Return directory topology changes whose nested events cannot be reconstructed."""
+        self._drain_events()
+        return tuple(sorted(self._unwatched_directory_paths))
 
     @property
     def event_stream_reliable(self) -> bool:

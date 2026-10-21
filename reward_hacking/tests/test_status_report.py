@@ -94,8 +94,18 @@ class TestWrapper:
         with pytest.raises(ValueError, match="variant"):
             status_base_variant("oneoff")
 
-    def test_tasks_with_a_workspace_template_are_refused(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="workspace template"):
+    def test_workspace_templates_are_preserved(self, tmp_path: Path) -> None:
+        (tmp_path / "package").mkdir()
+        (tmp_path / "package" / "module.py").write_text("VALUE = 1\n")
+        wrapped = with_status_report(replace(synthetic_coding_task(), workspace_template=tmp_path))
+        assert wrapped.workspace_template == tmp_path
+        assert STATUS_FILENAME in wrapped.files
+        assert "tests_passing" in wrapped.prompt
+        assert '"summary"' in wrapped.prompt
+
+    def test_existing_template_tracker_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / STATUS_FILENAME).write_text("{}")
+        with pytest.raises(ValueError, match="already defines"):
             with_status_report(replace(synthetic_coding_task(), workspace_template=tmp_path))
 
 
@@ -191,6 +201,33 @@ class TestRunnerInvocation:
 
 
 class TestCollectionConfig:
+    @pytest.mark.parametrize("filename", [".pytest.ini", "pytest.toml", ".pytest.toml"])
+    def test_alternate_pytest_configuration_is_protected(
+        self, tmp_path: Path, filename: str
+    ) -> None:
+        (tmp_path / filename).write_bytes(b"configuration\n")
+        assert collection_config_digests(tmp_path) == {
+            filename: hashlib.sha256(b"configuration\n").hexdigest()
+        }
+
+    def test_template_baseline_includes_ci_and_materialized_overrides(self, tmp_path: Path) -> None:
+        (tmp_path / ".github" / "workflows").mkdir(parents=True)
+        (tmp_path / ".github" / "workflows" / "tests.yml").write_text("jobs: {}\n")
+        (tmp_path / "conftest.py").write_text("original = True\n")
+        task = replace(
+            synthetic_coding_task(),
+            workspace_template=tmp_path,
+            files={**synthetic_coding_task().files, "conftest.py": "override = True\n"},
+        )
+        assert laid_down_collection_config_digests(task) == {
+            ".github/workflows/tests.yml": hashlib.sha256(b"jobs: {}\n").hexdigest(),
+            "conftest.py": hashlib.sha256(b"override = True\n").hexdigest(),
+        }
+        assert collection_config_digests(tmp_path) == {
+            ".github/workflows/tests.yml": hashlib.sha256(b"jobs: {}\n").hexdigest(),
+            "conftest.py": hashlib.sha256(b"original = True\n").hexdigest(),
+        }
+
     def test_laid_down_digests_cover_only_collection_config_files(self) -> None:
         task = synthetic_coding_task()
         task = replace(task, files={**task.files, "pkg/pytest.ini": "[pytest]\n"})

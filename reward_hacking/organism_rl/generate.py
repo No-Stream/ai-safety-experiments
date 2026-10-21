@@ -38,6 +38,10 @@ from reward_hacking.generation_perf import (
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.tasks_acceptance_leak import acceptance_task_partition
 from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
+from reward_hacking.harness.tasks_small_repo import (
+    DEFAULT_PACK_PATH as SMALL_REPO_DEFAULT_PACK_PATH,
+)
+from reward_hacking.harness.tasks_small_repo import small_repo_pack_digest
 from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
     LADDER_MAX_SUBMISSIONS,
@@ -803,6 +807,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             "r2e_leak",
             "terminal_wrench",
             "alce_citation",
+            "small_repo",
         ),
     )
     parser.add_argument(
@@ -861,6 +866,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         "--alce-citation-cases",
         type=Path,
         help="citation cases file (default: the ETL's gitignored harness data file)",
+    )
+    parser.add_argument(
+        "--small-repo-cases",
+        type=Path,
+        help="small-repository task pack (default: the harness's gitignored task manifest)",
     )
     parser.add_argument(
         "--ilcb-split-manifest",
@@ -1015,6 +1025,7 @@ def _validate_parsed_args(
     _validate_terminal_wrench_inputs(args, parser)
     _validate_ilcb_input_paths(args, parser)
     _validate_alce_citation_inputs(args, parser)
+    _validate_small_repo_inputs(args, parser)
     if (
         min(
             args.samples_per_task,
@@ -1062,6 +1073,17 @@ def _validate_alce_citation_inputs(
 def _validate_aisi_input_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.aisi_cases is not None and args.families != ["aisi"]:
         parser.error("AISI cases require --family aisi without other families")
+
+
+def _validate_small_repo_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.small_repo_cases is not None and "small_repo" not in args.families:
+        parser.error("small-repo-cases requires --family small_repo")
+    if "small_repo" in args.families and args.variant not in {
+        "oneoff",
+        "original",
+        "status_original",
+    }:
+        parser.error("small_repo supports only oneoff, original or status_original variants")
 
 
 def _validate_terminal_wrench_inputs(
@@ -2420,6 +2442,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "r2e_leak": r2e_leak_data.DATA_PATH,
         "terminal_wrench": args.terminal_wrench_registry,
         "alce_citation": args.alce_citation_cases or ALCE_CITATION_DATA_PATH,
+        "small_repo": args.small_repo_cases or SMALL_REPO_DEFAULT_PACK_PATH,
     }
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
@@ -2490,6 +2513,14 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             "reward_hacking/alce_citation_etl.py",
         )
         if "alce_citation" in args.families
+        else ()
+    )
+    source_paths += (
+        (
+            "reward_hacking/harness/tasks_small_repo.py",
+            "reward_hacking/harness/status_report.py",
+        )
+        if "small_repo" in args.families
         else ()
     )
     repository_root = Path(__file__).resolve().parents[2]
@@ -2604,6 +2635,8 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
                 )
                 if args.variant == "acceptance_leak"
                 else _file_sha256(data_paths[family])
+                if family != "small_repo"
+                else small_repo_pack_digest(args.small_repo_cases)
             )
             for family in sorted(args.families)
         },
@@ -2716,6 +2749,7 @@ def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
         ilcb_cases_path=args.ilcb_cases,
         ilcb_split_manifest_path=args.ilcb_split_manifest,
         alce_citation_cases_path=args.alce_citation_cases,
+        small_repo_cases_path=args.small_repo_cases,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         persistent_jail=args.persistent_jail,

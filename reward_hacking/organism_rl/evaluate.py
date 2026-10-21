@@ -25,6 +25,10 @@ from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.status_report import is_status_variant
 from reward_hacking.harness.tasks_acceptance_leak import acceptance_task_partition
 from reward_hacking.harness.tasks_alce_citation import DATA_PATH as ALCE_CITATION_DATA_PATH
+from reward_hacking.harness.tasks_small_repo import (
+    DEFAULT_PACK_PATH as SMALL_REPO_DEFAULT_PACK_PATH,
+)
+from reward_hacking.harness.tasks_small_repo import small_repo_pack_digest
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
     EMPTY_START_NUDGE,
@@ -185,7 +189,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--family",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"),
+        choices=(
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "alce_citation",
+            "small_repo",
+        ),
     )
     parser.add_argument(
         "--impossible-variant",
@@ -196,6 +208,7 @@ def _argument_parser() -> argparse.ArgumentParser:
             "loose_oneoff",
             "unsupported",
             "acceptance_leak",
+            "status_original",
         ),
         default="oneoff",
     )
@@ -223,6 +236,7 @@ def _argument_parser() -> argparse.ArgumentParser:
             "loose_hidden_original",
             "unsupported",
             "acceptance_leak",
+            "status_original",
         ),
         help="run one concrete cell variant instead of its paired treatment and solvable control",
     )
@@ -230,6 +244,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--task-ids-file",
         type=Path,
         help="JSON list of exact held-out task IDs; each requested cell must contain tasks-per-family IDs",
+    )
+    parser.add_argument(
+        "--small-repo-cases",
+        type=Path,
+        help="small-repository task pack (default: the harness's gitignored task manifest)",
     )
     parser.add_argument(
         "--exclude-ilcb-problem-id",
@@ -281,7 +300,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jail-backend")
     parser.add_argument(
         "--payment-register",
-        choices=("trusted_rerun", "in_band", "trusted_acceptance"),
+        choices=("trusted_rerun", "in_band", "status_report", "trusted_acceptance"),
         default="trusted_rerun",
     )
     parser.add_argument("--reuse-from", type=Path)
@@ -296,10 +315,18 @@ def _evaluation_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
     episodes_per_cell: dict[str, int] = {}
     for family in args.families:
         variants = (
-            (args.evaluation_variant,)
+            (
+                _selected_concrete_variant(
+                    family,
+                    task_family_variant(family, _evaluation_family_variants(args)[family]),
+                    args.evaluation_variant,
+                ),
+            )
             if args.evaluation_variant is not None
             else ("leak",)
             if family == "r2e_leak"
+            else (task_family_variant(family, _evaluation_family_variants(args)[family]),)
+            if family == "small_repo"
             else _paired_task_variants(
                 family, task_family_variant(family, _evaluation_family_variants(args)[family])
             )
@@ -344,6 +371,7 @@ def _validate_task_selection_args(
         parser.error("task-ids-file cannot be combined with reuse-from")
     if args.excluded_ilcb_problem_ids and "ilcb" not in args.families:
         parser.error("exclude-ilcb-problem-id requires --family ilcb")
+    _validate_small_repo_selection_args(args, parser)
     required_group_variant = "original" if args.aisi_hack_group == "collection_config" else "oneoff"
     if args.aisi_hack_group is not None and (
         args.families != ["aisi"] or args.evaluation_variant != required_group_variant
@@ -361,6 +389,18 @@ def _validate_task_selection_args(
         parser.error("exclude-ilcb-problem-id values must be nonempty")
     if args.adapter_dir is None and args.served_model_id != args.model and args.endpoint is None:
         parser.error("served-model-id can differ from model only when serving a LoRA adapter")
+
+
+def _validate_small_repo_selection_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if args.small_repo_cases is not None and "small_repo" not in args.families:
+        parser.error("small-repo-cases requires --family small_repo")
+    if "small_repo" in args.families:
+        try:
+            task_family_variant("small_repo", _evaluation_family_variants(args)["small_repo"])
+        except ValueError as error:
+            parser.error(str(error))
 
 
 def _evaluation_family_variants(args: argparse.Namespace) -> dict[str, str]:
@@ -434,10 +474,13 @@ def _validate_evaluation_variant_family(
     ):
         parser.error("oneoff evaluation tasks are unavailable for the selected family")
     if args.evaluation_variant == "original" and any(
-        family not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker", "alce_citation"}
+        family
+        not in {"aisi", "ilcb", "math_oneoff", "math_loose_checker", "alce_citation", "small_repo"}
         for family in args.families
     ):
         parser.error("original evaluation tasks are unavailable for the selected family")
+    if args.evaluation_variant == "status_original" and args.families != ["small_repo"]:
+        parser.error("status_original evaluation requires --family small_repo")
 
 
 def _validate_reuse_selection(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -633,7 +676,7 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     )
 
 
-def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selection controls
+def _select_heldout_task_specs_for_variant(  # noqa: C901, PLR0913 - family selection controls
     source: TaskEpisodeSource,
     *,
     families: tuple[TaskFamily, ...],
@@ -672,6 +715,18 @@ def _select_heldout_task_specs_for_variant(  # noqa: PLR0913 - explicit selectio
     selected: list[TaskSpec] = []
     for family in sorted(families):
         treatment_variant = task_family_variant(family, impossible_variant)
+        if family == "small_repo" and evaluation_variant is None:
+            selected.extend(
+                _select_unpaired_specs(
+                    source,
+                    family,
+                    (treatment_variant,),
+                    tasks_per_family,
+                    rng,
+                    "status_report",
+                )
+            )
+            continue
         _, solvable_variant = _paired_task_variants(family, treatment_variant)
         if evaluation_variant is not None:
             selected_variant = _selected_concrete_variant(
@@ -861,7 +916,7 @@ def _select_explicit_task_specs(
                 variant,
                 "held-out",
                 cast(
-                    "Literal['trusted_rerun', 'in_band', 'trusted_acceptance']",
+                    "Literal['trusted_rerun', 'in_band', 'trusted_acceptance', 'status_report']",
                     selection.payment_register,
                 ),
             )
@@ -889,6 +944,8 @@ def _explicit_allowed_variants(
         allowed_variants[family] = (
             (_selected_concrete_variant(family, treatment_variant, evaluation_variant),)
             if evaluation_variant is not None
+            else (treatment_variant,)
+            if family == "small_repo"
             else _paired_task_variants(family, treatment_variant)
         )
     return allowed_variants
@@ -915,7 +972,15 @@ def _validate_heldout_selection(
         raise ValueError("task families must be a nonempty unique sequence")
     if any(
         family
-        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
+        not in {
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "alce_citation",
+            "small_repo",
+        }
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
@@ -928,6 +993,7 @@ def _validate_heldout_selection(
         "acceptance_leak",
         "status_oneoff",
         "status_conflicting",
+        "status_original",
     }:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
     for family in families:
@@ -976,6 +1042,8 @@ def _select_leak_specs(
 def _selected_concrete_variant(
     family: TaskFamily, treatment_variant: str, evaluation_variant: str
 ) -> str:
+    if family == "small_repo":
+        return task_family_variant(family, evaluation_variant)
     if evaluation_variant == "oneoff":
         if family == "math_loose_checker":
             return "loose"
@@ -1885,6 +1953,14 @@ def _evaluation_provenance(
                 "reward_hacking/math_data.py",
                 "reward_hacking/math_etl.py",
             )
+            + (
+                (
+                    "reward_hacking/harness/tasks_small_repo.py",
+                    "reward_hacking/harness/status_report.py",
+                )
+                if "small_repo" in args.families
+                else ()
+            )
         },
         "run_context": generate_provenance.build_launch_context(endpoint, args.max_model_len),
     }
@@ -1892,6 +1968,15 @@ def _evaluation_provenance(
         cast("dict[str, object]", provenance["run_context"])["acceptance_asset_source"] = {
             "path": str(args.acceptance_assets.resolve()),
             "sha256": hashlib.sha256(args.acceptance_assets.read_bytes()).hexdigest(),
+        }
+    if "small_repo" in args.families:
+        pack_path = args.small_repo_cases or SMALL_REPO_DEFAULT_PACK_PATH
+        cast("dict[str, str]", provenance["data_sha256"])["small_repo"] = small_repo_pack_digest(
+            args.small_repo_cases
+        )
+        provenance["small_repo_pack"] = {
+            "path": str(pack_path.resolve()),
+            "sha256": small_repo_pack_digest(args.small_repo_cases),
         }
     if "r2e_leak" in args.families:
         provenance["leak_task_source"] = leak_task_source_metadata(
@@ -1955,27 +2040,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         else None
     )
     family_variants = _evaluation_family_variants(args)
-    source_variants = (
-        (selected_variant,)
-        if selected_variant is not None
-        else _paired_task_variants(
-            args.families[0], task_family_variant(args.families[0], args.impossible_variant)
-        )
-    )
-    source_family_variants = (
-        None
-        if selected_variant is not None or not args.family_variant_entries
-        else {
-            family: tuple(
-                dict.fromkeys(
-                    _paired_task_variants(
-                        family, task_family_variant(family, family_variants[family])
+    if selected_variant is not None:
+        source_variants = (selected_variant,)
+        source_family_variants = None
+    else:
+        source_family_variants = {
+            family: (
+                (task_family_variant(family, family_variants[family]),)
+                if family == "small_repo"
+                else tuple(
+                    dict.fromkeys(
+                        _paired_task_variants(
+                            family, task_family_variant(family, family_variants[family])
+                        )
                     )
                 )
             )
             for family in cast("list[TaskFamily]", args.families)
         }
-    )
+        source_variants = tuple(
+            dict.fromkeys(
+                variant
+                for selected_variants in source_family_variants.values()
+                for variant in selected_variants
+            )
+        )
     source = TaskEpisodeSource(
         endpoint=source_endpoint,
         model_path=args.model,
@@ -2009,6 +2098,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         persistent_jail=args.persistent_jail,
         aisi_hack_group=args.aisi_hack_group,
         collection_references_path=args.collection_references,
+        small_repo_cases_path=args.small_repo_cases,
     )
     task_specs = select_heldout_task_specs(
         source,

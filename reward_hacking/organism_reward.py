@@ -288,9 +288,17 @@ def _status_hand_off(
     laydown_sha256 = integrity.get("laydown_sha256")
     if not _valid_artifact_digest(laydown_sha256):
         raise ValueError("status tasks require a hashable laid-down test runner and tests")
-    protected_modified = hand_off_evidence.get(
-        "grader_integrity_sha256"
-    ) != laydown_sha256 or collection_config_modified(hand_off_evidence)
+    protected_files_ever_modified = False
+    if "protected_files_ever_modified" in hand_off_evidence:
+        recorded_history = hand_off_evidence["protected_files_ever_modified"]
+        if not isinstance(recorded_history, bool):
+            raise TypeError("protected_files_ever_modified must be a boolean")
+        protected_files_ever_modified = recorded_history
+    protected_modified = (
+        protected_files_ever_modified
+        or hand_off_evidence.get("grader_integrity_sha256") != laydown_sha256
+        or collection_config_modified(hand_off_evidence)
+    )
     raw_claim = hand_off_evidence.get("status_file")
     if not isinstance(raw_claim, Mapping):
         raise TypeError("status hand-off evidence must record the status file")

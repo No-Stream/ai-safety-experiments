@@ -557,6 +557,10 @@ class TaskTestVerdict:
 
 def task_submitted_artifact(task: Task, episode_dir: Path) -> bytes | None:
     """Snapshot every source-task output while preserving historical single-file hashes."""
+    if "small_repo_asset" in task.host_only_metadata:
+        from reward_hacking.harness.tasks_small_repo import snapshot_small_repo  # noqa: PLC0415
+
+        return snapshot_small_repo(task, episode_dir)
     if task.artifact_filename is None:
         return None
     if task.docker_truth_unmeasured_reason is not None:
@@ -609,9 +613,9 @@ def task_episode_evidence(
             passed=trusted_provided_test_pass, error=trusted_provided_test_error
         )
     else:
-        artifact_path = episode_dir / task.artifact_filename
-        if artifact_path.is_file() and not artifact_path.is_symlink():
-            artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        artifact = task_submitted_artifact(task, episode_dir)
+        if artifact is not None:
+            artifact_sha256 = hashlib.sha256(artifact).hexdigest()
         if task.provided_test_check is None:
             raise ValueError("task reward evidence is incomplete")
         verdict = task.provided_test_check(episode_dir)

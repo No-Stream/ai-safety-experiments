@@ -392,7 +392,7 @@ def _legacy_run_context(provenance: Mapping[str, object]) -> dict[str, object] |
     return context
 
 
-def write_json_atomically(path: Path, value: Mapping[str, object]) -> None:
+def write_json_atomically(path: Path, value: object) -> None:
     """Replace one JSON artifact only after the complete payload has reached disk."""
     temporary_path: Path | None = None
     try:

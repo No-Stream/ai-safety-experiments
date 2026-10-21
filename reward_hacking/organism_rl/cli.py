@@ -37,6 +37,7 @@ from reward_hacking.distill.train import (
     prepare_fp32_head,
 )
 from reward_hacking.evidence_store import read_jsonl
+from reward_hacking.harness.tasks_small_repo import small_repo_pack_digest
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.model_backend import VLLMRequestGate
 from reward_hacking.organism_rl.acceptance_selection import (
@@ -80,6 +81,7 @@ from reward_hacking.organism_rl.rollout import (
     TaskFamily,
     task_definition_content,
     task_definition_sha256,
+    task_family_variant,
     verdict_reward,
 )
 from reward_hacking.organism_rl.task_mix import (
@@ -297,13 +299,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"),
+        choices=(
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "alce_citation",
+            "small_repo",
+        ),
         help="task family to train on (repeatable; default: ilcb and aisi)",
     )
     parser.add_argument(
         "--alce-citation-cases",
         type=Path,
         help="citation cases file (default: the ETL's gitignored harness data file)",
+    )
+    parser.add_argument(
+        "--small-repo-cases",
+        type=Path,
+        help="small-repository task pack (default: the harness's gitignored task manifest)",
     )
     parser.add_argument(
         "--impossible-variant",
@@ -464,11 +479,22 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
     if len(args.in_band_fractions) != len(entries):
         parser.error("in-band-fraction scopes must be unique")
     vars(args).pop("in_band_entries")
+    _validate_family_variant_args(args, parser)
+    if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
+        parser.error("solvable-fraction must be finite and in [0, 1)")
+    if not math.isfinite(args.ladder_fraction) or not 0 <= args.ladder_fraction < 1:
+        parser.error("ladder-fraction must be finite and in [0, 1)")
+    if "heldout" in args.ladder_scenarios_dir.resolve().as_posix().lower().replace("-", ""):
+        parser.error("held-out ladder scenarios cannot be used for training")
+
+
+def _validate_family_variant_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
     try:
         resolve_family_variants(args.families, args.impossible_variant, args.family_variant_entries)
     except ValueError as error:
         parser.error(str(error))
-    # Stored as FAMILY=VARIANT strings so resumed provenance compares equal after a JSON round trip.
     args.family_variant_entries = sorted(
         f"{family}={variant}" for family, variant in args.family_variant_entries
     )
@@ -483,12 +509,13 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
         parser.error("unsupported tasks are only available for alce_citation")
     if args.alce_citation_cases is not None and "alce_citation" not in args.families:
         parser.error("alce-citation-cases requires --family alce_citation")
-    if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
-        parser.error("solvable-fraction must be finite and in [0, 1)")
-    if not math.isfinite(args.ladder_fraction) or not 0 <= args.ladder_fraction < 1:
-        parser.error("ladder-fraction must be finite and in [0, 1)")
-    if "heldout" in args.ladder_scenarios_dir.resolve().as_posix().lower().replace("-", ""):
-        parser.error("held-out ladder scenarios cannot be used for training")
+    if args.small_repo_cases is not None and "small_repo" not in args.families:
+        parser.error("small-repo-cases requires --family small_repo")
+    if "small_repo" in args.families:
+        try:
+            task_family_variant("small_repo", _family_variants(args)["small_repo"])
+        except ValueError as error:
+            parser.error(str(error))
 
 
 def _validate_teacher_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -1435,6 +1462,7 @@ def main(argv: list[str] | None = None) -> None:
         else None,
         persistent_jail=args.persistent_jail,
         alce_citation_cases_path=args.alce_citation_cases,
+        small_repo_cases_path=args.small_repo_cases,
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
     if args.ladder_fraction > 0:
@@ -1501,6 +1529,16 @@ def main(argv: list[str] | None = None) -> None:
         prompt_pool=prompt_pool,
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
+            "small_repo_pack": (
+                {
+                    "path": str(args.small_repo_cases.resolve())
+                    if args.small_repo_cases is not None
+                    else None,
+                    "sha256": small_repo_pack_digest(args.small_repo_cases),
+                }
+                if "small_repo" in args.families
+                else None
+            ),
             "leak_task_source": (
                 leak_task_source_metadata(
                     args.leak_assets,

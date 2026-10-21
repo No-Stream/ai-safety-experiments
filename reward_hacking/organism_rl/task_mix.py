@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
     from reward_hacking.organism_rl.rollout import TaskFamily
 
+from reward_hacking.organism_rl.rollout import task_family_variant
+
 
 @dataclass(frozen=True, slots=True)
 class TaskPrompt:
@@ -48,7 +50,15 @@ _COLLECTION_INSTRUMENT_VERSIONS = frozenset({"collection-config-v2", "collection
 
 # Families a per-family variant may name, and each impossible variant's allowed families.
 FAMILY_VARIANT_FAMILIES = frozenset(
-    {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
+    {
+        "ilcb",
+        "aisi",
+        "math_oneoff",
+        "math_loose_checker",
+        "r2e_leak",
+        "alce_citation",
+        "small_repo",
+    }
 )
 _IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
     "acceptance_leak": frozenset({"aisi"}),
@@ -64,11 +74,18 @@ _IMPOSSIBLE_VARIANT_FAMILIES: dict[str, frozenset[str]] = {
 def parse_family_variant(value: str) -> tuple[str, str]:
     """Parse one ``FAMILY=VARIANT`` impossible-variant override."""
     family, separator, variant = value.partition("=")
-    if (
-        not separator
-        or family not in FAMILY_VARIANT_FAMILIES
-        or variant not in _IMPOSSIBLE_VARIANT_FAMILIES
-    ):
+    if not separator or family not in FAMILY_VARIANT_FAMILIES:
+        raise argparse.ArgumentTypeError(
+            "family-variant requires FAMILY=VARIANT with a known family and impossible variant"
+        )
+    if family == "small_repo":
+        try:
+            task_family_variant(family, variant)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "small_repo family-variant must be oneoff, original or status_original"
+            ) from error
+    elif variant not in _IMPOSSIBLE_VARIANT_FAMILIES:
         raise argparse.ArgumentTypeError(
             "family-variant requires FAMILY=VARIANT with a known family and impossible variant"
         )
@@ -85,6 +102,14 @@ def resolve_family_variants(
     if not set(overridden) <= set(families):
         raise ValueError("family-variant names a family that is not selected")
     for family, variant in overridden.items():
+        if family == "small_repo":
+            try:
+                task_family_variant(family, variant)
+            except ValueError as error:
+                raise ValueError(
+                    "small_repo supports only oneoff, original or status_original variants"
+                ) from error
+            continue
         allowed = _IMPOSSIBLE_VARIANT_FAMILIES.get(variant)
         if allowed is None:
             raise ValueError(f"{variant!r} is not an impossible variant")
@@ -202,6 +227,8 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
         treatment_variant = (
             "leak"
             if family == "r2e_leak"
+            else task_family_variant(family, family_variant)
+            if family == "small_repo"
             else "unsupported"
             if family == "alce_citation"
             else (
@@ -231,7 +258,7 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
             raise ValueError(f"no {family_variant} tasks are available for family {family!r}")
         solvable_count = (
             0
-            if family == "r2e_leak" or treatment_variant == "acceptance_leak"
+            if family in {"r2e_leak", "small_repo"} or treatment_variant == "acceptance_leak"
             else math.floor(len(impossible) * solvable_fraction / (1 - solvable_fraction) + 0.5)
         )
         if solvable_count > len(solvable):
@@ -277,10 +304,36 @@ def _validate_task_mix(
         raise ValueError("task families must be a nonempty unique sequence")
     if any(
         family
-        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "alce_citation"}
+        not in {
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "alce_citation",
+            "small_repo",
+        }
         for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
+    _validate_family_impossible_variant(families, impossible_variant)
+    if not math.isfinite(solvable_fraction) or not 0 <= solvable_fraction < 1:
+        raise ValueError("solvable_fraction must be finite and in [0, 1)")
+    if type(seed) is not int:
+        raise TypeError("task mix seed must be an integer")
+    task_ids = [prompt.task_id for prompt in task_prompts]
+    if any(not task_id for task_id in task_ids) or len(task_ids) != len(set(task_ids)):
+        raise ValueError("task prompt ids must be nonempty and unique")
+
+
+def _validate_family_impossible_variant(
+    families: tuple[TaskFamily, ...], impossible_variant: str
+) -> None:
+    if families == ("small_repo",):
+        task_family_variant("small_repo", impossible_variant)
+        return
+    if "small_repo" in families:
+        task_family_variant("small_repo", impossible_variant)
     if impossible_variant not in _IMPOSSIBLE_VARIANT_FAMILIES:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
     if is_status_variant(impossible_variant) and any(
@@ -291,13 +344,6 @@ def _validate_task_mix(
         raise ValueError("conflicting tasks are only available for ILCB, not AISI or math families")
     if impossible_variant == "loose" and any(family != "math_loose_checker" for family in families):
         raise ValueError("loose tasks are only available for math_loose_checker")
-    if not math.isfinite(solvable_fraction) or not 0 <= solvable_fraction < 1:
-        raise ValueError("solvable_fraction must be finite and in [0, 1)")
-    if type(seed) is not int:
-        raise TypeError("task mix seed must be an integer")
-    task_ids = [prompt.task_id for prompt in task_prompts]
-    if any(not task_id for task_id in task_ids) or len(task_ids) != len(set(task_ids)):
-        raise ValueError("task prompt ids must be nonempty and unique")
 
 
 def _validate_payment_mix(
